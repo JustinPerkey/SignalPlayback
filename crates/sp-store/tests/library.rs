@@ -9,8 +9,8 @@ use sp_core::{
 };
 use sp_store::blob::{self, BlobKind, BlobWriter, HEADER_LEN};
 use sp_store::{
-    library, props, pulses, trains, verify, NewDataset, NewGroup, NewPulseField, NewPulseGroup,
-    NewSignal, NewTrain, PropertyQuery, PulsePredicate, Store,
+    library, props, pulses, pyramid, trains, verify, NewDataset, NewGroup, NewPulseField,
+    NewPulseGroup, NewSignal, NewTrain, PropertyQuery, PulsePredicate, Store,
 };
 
 fn open() -> (tempfile::TempDir, Store) {
@@ -786,4 +786,108 @@ fn a_rolled_back_import_leaves_no_trace() {
     let summary = store.read(library::summary).unwrap();
     assert_eq!(summary, Default::default());
     assert!(store.read(verify::verify).unwrap().is_clean());
+}
+
+/// The pyramid index owns one reference to the blob it points at, and gives it
+/// back when the pyramid is dropped (§5.4). What the bytes *mean* is
+/// `sp-engine`'s business; here they are just a blob.
+#[test]
+fn a_pyramid_holds_one_reference_to_its_blob() {
+    let (_dir, store) = open();
+    let (source, pyramid_blob) = store
+        .write(|conn| {
+            let tx = conn.transaction()?;
+            let source = blob::write_column(
+                &tx,
+                &SampleBuffer::from_f64(DType::F32, &sine(1_000)),
+                Timebase::regular(1_000.0, 0.0),
+                blob::DEFAULT_CHUNK_SIZE,
+            )?;
+            let mut writer = BlobWriter::begin(&tx, BlobKind::Pyramid, blob::DEFAULT_CHUNK_SIZE)?;
+            writer.write(b"not really a pyramid, but it is a blob")?;
+            let pyramid_blob = writer.finish()?;
+            tx.commit()?;
+            Ok((source, pyramid_blob))
+        })
+        .unwrap();
+
+    let checksum = store
+        .read(move |conn| Ok(blob::info(conn, source)?.checksum))
+        .unwrap();
+
+    let row = store
+        .write({
+            let checksum = checksum.clone();
+            move |conn| pyramid::link(conn, &checksum, pyramid_blob, 3, 6, 1_000)
+        })
+        .unwrap();
+    assert_eq!(row.blob_id, pyramid_blob);
+    assert_eq!(
+        store
+            .read(move |conn| Ok(blob::info(conn, pyramid_blob)?.refcount))
+            .unwrap(),
+        1,
+        "the index takes over the writer's reference rather than adding one",
+    );
+    assert_eq!(store.read(pyramid::list).unwrap(), vec![row.clone()]);
+
+    // Dropping the pyramid frees its blob and leaves the column alone.
+    assert_eq!(
+        store.write(move |conn| pyramid::clear_all(conn)).unwrap(),
+        1
+    );
+    store
+        .read(move |conn| {
+            assert!(blob::info(conn, pyramid_blob).is_err());
+            assert!(blob::info(conn, source).is_ok());
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_second_pyramid_for_the_same_column_is_refused_without_leaking() {
+    let (_dir, store) = open();
+    let checksum = "0".repeat(64);
+
+    let make_blob = |bytes: &'static [u8]| {
+        store
+            .write(move |conn| {
+                let tx = conn.transaction()?;
+                let mut writer =
+                    BlobWriter::begin(&tx, BlobKind::Pyramid, blob::DEFAULT_CHUNK_SIZE)?;
+                writer.write(bytes)?;
+                let id = writer.finish()?;
+                tx.commit()?;
+                Ok(id)
+            })
+            .unwrap()
+    };
+
+    let first = make_blob(b"first");
+    let second = make_blob(b"second");
+    let kept = store
+        .write({
+            let checksum = checksum.clone();
+            move |conn| pyramid::link(conn, &checksum, first, 1, 6, 10)
+        })
+        .unwrap();
+    let again = store
+        .write({
+            let checksum = checksum.clone();
+            move |conn| pyramid::link(conn, &checksum, second, 1, 6, 10)
+        })
+        .unwrap();
+
+    assert_eq!(again, kept, "the pyramid already filed wins");
+    store
+        .read(move |conn| {
+            assert_eq!(blob::info(conn, first)?.refcount, 1);
+            assert!(
+                blob::info(conn, second).is_err(),
+                "the losing build's blob is released, not leaked"
+            );
+            Ok(())
+        })
+        .unwrap();
 }

@@ -494,10 +494,12 @@ multi-resolution min/max pyramid, itself stored as a blob (`kind = 'pyramid'`) k
 the source blob's checksum:
 
 - Level *k* stores one `(min, max)` `f32` pair per `2^(k+6)` source values — level 0 is a
-  64:1 reduction, each level halves again. Every level together adds ~3% to the source
-  size.
-- Levels are built once, lazily, on the worker pool (~200 ms per 100 M samples, a single
-  linear pass) and cached in the library.
+  64:1 reduction, each level halves again. Level 0 adds ~3% to an `f32` source and the
+  levels above it sum to one more of the same, so the whole pyramid costs ~6%.
+- Levels are built once, lazily, on the worker pool and cached in the library. Measured at
+  M4: **~0.7 s per 100 M samples** in a release build, which is the streaming read of the
+  column out of its chunks plus one linear fold; the build is a background job, never on
+  the frame path.
 - The renderer picks the level where **samples-per-pixel lands in [1, 2]** and reads that
   slice — a few KB, one chunk — then draws vertical min/max bars.
 - Below one sample per pixel the renderer reads the raw span and draws a polyline with
@@ -1456,6 +1458,11 @@ Interactions: scroll = zoom time about the pointer, shift+scroll = pan, ctrl+scr
 amplitude, drag = box zoom, double-click = fit, `Home`/`End` = jump to bounds,
 space = play/pause, `[` / `]` = set loop in/out, `←`/`→` = previous/next stage.
 
+M4 ships every one of these except `←`/`→`, which needs a stage rail to step along and
+arrives with M6; the artifacts layer is likewise empty until there are stages to produce
+them. A single click on the canvas moves the playhead, which the table above leaves to the
+transport but is what a scope is expected to do.
+
 Per-trace controls: visibility, colour, gain, vertical offset, and a **stacked vs.
 overlaid** layout toggle. Domain drives the default renderer — `DigitalLogic` signals get
 logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
@@ -1837,6 +1844,23 @@ noted.
 10. **Artifact size ceiling.** 64 KB inline / blob beyond that is a guess. A per-group
    spectrogram at fine resolution can reach hundreds of MB; if that is routine, the
    spectrogram artifact should store a decimated pyramid the way signals do.
+
+### Playback — resolved at M4
+
+14. **Complex signals on the scope (part of §17.12).** A `c64` column reduces to
+    **magnitude** in the pyramid, because a min/max pair is a real-valued idea; the scope
+    draws that envelope mirrored about zero, which is the shape an I/Q capture is read by.
+    Constellation and separate I/Q traces need either a second pyramid per component or a
+    complex-aware cell, and stay V1.x. Nothing about the stored format has to change for
+    them: a pyramid is derived data and can be rebuilt in a new shape.
+15. **Irregular signals on the scope.** A signal whose times come from a companion time
+    column has no arithmetic index-to-time map, so the reducer cannot pick a pyramid cell
+    by span. It reports the trace as undrawable rather than guessing, and no such signal
+    exists in practice yet — import writes pulse groups, generation writes regular
+    signals. The shape of the answer is known: a pyramid over the **time** column gives
+    each cell's time extent, and pairing it with the value column's pyramid at the same
+    level makes an irregular trace as cheap as a regular one. It belongs with pulse-field
+    plotting, which the Results screen wants anyway (M6).
 
 ### Data model
 

@@ -57,11 +57,15 @@ impl VerifyReport {
     }
 }
 
+/// Every column that owns a reference to a blob. The row identity is read as
+/// `rowid`, which is the same value as `id` for the tables that declare one
+/// and the only identity `render_pyramid` has (its key is the checksum).
 const REFERENCING_COLUMNS: &[(&str, &str)] = &[
     ("signal", "blob_id"),
     ("signal", "time_blob_id"),
     ("signal_group", "toa_blob_id"),
     ("pulse_field", "blob_id"),
+    ("render_pyramid", "blob_id"),
 ];
 
 /// Runs every check. Read-only; safe on a pooled reader.
@@ -72,7 +76,7 @@ pub fn verify(conn: &Connection) -> Result<VerifyReport> {
     let mut refs: HashMap<i64, i64> = HashMap::new();
     for (table, column) in REFERENCING_COLUMNS {
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, {column} FROM {table} WHERE {column} IS NOT NULL"
+            "SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
         ))?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
         for row in rows {
