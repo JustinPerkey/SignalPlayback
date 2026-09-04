@@ -7,6 +7,7 @@
 pub mod artifact;
 pub mod group;
 pub mod props;
+pub mod pulse;
 pub mod signal;
 pub mod stats;
 pub mod time;
@@ -18,6 +19,7 @@ pub use group::{Dataset, GroupId, GroupMeta, SignalGroup, SourceKind};
 pub use props::{
     Attributes, PropKind, PropScope, PropertyDef, PropertyError, PropertySet, PropertyValue,
 };
+pub use pulse::{FieldRange, PulseField, PulseRef, TimeUnit};
 pub use signal::{
     DType, Domain, Provenance, RunId, SampleBuffer, Samples, Scaling, Signal, SignalId, C64,
 };
