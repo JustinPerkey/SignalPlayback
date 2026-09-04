@@ -159,9 +159,7 @@ impl Noise {
         for (octave, stream) in self.streams.iter_mut().enumerate() {
             stream.seek(index >> octave);
         }
-        for slot in &mut self.held {
-            *slot = (u64::MAX, 0.0);
-        }
+        self.held.fill((u64::MAX, 0.0));
     }
 
     /// The noise value at `index`. Call in increasing index order after a
