@@ -24,10 +24,15 @@ sp-engine = { path = "crates/sp-engine" }
 # usage is confined to sp-app.
 iced = { version = "0.13.1", features = ["canvas", "tokio", "advanced"] }
 
+# Native file dialogs. The XDG portal backend keeps the Linux build free of
+# GTK development headers, which CI would otherwise have to install.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "blob", "cache"] }
 blake3 = "1.8"
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync"] }
 tempfile = "3.27"
+proptest = "1.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

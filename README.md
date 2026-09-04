@@ -10,13 +10,22 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
 ## Status
 
-**M1 — Store.** The library exists: one SQLite file holding metadata and
-sample data, with numbered migrations, a chunked content-addressed blob store
-read through incremental blob I/O, a single-writer/many-reader store actor,
-user-defined property definitions with an indexed query mirror, pulse groups
-with zone-map cross-group search, and a `Verify Library` pass. The Library and
-Properties screens browse and edit it. Import, generation, playback and
-processing are the next milestones (§16 of the design).
+**M2 — Import.** CSV files reach the library. The grouped-block format (§7 of
+the design) is framed by its count column alone, previewed from its first
+group however large the file, and streamed in one pass into one column blob
+per pulse field — with a column-mapping panel for the count and time columns,
+the time unit, per-column storage and property binding; saved import profiles
+for recurring file shapes; strict or tolerant count handling with a positioned
+error list; and cancellable progress. The writer reverses the grammar exactly,
+so import → database → export round-trips (goal G1).
+
+Before it, **M1 — Store**: one SQLite file holding metadata and sample data,
+with numbered migrations, a chunked content-addressed blob store read through
+incremental blob I/O, a single-writer/many-reader store actor, user-defined
+property definitions with an indexed query mirror, pulse groups with zone-map
+cross-group search, and a `Verify Library` pass.
+
+Generation, playback and processing are the next milestones (§16).
 
 ## Build and run
 
@@ -45,7 +54,7 @@ Dependencies point left-to-right only: `sp-core` depends on nothing else here,
 | `sp-app` | The Iced application — the only crate that knows about pixels | M0+ |
 
 Inside `sp-store`, row-level functions (`library`, `props`, `pulses`, `blob`,
-`verify`) take a connection and do one thing; `Store` owns the connections and
+`profiles`, `verify`) take a connection and do one thing; `Store` owns the connections and
 runs closures on the writer thread (`write`) or a pooled reader (`read`).
 
 ## Keyboard
@@ -63,7 +72,7 @@ one up is copying one file. It lives at
 equivalent elsewhere), beside the rolling log in `…\SignalPlayback\logs`. The
 `-wal` and `-shm` files next to it are SQLite's own and are folded back into
 the main file on a clean exit. Set `RUST_LOG` to change log verbosity (default:
-`warn,signalplayback=info,sp_core=info,sp_store=info`).
+`warn,signalplayback=info,sp_core=info,sp_store=info,sp_csv=info`).
 
 Every table and every byte of column data is reachable with `sqlite3`:
 

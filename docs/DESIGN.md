@@ -746,6 +746,8 @@ file with millions of rows per group.
 | **Field whitespace** | Leading and trailing whitespace is trimmed from every field before parsing — the format writes `, ` as its delimiter run. |
 | **Time column** | Located by name (`time`, `toa`, `time_of_arrival`). Its unit comes from the profile, defaulting to **microseconds**, and is scaled to seconds for the absolute timeline on ingest. The original unit is recorded so export restores it exactly. |
 | **Pulse fields** | Every non-time column of the pulse header becomes one field array per group (§6.6). Files are numeric throughout; a non-numeric column is reported as a diagnostic and kept as a text field array rather than aborting the import. |
+| **Numeric storage** | Pulse columns default to `f64`, not the `f32` of §17.11: G1 asks for a lossless round trip and a decimal that survives `f32` is the exception. Narrowing a column to `f32` or `i32` halves or quarters its storage and is a per-column choice in the mapping UI. The sniff pass *offers* a narrowing it can see is safe but never applies one, because it has read only the first group. |
+| **Text columns** | A text field array is stored the way every other column is — as a numeric blob — by dictionary-encoding it: the column holds `i32` indices and the group carries the distinct cells in `csv_text.<key>`. Export restores the original spelling, so the round trip is lossless; the column's zone map orders by first appearance rather than by value, which is why a text column is not searchable by range. |
 | **Group fields** | Every group-header column other than the count becomes a group property. Text is expected here (`info` in the sample) and is stored as a group attribute. |
 | **Delimiter** | Auto-detected from the group header (`,` `;` `\t` `\|`), overridable. |
 | **Encoding** | UTF-8, with UTF-8/UTF-16 BOM stripped. Invalid sequences are reported with byte offsets, not silently replaced. |
@@ -1709,10 +1711,12 @@ noted.
 
 ### Data model
 
-11. **Numeric precision.** Default storage is `f32` (halves memory, ample for most captured
-    signals); `f64` is available per signal. Processing is always done in `f64` internally
-    and narrowed on write — confirm that narrowing on every stage boundary is acceptable,
-    or whether intermediate stages should stay `f64` end-to-end.
+11. **Numeric precision.** Default storage is `f32` for *signals* (halves memory, ample for
+    most captured signals); `f64` is available per signal. **Pulse columns resolved to `f64`
+    at M2** — G1 requires the CSV round trip to be lossless, and `f32` cannot promise it, so
+    narrowing a pulse column is an explicit per-column choice (§7.3). Processing is always
+    done in `f64` internally and narrowed on write — confirm that narrowing on every stage
+    boundary is acceptable, or whether intermediate stages should stay `f64` end-to-end.
 12. **Complex signals.** `c64` is in the dtype enum and `BasebandIq` is a domain, but full
     complex support (complex-aware pyramids, constellation rendering) is scheduled for
     V1.x. Confirm whether I/Q pairs arrive as two real signals or as one complex one — this

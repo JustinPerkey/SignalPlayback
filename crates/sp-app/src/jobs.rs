@@ -23,6 +23,19 @@ where
     flatten(tokio::task::spawn_blocking(move || store.write(job)).await)
 }
 
+/// Runs a blocking call that does not touch the store — reading a file to
+/// preview it, for instance — off the UI thread.
+pub async fn blocking<T, F>(job: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(job).await {
+        Ok(value) => value,
+        Err(error) => panic!("a blocking job did not complete: {error}"),
+    }
+}
+
 fn flatten<T>(outcome: Result<sp_store::Result<T>, tokio::task::JoinError>) -> Result<T, String> {
     match outcome {
         Ok(Ok(value)) => Ok(value),
