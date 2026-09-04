@@ -6,13 +6,14 @@ use iced::widget::{button, column, container, horizontal_rule, row, scrollable, 
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
 use sp_store::Store;
 
-use crate::screens::{self, generate, import, library, properties, Screen, Section};
+use crate::screens::{self, generate, import, library, properties, scope, Screen, Section};
 
 /// Everything the UI reads.
 ///
 /// Screen state lives here rather than inside [`Screen`] so it survives
-/// navigation (§12.3). Later milestones add the stage registry and the scope
-/// state alongside.
+/// navigation (§12.3) — the scope keeps its playhead, viewport and traces
+/// while the user is off looking at something else. Later milestones add the
+/// stage registry and the active run alongside.
 #[derive(Debug)]
 pub struct App {
     screen: Screen,
@@ -25,6 +26,9 @@ pub struct App {
     import: import::State,
     generate: generate::State,
     properties: properties::State,
+    /// Playback state survives navigation, so comparing two screens never
+    /// costs the user their place (§12.3).
+    scope: scope::State,
     log_dir: Option<PathBuf>,
 }
 
@@ -38,6 +42,7 @@ pub enum Message {
     Import(import::Message),
     Generate(generate::Message),
     Properties(properties::Message),
+    Scope(scope::Message),
 }
 
 impl App {
@@ -79,6 +84,7 @@ impl App {
             import: import::State::default(),
             generate: generate::State::default(),
             properties: properties::State::default(),
+            scope: scope::State::default(),
             log_dir,
         };
 
@@ -88,6 +94,7 @@ impl App {
                 app.import.load(&store).map(Message::Import),
                 app.generate.load(&store).map(Message::Generate),
                 app.properties.load(&store).map(Message::Properties),
+                app.scope.load(&store).map(Message::Scope),
             ]),
             None => Task::none(),
         };
@@ -132,9 +139,11 @@ impl App {
                     .map(Message::Import);
                 // An import that committed changes what the library holds.
                 match (self.import.take_completed(), self.store.clone()) {
-                    (true, Some(store)) => {
-                        Task::batch([task, self.library.load(&store).map(Message::Library)])
-                    }
+                    (true, Some(store)) => Task::batch([
+                        task,
+                        self.library.load(&store).map(Message::Library),
+                        self.scope.load(&store).map(Message::Scope),
+                    ]),
                     _ => task,
                 }
             }
@@ -145,9 +154,11 @@ impl App {
                     .map(Message::Generate);
                 // A generation that committed changes what the library holds.
                 match (self.generate.take_completed(), self.store.clone()) {
-                    (true, Some(store)) => {
-                        Task::batch([task, self.library.load(&store).map(Message::Library)])
-                    }
+                    (true, Some(store)) => Task::batch([
+                        task,
+                        self.library.load(&store).map(Message::Library),
+                        self.scope.load(&store).map(Message::Scope),
+                    ]),
                     _ => task,
                 }
             }
@@ -155,6 +166,10 @@ impl App {
                 .properties
                 .update(self.store.as_ref(), message)
                 .map(Message::Properties),
+            Message::Scope(message) => self
+                .scope
+                .update(self.store.as_ref(), message)
+                .map(Message::Scope),
         }
     }
 
@@ -162,8 +177,38 @@ impl App {
         Subscription::batch([
             self.import.subscription().map(Message::Import),
             self.generate.subscription().map(Message::Generate),
+            self.scope.subscription().map(Message::Scope),
+            self.transport_shortcuts(),
             Self::shortcuts(),
         ])
+    }
+
+    /// Keyboard transport, live only while the Scope screen is showing
+    /// (§11.4): space plays and pauses, `[` and `]` set the loop points,
+    /// `Home` and `End` jump to the bounds.
+    ///
+    /// They are suppressed while the user is typing in the scope's filter,
+    /// where a space is a space.
+    fn transport_shortcuts(&self) -> Subscription<Message> {
+        use keyboard::key::Named;
+
+        if self.screen != Screen::Scope || !self.scope.accepts_transport_keys() {
+            return Subscription::none();
+        }
+        keyboard::on_key_press(|key, modifiers| {
+            if modifiers.command() || modifiers.alt() {
+                return None;
+            }
+            let message = match key.as_ref() {
+                keyboard::Key::Named(Named::Space) => scope::Message::Toggle,
+                keyboard::Key::Named(Named::Home) => scope::Message::SeekFraction(0.0),
+                keyboard::Key::Named(Named::End) => scope::Message::SeekFraction(1.0),
+                keyboard::Key::Character("[") => scope::Message::SetLoopStart,
+                keyboard::Key::Character("]") => scope::Message::SetLoopEnd,
+                _ => return None,
+            };
+            Some(Message::Scope(message))
+        })
     }
 
     fn shortcuts() -> Subscription<Message> {
@@ -192,6 +237,7 @@ impl App {
             Screen::Import => self.import.view().map(Message::Import),
             Screen::Generate => self.generate.view().map(Message::Generate),
             Screen::Properties => self.properties.view().map(Message::Properties),
+            Screen::Scope => self.scope.view().map(Message::Scope),
             other => screens::placeholder(other),
         };
 

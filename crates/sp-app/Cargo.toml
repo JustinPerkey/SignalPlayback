@@ -17,6 +17,7 @@ sp-core.workspace = true
 sp-store.workspace = true
 sp-csv.workspace = true
 sp-gen.workspace = true
+sp-engine.workspace = true
 iced.workspace = true
 rfd.workspace = true
 tokio.workspace = true

@@ -13,6 +13,7 @@ mod logging;
 mod paths;
 mod screens;
 mod state;
+mod widgets;
 
 use iced::{Size, Task};
 

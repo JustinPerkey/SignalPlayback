@@ -3645,6 +3645,7 @@ dependencies = [
  "serde_json",
  "sp-core",
  "sp-csv",
+ "sp-engine",
  "sp-gen",
  "sp-store",
  "tempfile",
@@ -3690,7 +3691,12 @@ dependencies = [
 name = "sp-engine"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "sp-core",
+ "sp-store",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

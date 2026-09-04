@@ -10,6 +10,7 @@ pub mod generate;
 pub mod import;
 pub mod library;
 pub mod properties;
+pub mod scope;
 
 use iced::widget::{column, container, row, text, text::secondary, Space};
 use iced::{Element, Length};
