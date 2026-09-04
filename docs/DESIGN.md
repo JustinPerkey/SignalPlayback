@@ -1,10 +1,15 @@
 # SignalPlayback — Design Document
 
-**Status:** Draft v0.3
+**Status:** Draft v0.5
 **Date:** 2026-09-04
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v0.5** — Schema corrections found while building M1: `sample_chunk` keeps
+> its rowid because `sqlite3_blob_open` cannot address a `WITHOUT ROWID` table; `signal`
+> gains `nan_count` so cached statistics reload with their sums intact; `dataset` gains
+> `attributes` to match the domain model. §5.2 and §5.3 updated.
+>
 > **Changes in v0.4** — The library is now a **single SQLite file**: column data is stored
 > as chunked BLOBs inside `library.db` rather than as `.sigbin` files beside it. §5.1, §5.3
 > and §5.4 rewritten, §3 and §3.1 updated, and the blob/SQLite desync risk is gone.
@@ -279,7 +284,8 @@ CREATE TABLE dataset (
     source_uri    TEXT,
     profile_id    INTEGER REFERENCES import_profile(id),
     created_utc   TEXT    NOT NULL,
-    notes         TEXT
+    notes         TEXT,
+    attributes    TEXT    NOT NULL DEFAULT '{}'   -- JSON property values
 );
 
 -- A group block from the CSV, or a bundle of generated signals.
@@ -318,6 +324,7 @@ CREATE TABLE signal (
     time_blob_id   INTEGER REFERENCES sample_blob(id),
     gen_spec       TEXT,                   -- JSON GenSpec when generated
     min_value      REAL, max_value REAL, mean_value REAL, rms_value REAL,
+    nan_count      INTEGER NOT NULL DEFAULT 0,      -- samples excluded from the stats
     attributes     TEXT    NOT NULL DEFAULT '{}',    -- JSON property values
     UNIQUE (group_id, ordinal)
 );
@@ -336,13 +343,16 @@ CREATE TABLE sample_blob (
 );
 
 -- Blob payload, split so no single BLOB approaches SQLite's 1 GB ceiling and
--- so a bulk import checkpoints the WAL at a predictable rate.
+-- so a bulk import checkpoints the WAL at a predictable rate. Keeps its rowid:
+-- incremental blob I/O addresses a cell by rowid and cannot open one in a
+-- WITHOUT ROWID table.
 CREATE TABLE sample_chunk (
+    id      INTEGER PRIMARY KEY,
     blob_id INTEGER NOT NULL REFERENCES sample_blob(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL,               -- 0-based chunk index
     data    BLOB    NOT NULL,
-    PRIMARY KEY (blob_id, ordinal)
-) WITHOUT ROWID;
+    UNIQUE (blob_id, ordinal)
+);
 
 CREATE TABLE tag (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
 CREATE TABLE signal_tag (
@@ -452,9 +462,13 @@ single-file library: one copy per read where an mmap'd file would have had none.
 pattern (`INSERT … zeroblob(n)`, then `blob_open` and write), which keeps a 4 MiB chunk
 from ever being materialised twice in memory.
 
-Blobs are immutable and content-addressed by blake3 over the payload. Editing a signal
-writes a new blob and decrements the old blob's `refcount`; a maintenance pass deletes
-blobs at refcount 0, and `VACUUM` returns the pages.
+Blobs are immutable and content-addressed by blake3 over the payload. A write streams
+into a row carrying a placeholder address and, on completion, either takes its blake3
+address or — if a blob with that address already exists — discards its chunks and bumps
+the existing blob's `refcount`. Editing a signal writes a new blob and releases the old
+one; a blob is deleted, chunks included, when its last reference goes, and `VACUUM`
+returns the pages. `Verify Library` (§14) reconciles `refcount` against the rows that
+actually reference each blob.
 
 **This is what makes storing every intermediate stage affordable.** A stage that passes a
 signal through unchanged produces the same content hash and therefore the same blob — the
