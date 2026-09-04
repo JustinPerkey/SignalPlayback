@@ -5,6 +5,10 @@
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v0.4** — The library is now a **single SQLite file**: column data is stored
+> as chunked BLOBs inside `library.db` rather than as `.sigbin` files beside it. §5.1, §5.3
+> and §5.4 rewritten, §3 and §3.1 updated, and the blob/SQLite desync risk is gone.
+>
 > **Changes in v0.3** — `sample/sample.csv` settled the input format, which carries **pulse
 > records** rather than sampled waveforms. §7 rewritten to the real grammar (fixed preamble,
 > file-level headers, count-driven framing, TOA in µs), §6.6 added for the pulse record
@@ -50,9 +54,9 @@ reproducible, comparable against a baseline, and can assert pass/fail on metrics
 | G1 | Round-trip the project's CSV format losslessly: import → database → export produces an equivalent file. |
 | G2 | Handle libraries of at least 10 000 signals and individual signals of at least 100 M samples without the UI dropping below 60 fps. The same budget covers a group of 10 M pulse records. |
 | G3 | Generated signals are **reproducible**: the parameter spec plus a stored seed regenerates bit-identical samples. |
-| G4 | Single-file distribution — one executable plus a self-contained library directory. No server, no external database process. |
+| G4 | Single-file everything — one executable, and one `library.db` holding metadata *and* sample data. No server, no external database process, no companion directory to keep in step. |
 | G5 | Every long-running operation (import, generation, processing, export) is cancellable and reports progress without blocking the UI. |
-| G6 | The database is inspectable and repairable with standard tooling (`sqlite3`, a hex editor). |
+| G6 | The whole library is inspectable and repairable with standard tooling: `sqlite3` reaches every table and every byte of column data. |
 | G7 | **Every stage's output is inspectable.** After a run, the user can select any (group, stage) pair and see exactly what that stage produced, with the stage before it available for comparison. |
 | G8 | **Runs are reproducible and comparable.** A run records the pipeline, stage versions, parameters and input hashes; re-running the same inputs produces identical results, and any two runs can be diffed. |
 | G9 | **A new algorithm is cheap to add.** Implementing one trait plus a parameter descriptor is enough to make a stage appear in the pipeline editor with a generated parameter form. |
@@ -78,7 +82,7 @@ reproducible, comparable against a baseline, and can assert pass/fail on metrics
 | Language | Rust (2021 edition, stable toolchain) | Repo is already Cargo-configured. Memory safety plus the throughput needed for large sample arrays. |
 | GUI | **Iced** (`iced` 0.13.x, `wgpu` backend) | Retained-mode Elm architecture: a single `Message` enum and pure `update` make the transport and pipeline state machines easy to reason about and test. Pure Rust, no JS toolchain. Custom `canvas::Program` gives full control of the scope renderer. |
 | Metadata store | **SQLite** via `rusqlite` (bundled feature, WAL mode) | Ad-hoc SQL over groups/signals/properties/runs, transactional integrity, single-file backup, universally inspectable. |
-| Sample store | **File-backed binary blobs** (`.sigbin`) with mmap reads | Keeps multi-GB sample arrays out of the SQLite page cache. Zero-copy slice reads for the renderer. Content addressing makes pipeline passthrough free. |
+| Sample store | **Chunked SQLite BLOBs** read with incremental blob I/O (`sqlite3_blob_open`) | Keeps the library a single file (G4) and every byte reachable from `sqlite3` (G6). Chunking sidesteps SQLite's 1 GB blob ceiling and bounds WAL churn; incremental I/O reads a slice without materialising the whole column. Content addressing still makes pipeline passthrough free. |
 | CSV | `csv` crate over a custom block framer | Handles quoting/escaping correctly; the framer above it enforces the group/signal block grammar. |
 | Serialization | `serde` + `serde_json` | Generator specs, stage parameters, artifact payloads and property values. |
 | Hashing | `blake3` | Content addressing, integrity checks, and pipeline cache keys. |
@@ -96,9 +100,12 @@ reproducible, comparable against a baseline, and can assert pass/fail on metrics
   traces is harder to cache than Iced's explicit `canvas::Cache`.
 - **Tauri** — richest charting ecosystem, but the IPC boundary would force sample data
   through serialization on every viewport change and every stage inspection.
-- **Pure-SQLite BLOB storage** — simplest, but chunked BLOB reads add a copy per access,
-  bloat the WAL during import, and lose the content-addressed dedup that makes storing
-  every stage's intermediate signals affordable.
+- **External blob files with mmap** (`.sigbin` beside `library.db`) — the fastest option:
+  zero-copy slice reads, no write amplification through the WAL. Rejected because it makes
+  the library a directory rather than a file, and puts the sample bytes outside anything
+  `sqlite3` can see. It also introduces the one failure mode a single file cannot have —
+  a blob and its row disagreeing after a crash. The cost of the choice is one memcpy per
+  chunk read and a heavier import; both are bounded and measured in §13.
 - **DuckDB/Parquet-first** — excellent for cross-signal analytics, but heavier and awkward
   as live application state.
 - **A dataflow graph engine (petgraph-based DAG with arbitrary topology)** — considered for
@@ -131,7 +138,7 @@ SignalPlayback/
     ├── sp-store/              # Persistence: SQLite schema, migrations, blob store.
     │   ├── schema/            #   NNNN_name.sql migration files (embedded)
     │   ├── db.rs              #   Connection management, writer actor
-    │   ├── blob.rs            #   .sigbin read/write, mmap, checksums
+    │   ├── blob.rs            #   Chunked BLOB read/write, incremental I/O, checksums
     │   ├── runs.rs            #   Run/stage/artifact recording and retrieval
     │   ├── pulses.rs          #   Column read/scan, zone-map prefilter, pulse search
     │   └── query.rs           #   Typed query API (no SQL escapes this crate)
@@ -223,28 +230,40 @@ plugin interface would later slot into.
 
 ### 5.1 Library Layout on Disk
 
+A library is **one file**. Metadata, sample and pulse-field columns, render pyramids and
+artifact payloads all live in it; the `-wal` and `-shm` files are SQLite's own and exist
+only while the library is open or after an unclean shutdown.
+
 ```
-<library-root>/
-├── library.db            # SQLite: all metadata, runs, artifacts
-├── library.db-wal
-├── samples/
-│   └── a3/a3f9c1…e2.sigbin   # content-addressed by blake3, 2-char fanout
-├── pyramids/
-│   └── a3/a3f9c1…e2.sigmip   # derived, safe to delete and rebuild
-├── artifacts/
-│   └── 7c/7c11ab…04.artbin   # large artifact payloads (spectrogram matrices, etc.)
-└── imports/
-    └── 2026-09-04T12-00-00_capture.csv   # optional archived original
+my-library.db             # everything: metadata, columns, pyramids, artifacts
+my-library.db-wal         # SQLite write-ahead log (transient)
+my-library.db-shm         # SQLite shared-memory index (transient)
 ```
 
-Default root: `%LOCALAPPDATA%\SignalPlayback\library` on Windows, via `directories`.
-The root is user-selectable; multiple libraries are supported (one open at a time in v1).
+Default: `%LOCALAPPDATA%\SignalPlayback\library\library.db` on Windows, via `directories`.
+The path is user-selectable; multiple libraries are supported (one open at a time in v1).
+Backing a library up, or handing one to a colleague, is copying a single file — the point
+of the choice.
+
+**Pragmas.**
+
+```sql
+PRAGMA journal_mode = WAL;      -- one writer, many readers, no SQLITE_BUSY dance
+PRAGMA synchronous  = NORMAL;   -- WAL makes this safe against process crashes
+PRAGMA foreign_keys = ON;
+PRAGMA page_size    = 8192;     -- fewer pages per MB of column data
+PRAGMA wal_autocheckpoint = 4000;  -- ~32 MB, so bulk import checkpoints steadily
+PRAGMA temp_store   = MEMORY;
+```
+
+The original CSV is **not** archived by default — re-importing costs one pass, and copying
+a multi-GB file into the library to sit unread is a poor trade. A per-import "keep a copy
+of the source" option stores it as a compressed blob when the provenance matters.
 
 ### 5.2 Core Schema
 
 ```sql
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+-- Connection pragmas are in §5.1.
 
 CREATE TABLE app_meta (
     key    TEXT PRIMARY KEY,
@@ -303,13 +322,27 @@ CREATE TABLE signal (
     UNIQUE (group_id, ordinal)
 );
 
+-- An immutable, content-addressed byte array: a signal's samples, a pulse
+-- field's column, a TOA column, a render pyramid, or a large artifact payload.
+-- The bytes live in sample_chunk (§5.3), never on the filesystem.
 CREATE TABLE sample_blob (
-    id        INTEGER PRIMARY KEY,
-    relpath   TEXT    NOT NULL UNIQUE,
-    byte_len  INTEGER NOT NULL,
-    checksum  TEXT    NOT NULL,            -- blake3 hex
-    refcount  INTEGER NOT NULL DEFAULT 0   -- identical signals share one blob
+    id         INTEGER PRIMARY KEY,
+    checksum   TEXT    NOT NULL UNIQUE,     -- blake3 hex; this is the address
+    byte_len   INTEGER NOT NULL,            -- total payload length across chunks
+    chunk_size INTEGER NOT NULL,            -- bytes per chunk, last one may be short
+    kind       TEXT    NOT NULL             -- what the bytes are, for Verify/maintenance
+               CHECK (kind IN ('samples','pyramid','artifact')),
+    refcount   INTEGER NOT NULL DEFAULT 0   -- identical columns share one blob
 );
+
+-- Blob payload, split so no single BLOB approaches SQLite's 1 GB ceiling and
+-- so a bulk import checkpoints the WAL at a predictable rate.
+CREATE TABLE sample_chunk (
+    blob_id INTEGER NOT NULL REFERENCES sample_blob(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,               -- 0-based chunk index
+    data    BLOB    NOT NULL,
+    PRIMARY KEY (blob_id, ordinal)
+) WITHOUT ROWID;
 
 CREATE TABLE tag (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
 CREATE TABLE signal_tag (
@@ -384,9 +417,11 @@ Processing-related tables are in §9.6.
 applied in order inside a transaction, gated on `app_meta.schema_version`. Downgrades are
 refused with a clear message rather than attempted.
 
-### 5.3 Sample Blob Format (`.sigbin`)
+### 5.3 Column Blob Format
 
-Fixed 64-byte header, then packed little-endian samples:
+A blob's logical payload is a fixed 64-byte header followed by packed little-endian
+values. It is the same layout whether the bytes hold a signal's samples, a pulse field's
+column, or a group's TOA column.
 
 | Offset | Size | Field |
 |--------|------|-------|
@@ -396,35 +431,57 @@ Fixed 64-byte header, then packed little-endian samples:
 | 7  | 1 | Channel count (u8), 1 for v1 |
 | 8  | 8 | Sample rate Hz (f64, 0.0 ⇒ irregular) |
 | 16 | 8 | t0 seconds (f64) |
-| 24 | 8 | Sample count (u64) |
+| 24 | 8 | Value count (u64) |
 | 32 | 8 | Scale factor (f64, for integer dtypes) |
 | 40 | 8 | Offset (f64, for integer dtypes) |
 | 48 | 16 | Reserved (zeroed) |
-| 64 | … | Sample payload |
+| 64 | … | Value payload |
 
-Blobs are immutable and content-addressed. Editing a signal writes a new blob and
-decrements the old blob's `refcount`; a vacuum pass removes blobs at refcount 0.
+**Stored as chunks.** That byte array is split across `sample_chunk` rows of a fixed
+`chunk_size` (**4 MiB** by default, the last chunk short). Chunking buys three things:
+SQLite's 1 GB per-BLOB ceiling never applies, a bulk import checkpoints the WAL at a
+steady rate instead of growing it by the size of the whole column, and a random slice read
+touches one chunk rather than deserialising the column.
+
+**Reading.** `sqlite3_blob_open` (rusqlite's `Connection::blob_open`) gives `Read + Seek`
+over one chunk's BLOB without loading it, so reading samples `[i, j)` costs one `memcpy`
+of exactly that span out of the chunks it falls in. This is the concrete price of a
+single-file library: one copy per read where an mmap'd file would have had none.
+
+**Writing.** Chunks are appended inside the import transaction with a zero-blob-then-fill
+pattern (`INSERT … zeroblob(n)`, then `blob_open` and write), which keeps a 4 MiB chunk
+from ever being materialised twice in memory.
+
+Blobs are immutable and content-addressed by blake3 over the payload. Editing a signal
+writes a new blob and decrements the old blob's `refcount`; a maintenance pass deletes
+blobs at refcount 0, and `VACUUM` returns the pages.
 
 **This is what makes storing every intermediate stage affordable.** A stage that passes a
 signal through unchanged produces the same content hash and therefore the same blob — the
 run records a reference, not a copy. Only signals a stage actually altered cost storage.
 
-### 5.4 Render Pyramid (`.sigmip`)
+### 5.4 Render Pyramid
 
 Rendering 100 M points per frame is not feasible, so each blob gets a derived
-multi-resolution min/max pyramid:
+multi-resolution min/max pyramid, itself stored as a blob (`kind = 'pyramid'`) keyed by
+the source blob's checksum:
 
-- Level *k* stores one `(min, max)` `f32` pair per `2^(k+6)` source samples — level 0 is a
-  64:1 reduction, each level halves again.
+- Level *k* stores one `(min, max)` `f32` pair per `2^(k+6)` source values — level 0 is a
+  64:1 reduction, each level halves again. Every level together adds ~3% to the source
+  size.
 - Levels are built once, lazily, on the worker pool (~200 ms per 100 M samples, a single
-  linear pass) and cached to disk.
-- The renderer picks the level where **samples-per-pixel lands in [1, 2]**, reads that
-  slice via mmap, and draws vertical min/max bars.
-- Below one sample per pixel the renderer reads the raw blob and draws a polyline with
+  linear pass) and cached in the library.
+- The renderer picks the level where **samples-per-pixel lands in [1, 2]** and reads that
+  slice — a few KB, one chunk — then draws vertical min/max bars.
+- Below one sample per pixel the renderer reads the raw span and draws a polyline with
   point markers.
 
 Draw cost is proportional to viewport width in pixels, not to signal length — the key to
-G2, and the reason flipping between stage outputs stays instant.
+G2, and the reason flipping between stage outputs stays instant. Because a pyramid read is
+kilobytes, the extra copy imposed by BLOB storage never lands on the frame path.
+
+Pyramids are derived data: deleting every `kind = 'pyramid'` blob is always safe and is
+what the *Rebuild pyramids* maintenance action does.
 
 ---
 
@@ -570,7 +627,7 @@ is a first-class operation.
 Two views of the same bytes serve those two needs.
 
 **Stored as columns.** Each field of a group becomes one array — a `pulse_field` backed by
-an ordinary content-addressed blob — and the group's TOA column becomes the shared
+an ordinary content-addressed blob inside `library.db` — and the group's TOA column becomes the shared
 irregular timebase every field is indexed against. A field array is a signal in every way
 that matters: it has statistics, a render pyramid, a scope trace, and it flows into a
 `GroupFrame` exactly like a sampled signal, so no stage, viewer or storage path needs a
@@ -597,9 +654,10 @@ costs 40 rows, not 10 M.
 
 **Cross-group search.** Each `pulse_field` records min/max — a zone map — so a predicate
 such as `pulse_width < 2 AND angle BETWEEN 30 AND 40` first eliminates whole groups in
-SQL, then scans only the surviving groups' columns through mmap, in parallel, returning
-`PulseRef` hits. A 4-byte-per-value linear scan runs at memory bandwidth, so a selective
-query over a 10 000-group library touches a few hundred MB at most.
+SQL, then reads only the surviving groups' columns chunk by chunk, in parallel, returning
+`PulseRef` hits. A 4-byte-per-value scan runs at roughly memory bandwidth even with the
+chunk copy in the way, so a selective query over a 10 000-group library touches a few
+hundred MB at most.
 
 **Why not one `signal` row per pulse.** It is the obvious model and it does not scale here:
 10 M pulses would mean 10 M `signal` rows plus ~40 M `signal_property` rows — hundreds of
@@ -883,7 +941,7 @@ upstream produces is flagged in place, with the missing port named, before the r
 ```rust
 pub struct GroupFrame {
     pub group:    GroupMeta,        // name, properties, ordinal
-    pub signals:  Vec<SignalRef>,   // lazily mmap-backed; never eagerly copied
+    pub signals:  Vec<SignalRef>,   // lazy column handles; read by span, never copied whole
     pub inbound:  PortMap,          // artifacts published by upstream stages
     pub run:      RunId,
 }
@@ -1122,8 +1180,8 @@ Built-in kinds: `Spectrum`, `Spectrogram`, `Detections`, `Symbols`, `Bits`, `Met
 `Constellation`, `Histogram`, `FilterResponse`, `Table`, `Text`.
 
 **Storage.** Payloads under 64 KB are stored as JSON in `artifact.payload_json`; larger
-ones (a spectrogram matrix) go to a content-addressed `.artbin` blob with the JSON holding
-only the header. The viewer sees no difference.
+ones (a spectrogram matrix) go to a content-addressed blob (`kind = 'artifact'`) with the
+JSON holding only the header. The viewer sees no difference.
 
 **Overlay artifacts are the payoff.** A `Detections` artifact draws as shaded spans
 directly on the scope, on the same time axis as the signal it came from, moving with the
@@ -1346,10 +1404,11 @@ run proceeds — the user can inspect stage 1's output while stage 4 is still co
 | Stage switch in results | < 30 ms | Metadata-only load; pyramids already built; viewport preserved |
 | CSV sniff (first 2 blocks) | < 100 ms on a 4 GB file | Bounded read, never a full scan |
 | CSV ingest | ≥ 50 MB/s single-threaded | Streaming reader, no intermediate `String` per field, direct write into a column buffer |
-| Pulse ingest | ≥ 1 M records/s | One append per field per row; group flushed to blobs at the block boundary |
-| Cross-group pulse search | < 1 s over 10 000 groups | Zone-map prefilter in SQL, then parallel mmap scan of surviving columns (§6.6) |
+| Pulse ingest | ≥ 1 M records/s | One append per field per row; group flushed to chunked blobs at the block boundary |
+| Cross-group pulse search | < 1 s over 10 000 groups | Zone-map prefilter in SQL, then parallel chunked scan of surviving columns (§6.6) |
 | Generation | ≥ 100 M samples/s (sine, 8 cores) | Rayon chunking, no per-sample allocation |
-| Pyramid build | ≤ 1 linear pass over the blob | Build all levels in one traversal |
+| Pyramid build | ≤ 1 linear pass over the blob | Build all levels in one traversal, streaming chunk by chunk |
+| Column slice read | ≤ 1 copy of the requested span | Incremental blob I/O into the caller's buffer; no whole-column materialisation |
 | Pipeline throughput | ≥ 0.8 × cores on group-parallel work | Groups fan out across rayon; bounded in-flight frames |
 | Re-run after a param edit | Only stages ≥ the edited one | Content-hash cache (§9.5) |
 | Library query | < 50 ms at 10 000 signals | Indexed SQLite + FTS5 + `signal_property` index, metadata only |
@@ -1368,8 +1427,10 @@ caught at the task boundary (`catch_unwind`) and reported as a stage failure wit
 group named, so one bad algorithm cannot take down a run.
 
 **Integrity.** Blob checksums are verified on first read after app start and after any
-crash-recovery. A `Verify Library` action rehashes everything and reports mismatches in
-both directions, including artifact blobs.
+crash-recovery. A `Verify Library` action rehashes every blob and reports mismatches, plus
+any blob at refcount 0 and any row referencing a missing blob. Because the bytes and the
+rows describing them commit in one SQLite transaction, the two cannot disagree after a
+crash — the failure mode a split file/database store has, and this one does not.
 
 **Testing.**
 - Unit tests per crate; property tests (`proptest`) for the CSV round-trip (G1) and for
@@ -1494,7 +1555,7 @@ larger effort · **[Stretch]** speculative.
 - **[V1.x]** Bulk edit: rename, retag, set properties across a selection.
 - **[V1.x]** Duplicate detection via blob checksum; deduplicate on ingest.
 - **[V1.x]** Library statistics dashboard (count, total size, rate distribution, run storage).
-- **[V1.x]** Vacuum / verify / rebuild-pyramids / prune-old-runs maintenance actions.
+- **[V1.x]** Vacuum / verify / rebuild-pyramids / prune-old-runs maintenance actions (a library that has shed data needs `VACUUM` to return the pages).
 - **[V2]** Multiple libraries open simultaneously with cross-library compare.
 - **[V2]** Versioning: keep prior revisions of an edited signal.
 - **[V2]** Archive/restore a dataset or a run to a single portable `.splib` bundle.
@@ -1563,7 +1624,7 @@ larger effort · **[Stretch]** speculative.
 | Phase | Deliverable | Exit criteria |
 |-------|-------------|---------------|
 | **M0 — Skeleton** | Workspace, `sp-core` types, Iced window with screen nav, logging | App launches, screens switch, CI builds and clippy is clean |
-| **M1 — Store** | SQLite schema + migrations, blob store, store actor, property definitions, library screen | Signals insert and list; property queries work; `Verify Library` passes |
+| **M1 — Store** | SQLite schema + migrations, chunked blob store, store actor, property definitions, library screen | Signals insert and list; property queries work; a column round-trips through chunked BLOB storage byte-for-byte; `Verify Library` passes |
 | **M2 — Import** | Block framer, parser, mapping UI (incl. property binding), streaming ingest, error list | Fixture corpus imports; round-trip property test passes (G1) |
 | **M3 — Generate** | `GenSpec`, primitives, combinators, generator UI, sweeps | Determinism property test passes (G3); presets load |
 | **M4 — Playback** | Pyramid builder, viewport, scope canvas, transport, clock, domain renderers | 100 M-sample signal plays at 60 fps (G2) |
@@ -1651,5 +1712,6 @@ noted.
 | A user algorithm panics or hangs | Run lost, app unstable | `catch_unwind` per stage invocation; per-stage timeout; failure isolated to one group |
 | Iced canvas performance at 8+ dense traces plus overlays | Misses G2 | Pyramid decimation caps draw cost at viewport width; layered caches; `wgpu` backend; fall back to instanced GPU line rendering if needed |
 | Iced API churn between releases | Build breakage | Pin the minor version; isolate all Iced usage in `sp-app` |
-| Blob store and SQLite drifting out of sync after a crash | Orphaned or missing samples | Write blob first, then commit the row; `Verify Library` reconciles both directions |
+| WAL growth and write amplification during a large import | Slow import, transient disk use several times the payload | 4 MiB chunks with `wal_autocheckpoint` tuned to match; import commits per group, not per file; measured against the §13 ingest budget |
+| Library file stays large after data is deleted | Disk not reclaimed | Blob refcounting frees pages on delete; `VACUUM` in the maintenance actions reclaims the file itself |
 | Scope creep from §15 | M1–M8 slip | Tiers are contractual: nothing beyond **[MVP]** enters v1 without cutting something else |

@@ -49,9 +49,11 @@ Dependencies point left-to-right only: `sp-core` depends on nothing else here,
 
 ## Where things live
 
-The library and the rolling log default to `%LOCALAPPDATA%\SignalPlayback` on
-Windows, and to the platform equivalent elsewhere. Set `RUST_LOG` to change log
-verbosity (default: `warn,sp_app=info,sp_core=info`).
+A library is a single SQLite file — metadata and sample data both — so backing
+one up is copying one file. It and the rolling log default to
+`%LOCALAPPDATA%\SignalPlayback` on Windows, and to the platform equivalent
+elsewhere. Set `RUST_LOG` to change log verbosity (default:
+`warn,sp_app=info,sp_core=info`).
 
 ## Licence
 
