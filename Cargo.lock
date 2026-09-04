@@ -3683,8 +3683,12 @@ dependencies = [
 name = "sp-dsp"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "sp-core",
  "sp-proc",
+ "sp-store",
+ "tempfile",
 ]
 
 [[package]]
@@ -3721,7 +3725,15 @@ dependencies = [
 name = "sp-proc"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "rayon",
+ "serde",
+ "serde_json",
  "sp-core",
+ "sp-store",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

@@ -8,12 +8,13 @@ pub mod artifact;
 pub mod group;
 pub mod props;
 pub mod pulse;
+pub mod run;
 pub mod signal;
 pub mod stats;
 pub mod time;
 
 pub use artifact::{
-    Artifact, ArtifactSchema, ColumnSpec, FieldRef, FieldSpec, OverlayForm, ViewHint,
+    Artifact, ArtifactSchema, ColumnSpec, FieldKind, FieldRef, FieldSpec, OverlayForm, ViewHint,
 };
 pub use group::{
     Dataset, DatasetId, GroupId, GroupMeta, SignalGroup, SignalTrain, SourceKind, TrainId,
@@ -22,6 +23,9 @@ pub use props::{
     Attributes, PropKind, PropScope, PropertyDef, PropertyError, PropertySet, PropertyValue,
 };
 pub use pulse::{FieldRange, PulseField, PulseRef, TimeUnit};
+pub use run::{
+    ArtifactId, Diagnostic, Disposition, PipelineId, Retention, RunStatus, Severity, StageStatus,
+};
 pub use signal::{
     DType, Domain, Provenance, RunId, SampleBuffer, Samples, Scaling, Signal, SignalId, C64,
 };
