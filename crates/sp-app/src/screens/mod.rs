@@ -6,6 +6,7 @@
 //! from it (§12.3). Screens whose milestone has not landed show
 //! [`placeholder`].
 
+pub mod generate;
 pub mod import;
 pub mod library;
 pub mod properties;

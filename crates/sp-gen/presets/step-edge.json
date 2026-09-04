@@ -1,0 +1,18 @@
+{
+  "name": "Step edge",
+  "description": "A clean step halfway through, with a little noise on it, for threshold and slew measurements.",
+  "spec": {
+    "timebase": { "sample_rate_hz": 1000000.0, "t0_s": 0.0 },
+    "duration_s": 0.01,
+    "dtype": "f32",
+    "domain": "analog",
+    "seed": 7,
+    "root": {
+      "node": "sum",
+      "terms": [
+        { "node": "step", "at_s": 0.005, "before": 0.0, "after": 1.0 },
+        { "node": "noise", "kind": "gaussian", "amp": 0.01 }
+      ]
+    }
+  }
+}

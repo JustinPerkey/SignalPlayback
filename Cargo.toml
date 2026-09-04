@@ -30,11 +30,21 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "blob", "cache"] }
 blake3 = "1.8"
+
+# Generation. `ChaCha12Rng` is seekable, so a noise stream is addressable by
+# sample index and a chunk renders the same as the whole range (G3).
+rand = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
+rayon = "1.11"
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync"] }
 tempfile = "3.27"
 proptest = "1.9"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `float_roundtrip` makes the parser return the exact `f64` that was written.
+# Without it serde_json can come back a bit out on some values, which would
+# break the promise that a stored `gen_spec` re-renders bit-identical samples
+# (G3) and that an attribute survives export unchanged (G1).
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 thiserror = "2.0"
 time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing"] }
 tracing = "0.1"

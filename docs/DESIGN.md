@@ -792,7 +792,9 @@ Samples are a *cache* of the spec — deleting a blob is always safe.
 
 ```rust
 pub struct GenSpec {
-    pub timebase: Timebase,   // sample_rate_hz, duration_s, t0_s
+    pub timebase: Timebase,   // sample_rate_hz, t0_s
+    pub duration_s: f64,      // a stored signal's length is its sample count,
+                              //   so the duration is a field of the spec
     pub dtype:    DType,
     pub domain:   Domain,
     pub seed:     u64,        // ChaCha12 seed; makes noise reproducible (G3)
@@ -813,12 +815,12 @@ pub enum Node {
     Impulse   { at_s: f64, amp: f64 },
     Noise     { kind: NoiseKind, amp: f64 },   // Gaussian|Uniform|Pink|Brown
     Prbs      { order: u8, taps: Option<u32>, amp: f64 },
-    Expr      { source: String },              // f(t) via `meval`, t in seconds
+    Expr      { source: String },              // f(t), t in seconds
 
     // Combinators
     Sum       { terms: Vec<Node> },
     Product   { terms: Vec<Node> },
-    Concat    { parts: Vec<(Node, f64)> },     // (node, duration_s)
+    Concat    { parts: Vec<ConcatPart> },      // { node, duration_s }
     Gain      { input: Box<Node>, factor: f64 },
     Delay     { input: Box<Node>, by_s: f64 },
     Clip      { input: Box<Node>, lo: f64, hi: f64 },
@@ -830,6 +832,22 @@ pub enum Node {
 }
 ```
 
+Every node is addressed by its **JSON pointer** into the serialised spec — `/root`,
+`/root/terms/1`, `/root/carrier`, `/root/parts/0/node`. One address serves the tree
+editor's selection, a validation issue, the parameter form and a sweep target, which is
+why `Concat` holds a named struct rather than a tuple: a tuple has no field to point at.
+
+**Settled during M3.**
+
+| Decision | Why |
+|----------|-----|
+| **Node time** starts at the signal, not at the timeline: a node sees `t = index / fs`, and `t0_s` only places the finished signal. | Moving a signal in time must not change its samples. |
+| **`Expr` is evaluated by a hand-rolled shunting-yard compiler**, not `meval`. | `meval` 0.2 pulls `nom` 1.2 (2016), which `cargo` already reports as future-incompatible. Compiling once to RPN also makes the per-sample cost a stack machine rather than a tree walk. |
+| **FM and PM require an oscillator carrier** (`Sine`/`Square`/`Triangle`/`Sawtooth`), and FM requires a modulator with a closed-form integral. AM accepts any carrier. | Both rewrite the carrier's *phase*, which only a periodic primitive has. Anything else is rejected up front with that as the fix. |
+| **`Delay` shifts by whole samples.** | A sub-sample shift needs interpolation, and `Resample` is the node that owns interpolation. |
+| **`Resample` only ever lowers the rate.** | Above the output rate there is nothing to reconstruct; below it is what models a slower converter. Validation warns rather than blocking. |
+| **`serde_json`'s `float_roundtrip` feature is required.** | Without it the parser can return an `f64` a bit out from the one written, which would break both the stored `gen_spec` re-rendering identically (G3) and an attribute surviving export unchanged (G1). |
+
 ### 8.2 Rendering
 
 - Pure function `render(&GenSpec, range: SampleRange) -> SampleBuffer`, so any window can
@@ -840,16 +858,46 @@ pub enum Node {
 - Node parameter validation happens up front: negative frequencies, duty outside (0,1),
   Nyquist violations (`freq_hz ≥ fs/2`) become blocking errors with a fix suggestion.
 
+Independence is what everything else follows from: every source is a **function of the
+sample index** rather than a running state.
+
+- `ChaCha12Rng` is seekable, so the draw for sample *i* sits at a fixed word position and
+  a chunk starting at *i* seeks there. The key is `blake3(seed ‖ node pointer)`.
+- Pink and brown noise are Voss-McCartney octave sums, `white(k, i >> k)`, which are
+  addressable. An exact `1/f²` random walk is a prefix sum and is not; window-independent
+  rendering is the harder constraint, so the octave sum is what ships.
+- A PRBS is a linear recurrence, so its state at index *i* is `Mⁱ · s₀` over GF(2);
+  repeated squaring reaches any index in `O(log i)`.
+- `Concat` gives each part its own origin and duration, and `Resample` renders its input
+  on the resampled grid. Validation follows the same two rules, so a Nyquist message
+  about a node under a `Resample` names that node's own grid.
+
+"Bit-identical" (G3) means: the same spec and seed on the same build produce the same
+bits, and a chunked render equals a whole one. Cross-platform bit equality is not claimed
+and cannot be — `sin`, `ln` and `cos` are not bit-specified by IEEE 754.
+
 ### 8.3 Generator UI
 
 - Left: a node tree with add/remove/reorder. Right: parameters for the selected node.
-- A **live preview** strip renders the first ~2 seconds at reduced rate on every keystroke
-  (debounced 150 ms), so the shape is visible before committing.
+- A **live preview** strip renders the first ~2 seconds on every keystroke (debounced
+  150 ms), so the shape is visible before committing. It renders at the real rate and
+  *then* reduces to one min/max pair per column, rather than rendering at a reduced rate:
+  a lower rate would alias the preview into showing something the signal does not do.
 - **Batch/sweep mode**: mark one numeric parameter as swept (`start`, `stop`, `step`, or an
   explicit list) to emit a whole group of signals in one action — e.g. 20 sine waves from
   100 Hz to 2 kHz. The sweep becomes a `signal_group` with the swept value stored as a
   property, which is exactly the shape a pipeline wants as test input.
 - Presets are `GenSpec` JSON files; a small built-in library ships with the app.
+
+The parameter form and the sweep target picker are both generated from the spec's
+serialised fields rather than from a match over `Node`, so a node variant added later is
+editable and sweepable with no UI code. A sweep substitutes through the same JSON
+pointer, and declares its property in `property_def` so the swept value shows up as a
+typed column rather than as an unrecognised attribute (§6.4).
+
+A preset file is a `GenSpec` with a name and a description wrapped around it, so the
+browser has something to list; a file holding a bare `GenSpec` loads too and takes its
+name from the file.
 
 ### 8.4 Test-Vector Generation
 

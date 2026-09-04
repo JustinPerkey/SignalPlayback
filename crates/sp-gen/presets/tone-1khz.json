@@ -1,0 +1,12 @@
+{
+  "name": "1 kHz tone",
+  "description": "A single 1 kHz sine at 48 kHz. The known-answer vector for anything that measures frequency (DESIGN.md 8.4).",
+  "spec": {
+    "timebase": { "sample_rate_hz": 48000.0, "t0_s": 0.0 },
+    "duration_s": 1.0,
+    "dtype": "f32",
+    "domain": "analog",
+    "seed": 0,
+    "root": { "node": "sine", "freq_hz": 1000.0, "amp": 1.0, "phase_rad": 0.0, "offset": 0.0 }
+  }
+}

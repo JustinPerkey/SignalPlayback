@@ -1,0 +1,12 @@
+{
+  "name": "PRBS-9 NRZ",
+  "description": "A maximal-length PRBS-9 at one bit per sample, emitted as digital logic so a symbol decoder can be tested without an analog front end (DESIGN.md 8.4).",
+  "spec": {
+    "timebase": { "sample_rate_hz": 1000000.0, "t0_s": 0.0 },
+    "duration_s": 0.005,
+    "dtype": "f32",
+    "domain": "digital_logic",
+    "seed": 0,
+    "root": { "node": "prbs", "order": 9, "taps": null, "amp": 1.0 }
+  }
+}

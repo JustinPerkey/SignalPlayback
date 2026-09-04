@@ -1,0 +1,17 @@
+{
+  "name": "FM tone",
+  "description": "A 10 kHz carrier swept 2 kHz either side by a 200 Hz modulator, for demodulator tests.",
+  "spec": {
+    "timebase": { "sample_rate_hz": 192000.0, "t0_s": 0.0 },
+    "duration_s": 0.05,
+    "dtype": "f32",
+    "domain": "analog",
+    "seed": 0,
+    "root": {
+      "node": "modulate",
+      "carrier": { "node": "sine", "freq_hz": 10000.0, "amp": 1.0, "phase_rad": 0.0, "offset": 0.0 },
+      "modulator": { "node": "sine", "freq_hz": 200.0, "amp": 1.0, "phase_rad": 0.0, "offset": 0.0 },
+      "kind": { "mode": "fm", "dev_hz": 2000.0 }
+    }
+  }
+}
