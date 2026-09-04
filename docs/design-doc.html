@@ -1,0 +1,1536 @@
+<title>SignalPlayback Design</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&display=swap">
+
+<style>
+/* ── Tokens: complete light palette on bare :root ─────────────────────── */
+:root {
+  --ground:      #EFF2F3;
+  --surface:     #FFFFFF;
+  --surface-sub: #E7ECEE;
+  --ink:         #10171B;
+  --ink-mid:     #3D4B54;
+  --ink-mute:    #66757F;
+  --rule:        #D2DADE;
+  --rule-soft:   #E2E8EA;
+
+  /* Okabe–Ito, the palette the app itself uses for traces */
+  --trace-blue:  #0072B2;
+  --trace-teal:  #007D6E;
+  --trace-orange:#C25708;
+  --trace-plum:  #8B4B96;
+
+  --accent:      var(--trace-blue);
+  --accent-ink:  #FFFFFF;
+  --warn:        var(--trace-orange);
+  --warn-wash:   #FBEDE2;
+  --ok:          var(--trace-teal);
+
+  --tier-mvp-bg:    #DCEFE8;  --tier-mvp-fg:    #0A5F51;
+  --tier-v1-bg:     #DBE9F3;  --tier-v1-fg:     #0A5480;
+  --tier-v2-bg:     #E4E8EA;  --tier-v2-fg:     #4A5860;
+  --tier-str-bg:    transparent; --tier-str-fg: #7B6A54;
+  --tier-str-brd:   #C9B79C;
+
+  --code-bg:     #F3F6F7;
+  --shadow:      0 1px 2px rgba(16, 23, 27, .06), 0 8px 24px -16px rgba(16, 23, 27, .28);
+
+  --font-display: "IBM Plex Sans Condensed", "Segoe UI", system-ui, sans-serif;
+  --font-body:    "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  --font-mono:    "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  --measure: 68ch;
+  --page:    1180px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #0C1215;
+    --surface:     #141C21;
+    --surface-sub: #1B252B;
+    --ink:         #DFE7EB;
+    --ink-mid:     #AFBDC5;
+    --ink-mute:    #7E8F99;
+    --rule:        #253138;
+    --rule-soft:   #1C262C;
+
+    --trace-blue:  #56B4E9;
+    --trace-teal:  #37C39F;
+    --trace-orange:#E69F00;
+    --trace-plum:  #C79BD4;
+
+    --accent:      var(--trace-blue);
+    --accent-ink:  #08131A;
+    --warn:        var(--trace-orange);
+    --warn-wash:   #2A2216;
+    --ok:          var(--trace-teal);
+
+    --tier-mvp-bg: #123028;  --tier-mvp-fg: #5FD6B4;
+    --tier-v1-bg:  #102A3B;  --tier-v1-fg:  #7CC7F0;
+    --tier-v2-bg:  #212C33;  --tier-v2-fg:  #A2B2BB;
+    --tier-str-bg: transparent; --tier-str-fg: #C7B08A;
+    --tier-str-brd:#5C4F3B;
+
+    --code-bg:     #0F171C;
+    --shadow:      0 1px 2px rgba(0, 0, 0, .5), 0 10px 30px -18px rgba(0, 0, 0, .9);
+  }
+}
+
+:root[data-theme="dark"] {
+  --ground:      #0C1215;
+  --surface:     #141C21;
+  --surface-sub: #1B252B;
+  --ink:         #DFE7EB;
+  --ink-mid:     #AFBDC5;
+  --ink-mute:    #7E8F99;
+  --rule:        #253138;
+  --rule-soft:   #1C262C;
+
+  --trace-blue:  #56B4E9;
+  --trace-teal:  #37C39F;
+  --trace-orange:#E69F00;
+  --trace-plum:  #C79BD4;
+
+  --accent:      var(--trace-blue);
+  --accent-ink:  #08131A;
+  --warn:        var(--trace-orange);
+  --warn-wash:   #2A2216;
+  --ok:          var(--trace-teal);
+
+  --tier-mvp-bg: #123028;  --tier-mvp-fg: #5FD6B4;
+  --tier-v1-bg:  #102A3B;  --tier-v1-fg:  #7CC7F0;
+  --tier-v2-bg:  #212C33;  --tier-v2-fg:  #A2B2BB;
+  --tier-str-bg: transparent; --tier-str-fg: #C7B08A;
+  --tier-str-brd:#5C4F3B;
+
+  --code-bg:     #0F171C;
+  --shadow:      0 1px 2px rgba(0, 0, 0, .5), 0 10px 30px -18px rgba(0, 0, 0, .9);
+}
+
+/* ── Base ─────────────────────────────────────────────────────────────── */
+* { box-sizing: border-box; }
+
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 17px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 0 28px 96px;
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  column-gap: 48px;
+  align-items: start;
+}
+
+/* ── Masthead: instrument readout strip ───────────────────────────────── */
+.masthead {
+  grid-column: 1 / -1;
+  padding: 52px 0 0;
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 14px;
+}
+
+h1 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: clamp(38px, 6vw, 58px);
+  line-height: 1.02;
+  letter-spacing: -0.015em;
+  margin: 0 0 18px;
+  text-wrap: balance;
+}
+
+.standfirst {
+  font-size: 19px;
+  line-height: 1.55;
+  color: var(--ink-mid);
+  max-width: 56ch;
+  margin: 0 0 30px;
+}
+
+.specstrip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.specstrip > div {
+  flex: 1 1 150px;
+  padding: 11px 16px;
+  border-right: 1px solid var(--rule-soft);
+}
+.specstrip > div:last-child { border-right: 0; }
+.specstrip dt {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+  margin: 0 0 3px;
+}
+.specstrip dd {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The time-ruler motif: a scope axis, used to separate major sections */
+.ruler {
+  height: 13px;
+  margin: 44px 0 38px;
+  border-top: 1px solid var(--rule);
+  background:
+    repeating-linear-gradient(to right,
+      var(--rule) 0 1px, transparent 1px 24px);
+  background-size: 100% 5px;
+  background-repeat: no-repeat;
+  position: relative;
+}
+.ruler::after {
+  content: "";
+  position: absolute; inset: 0 0 auto 0;
+  height: 9px;
+  background: repeating-linear-gradient(to right,
+    var(--rule) 0 1px, transparent 1px 120px);
+}
+
+/* ── Contents rail ────────────────────────────────────────────────────── */
+.rail {
+  position: sticky;
+  top: 24px;
+  padding-top: 8px;
+  font-family: var(--font-display);
+  font-size: 13.5px;
+  line-height: 1.35;
+}
+.rail h2 {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: .15em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+  margin: 0 0 12px;
+}
+.rail ol {
+  list-style: none;
+  margin: 0; padding: 0;
+  display: flex; flex-direction: column;
+  counter-reset: rail;
+}
+.rail li { counter-increment: rail; }
+.rail a {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  gap: 6px;
+  padding: 5px 0;
+  color: var(--ink-mid);
+  text-decoration: none;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.rail a::before {
+  content: counter(rail);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-mute);
+  font-variant-numeric: tabular-nums;
+  padding-top: 1px;
+}
+.rail a:hover { color: var(--accent); }
+.rail a:hover::before { color: var(--accent); }
+.rail a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ── Content column ───────────────────────────────────────────────────── */
+main { min-width: 0; }
+
+section { scroll-margin-top: 20px; }
+
+h2 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: clamp(25px, 3.2vw, 33px);
+  line-height: 1.12;
+  letter-spacing: -0.01em;
+  margin: 0 0 6px;
+  text-wrap: balance;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: baseline;
+}
+h2 .num {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent);
+  letter-spacing: .04em;
+}
+
+h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 19px;
+  letter-spacing: .002em;
+  color: var(--ink);
+  margin: 34px 0 8px;
+}
+
+h4 {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+  margin: 26px 0 8px;
+}
+
+p, li { max-width: var(--measure); }
+p { margin: 0 0 14px; }
+
+main ul, main ol { margin: 0 0 16px; padding-left: 1.3em; }
+main li { margin-bottom: 5px; }
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+strong { font-weight: 600; }
+em { font-style: italic; }
+
+code {
+  font-family: var(--font-mono);
+  font-size: .86em;
+  background: var(--code-bg);
+  border: 1px solid var(--rule-soft);
+  border-radius: 3px;
+  padding: .1em .32em;
+}
+
+/* ── Figures: code, trees, diagrams ───────────────────────────────────── */
+figure { margin: 20px 0 24px; }
+
+.block {
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.block > .cap {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--rule-soft);
+  background: var(--surface-sub);
+}
+.block pre {
+  margin: 0;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.62;
+  color: var(--ink-mid);
+  tab-size: 2;
+}
+.block pre b { color: var(--ink); font-weight: 500; }
+.block pre i { color: var(--ink-mute); font-style: normal; }
+.block pre u { color: var(--accent); text-decoration: none; }
+
+figcaption {
+  font-size: 13.5px;
+  color: var(--ink-mute);
+  margin-top: 8px;
+  max-width: var(--measure);
+}
+
+/* ── Tables ───────────────────────────────────────────────────────────── */
+.tablewrap { overflow-x: auto; margin: 18px 0 24px; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 460px;
+  font-family: var(--font-display);
+  font-size: 14.5px;
+  line-height: 1.45;
+}
+th, td {
+  text-align: left;
+  vertical-align: top;
+  padding: 9px 14px 9px 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+th {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: .11em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+  font-weight: 500;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 7px;
+  white-space: nowrap;
+}
+td:first-child { font-weight: 600; color: var(--ink); white-space: nowrap; }
+table.wide td:first-child { white-space: normal; }
+td code { font-size: .84em; }
+.num-col { font-variant-numeric: tabular-nums; }
+
+/* ── Callouts ─────────────────────────────────────────────────────────── */
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--surface);
+  padding: 14px 18px;
+  margin: 20px 0;
+  border-radius: 0 3px 3px 0;
+  font-size: 15.5px;
+  max-width: var(--measure);
+}
+.note.warn { border-left-color: var(--warn); background: var(--warn-wash); }
+.note p:last-child { margin-bottom: 0; }
+.note .lede {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+  display: block;
+  margin-bottom: 5px;
+}
+
+/* ── Goal / risk cards ────────────────────────────────────────────────── */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(232px, 1fr));
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 20px 0 26px;
+}
+.cards > div {
+  background: var(--surface);
+  padding: 15px 17px 17px;
+}
+.cards .tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  color: var(--accent);
+  display: block;
+  margin-bottom: 6px;
+}
+.cards p { font-size: 14.5px; line-height: 1.5; margin: 0; color: var(--ink-mid); max-width: none; }
+
+/* ── Feature tiers ────────────────────────────────────────────────────── */
+.tierkey {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin: 16px 0 26px;
+  align-items: center;
+}
+.tier {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  padding: 2px 7px;
+  border-radius: 2px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.t-mvp { background: var(--tier-mvp-bg); color: var(--tier-mvp-fg); }
+.t-v1  { background: var(--tier-v1-bg);  color: var(--tier-v1-fg); }
+.t-v2  { background: var(--tier-v2-bg);  color: var(--tier-v2-fg); }
+.t-str { background: var(--tier-str-bg); color: var(--tier-str-fg); border-color: var(--tier-str-brd); }
+
+.features {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+  gap: 26px 34px;
+  margin: 8px 0 8px;
+}
+.features section { break-inside: avoid; }
+.features h3 { margin-top: 0; }
+.features ul {
+  list-style: none;
+  margin: 0; padding: 0;
+  display: flex; flex-direction: column;
+  gap: 7px;
+}
+.features li {
+  display: grid;
+  grid-template-columns: 62px 1fr;
+  gap: 9px;
+  align-items: start;
+  font-family: var(--font-display);
+  font-size: 14.5px;
+  line-height: 1.42;
+  color: var(--ink-mid);
+  max-width: none;
+  margin: 0;
+}
+.features li > .tier { justify-self: start; margin-top: 1px; }
+
+/* ── Milestone track ──────────────────────────────────────────────────── */
+.track { margin: 20px 0 26px; }
+.track ol { list-style: none; margin: 0; padding: 0; }
+.track li {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 18px;
+  padding: 14px 0;
+  border-top: 1px solid var(--rule-soft);
+  max-width: none;
+  margin: 0;
+}
+.track li:last-child { border-bottom: 1px solid var(--rule-soft); }
+.track .ms {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: .04em;
+  padding-top: 2px;
+}
+.track h4 { margin: 0 0 4px; color: var(--ink); font-size: 13px; letter-spacing: .04em; text-transform: none; font-family: var(--font-display); font-weight: 600; }
+.track p { font-family: var(--font-display); font-size: 14px; margin: 0; color: var(--ink-mid); max-width: none; }
+.track .exit {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-mute);
+  margin-top: 5px;
+  display: block;
+}
+
+/* ── Pyramid figure ───────────────────────────────────────────────────── */
+.svgfig {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 18px 16px 10px;
+  overflow-x: auto;
+}
+.svgfig svg { display: block; min-width: 480px; max-width: 100%; height: auto; }
+
+/* ── Footer ───────────────────────────────────────────────────────────── */
+footer {
+  grid-column: 1 / -1;
+  margin-top: 56px;
+  padding-top: 18px;
+  border-top: 1px solid var(--rule);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: .06em;
+  color: var(--ink-mute);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 26px;
+}
+
+/* ── Narrow ───────────────────────────────────────────────────────────── */
+@media (max-width: 940px) {
+  .page { grid-template-columns: minmax(0, 1fr); }
+  .rail { position: static; margin-bottom: 8px; }
+  .rail ol { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); column-gap: 20px; }
+  body { font-size: 16px; }
+  .page { padding: 0 18px 72px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+</style>
+
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">Design Document · Draft v0.1</p>
+    <h1>SignalPlayback</h1>
+    <p class="standfirst">A desktop signal library: import grouped CSV captures, generate waveforms from parameters, store both in a local database, and replay them on a synchronised on-screen scope.</p>
+    <dl class="specstrip">
+      <div><dt>Language</dt><dd>Rust 2021</dd></div>
+      <div><dt>GUI</dt><dd>Iced + wgpu</dd></div>
+      <div><dt>Store</dt><dd>SQLite + blobs</dd></div>
+      <div><dt>Playback sink</dt><dd>On-screen only</dd></div>
+      <div><dt>Date</dt><dd>2026-09-04</dd></div>
+    </dl>
+    <div class="ruler"></div>
+  </header>
+
+  <nav class="rail" aria-label="Contents">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#s1">Purpose</a></li>
+      <li><a href="#s2">Goals &amp; non-goals</a></li>
+      <li><a href="#s3">Technology</a></li>
+      <li><a href="#s4">Architecture</a></li>
+      <li><a href="#s5">Data model</a></li>
+      <li><a href="#s6">CSV format</a></li>
+      <li><a href="#s7">Generation</a></li>
+      <li><a href="#s8">Playback engine</a></li>
+      <li><a href="#s9">Interface</a></li>
+      <li><a href="#s10">Performance</a></li>
+      <li><a href="#s11">Cross-cutting</a></li>
+      <li><a href="#s12">Potential features</a></li>
+      <li><a href="#s13">Milestones</a></li>
+      <li><a href="#s14">Open questions</a></li>
+      <li><a href="#s15">Risks</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+    <!-- 1 ─────────────────────────────────────────────────────────────── -->
+    <section id="s1">
+      <h2><span class="num">01</span><span>Purpose</span></h2>
+      <p>SignalPlayback is a desktop application for building, storing, and replaying a library of time-domain signals. It gives an engineer one place to:</p>
+      <ol>
+        <li><strong>Import</strong> recorded signals from a structured CSV format — grouped, with per-group and per-signal metadata.</li>
+        <li><strong>Generate</strong> synthetic signals from parameters: waveform type, frequency, amplitude, noise, modulation, composition.</li>
+        <li><strong>Persist</strong> everything into a durable, queryable local signal database.</li>
+        <li><strong>Play back</strong> signals on a time-synchronised on-screen scope with transport controls and multi-signal overlay.</li>
+      </ol>
+      <p>The output of playback is <strong>on-screen visualization only</strong>. Hardware, network, and audio sinks are out of scope for v1, but the engine is structured so they can be added later as additional sinks.</p>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 2 ─────────────────────────────────────────────────────────────── -->
+    <section id="s2">
+      <h2><span class="num">02</span><span>Goals and non-goals</span></h2>
+
+      <h3>Goals</h3>
+      <div class="cards">
+        <div><span class="tag">G1 · Fidelity</span><p>Round-trip the CSV format losslessly. Import → database → export produces an equivalent file.</p></div>
+        <div><span class="tag">G2 · Scale</span><p>10 000 signals in a library, 100 M samples in a signal, without the UI dropping below 60 fps.</p></div>
+        <div><span class="tag">G3 · Reproducibility</span><p>A generated signal's parameter spec plus its stored seed regenerates bit-identical samples.</p></div>
+        <div><span class="tag">G4 · Portability</span><p>One executable plus a self-contained library directory. No server, no external database process.</p></div>
+        <div><span class="tag">G5 · Responsiveness</span><p>Every long operation is cancellable and reports progress without blocking the UI.</p></div>
+        <div><span class="tag">G6 · Inspectability</span><p>The database is readable and repairable with <code>sqlite3</code> and a hex editor.</p></div>
+      </div>
+
+      <h3>Non-goals for v1</h3>
+      <ul>
+        <li>Real-time output to DAC / SDR / DAQ hardware.</li>
+        <li>Network streaming of samples to other processes.</li>
+        <li>Audio playback.</li>
+        <li>Multi-user access, syncing, or a client/server split.</li>
+        <li>Heavy DSP analysis (filter design, demodulation chains). Basic FFT and statistics only.</li>
+      </ul>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 3 ─────────────────────────────────────────────────────────────── -->
+    <section id="s3">
+      <h2><span class="num">03</span><span>Technology choices</span></h2>
+      <div class="tablewrap">
+        <table class="wide">
+          <thead><tr><th>Layer</th><th>Choice</th><th>Rationale</th></tr></thead>
+          <tbody>
+            <tr><td>Language</td><td>Rust 2021, stable</td><td>Repo is already Cargo-configured. Memory safety plus the throughput needed for large sample arrays.</td></tr>
+            <tr><td>GUI</td><td><code>iced</code> 0.13.x, wgpu backend</td><td>Retained-mode Elm architecture: one <code>Message</code> enum and a pure <code>update</code> make the transport state machine easy to reason about and test. Pure Rust, no JS toolchain. A custom <code>canvas::Program</code> gives full control of the scope renderer.</td></tr>
+            <tr><td>Metadata store</td><td>SQLite via <code>rusqlite</code>, WAL</td><td>Ad-hoc SQL over groups, signals and tags. Transactional integrity, single-file backup, universally inspectable.</td></tr>
+            <tr><td>Sample store</td><td>File-backed <code>.sigbin</code> blobs, mmap</td><td>Keeps multi-GB sample arrays out of the SQLite page cache. Zero-copy slice reads for the renderer.</td></tr>
+            <tr><td>CSV</td><td><code>csv</code> crate over a custom framer</td><td>Correct quoting and escaping; the framer above it enforces the group/signal block grammar.</td></tr>
+            <tr><td>Serialization</td><td><code>serde</code> + <code>serde_json</code></td><td>Generator specs and unmapped metadata columns stored as JSON in SQLite.</td></tr>
+            <tr><td>Hashing</td><td><code>blake3</code></td><td>Content addressing and integrity checks for sample blobs.</td></tr>
+            <tr><td>RNG</td><td><code>rand_chacha</code></td><td><code>ChaCha12Rng</code> is portable and deterministic across platforms and versions — required by G3.</td></tr>
+            <tr><td>Parallelism</td><td><code>rayon</code> + <code>tokio</code></td><td>Generation and decimation parallelise cleanly; Iced tasks need an async executor.</td></tr>
+            <tr><td>Logging</td><td><code>tracing</code></td><td>Structured spans around import and generation for diagnosing slow files.</td></tr>
+            <tr><td>Dialogs / paths</td><td><code>rfd</code>, <code>directories</code></td><td>Native file pickers and a platform-correct default library location.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Rejected alternatives</h3>
+      <ul>
+        <li><strong>egui</strong> — better plotting out of the box, but immediate-mode redraw makes the transport and undo state model messier, and per-frame re-tessellation of 100 M-point traces is harder to cache than Iced's explicit <code>canvas::Cache</code>.</li>
+        <li><strong>Tauri</strong> — richest charting ecosystem, but the IPC boundary would force sample data through serialization on every viewport change.</li>
+        <li><strong>Pure-SQLite BLOB storage</strong> — simplest, but chunked BLOB reads add a copy per access and bloat the WAL during import.</li>
+        <li><strong>DuckDB / Parquet-first</strong> — excellent for cross-signal analytics, heavier and awkward as live application state.</li>
+      </ul>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 4 ─────────────────────────────────────────────────────────────── -->
+    <section id="s4">
+      <h2><span class="num">04</span><span>Architecture</span></h2>
+
+      <h3>Crate layout</h3>
+      <p>A Cargo workspace, so the domain logic is testable without a window.</p>
+      <figure>
+        <div class="block">
+          <div class="cap">Workspace</div>
+<pre>SignalPlayback/
+├── Cargo.toml                 <i># [workspace]</i>
+├── docs/DESIGN.md
+└── crates/
+    ├── <b>sp-core</b>/               <i># Domain types. No IO, no UI.</i>
+    │   ├── signal.rs          <i>#   Signal, SignalId, SampleBuffer, DType</i>
+    │   ├── group.rs           <i>#   SignalGroup, Dataset</i>
+    │   ├── time.rs            <i>#   TimeRange, SampleIndex, Timebase</i>
+    │   └── stats.rs           <i>#   min/max/mean/rms summarisation</i>
+    ├── <b>sp-store</b>/              <i># SQLite schema, migrations, blob store.</i>
+    │   ├── schema/            <i>#   NNNN_name.sql, embedded in the binary</i>
+    │   ├── db.rs              <i>#   Connection management, writer actor</i>
+    │   ├── blob.rs            <i>#   .sigbin read/write, mmap, checksums</i>
+    │   └── query.rs           <i>#   Typed query API — no SQL escapes this crate</i>
+    ├── <b>sp-csv</b>/                <i># Block grammar + import profiles.</i>
+    │   ├── framer.rs          <i>#   Blank-line block detection</i>
+    │   ├── parse.rs           <i>#   Header/row decoding, error positions</i>
+    │   ├── profile.rs         <i>#   Column mapping rules</i>
+    │   └── export.rs          <i>#   Database → CSV</i>
+    ├── <b>sp-gen</b>/                <i># Parametric synthesis.</i>
+    │   ├── spec.rs            <i>#   GenSpec DAG (serde)</i>
+    │   ├── waveform.rs        <i>#   Primitive oscillators</i>
+    │   ├── noise.rs           <i>#   Gaussian / uniform / pink / PRBS</i>
+    │   ├── modulate.rs        <i>#   AM/FM/PM, chirps, envelopes</i>
+    │   └── render.rs          <i>#   Spec → SampleBuffer</i>
+    ├── <b>sp-engine</b>/             <i># Playback clock, scheduler, pyramids.</i>
+    │   ├── transport.rs       <i>#   Stopped / Playing / Paused</i>
+    │   ├── clock.rs           <i>#   Monotonic virtual time, rate scaling</i>
+    │   ├── pyramid.rs         <i>#   Multi-resolution min/max mipmaps</i>
+    │   └── viewport.rs        <i>#   Time/amplitude window → draw commands</i>
+    └── <b>sp-app</b>/                <i># Iced binary. The only crate that knows pixels.</i>
+        ├── state.rs           <i>#   App state, Message enum</i>
+        ├── screens/           <i>#   library / import / generate / scope / inspect</i>
+        └── widgets/scope.rs   <i>#   canvas::Program implementation</i></pre>
+        </div>
+        <figcaption><strong>Dependency rule:</strong> dependencies point left-to-right only. <code>sp-core</code> depends on nothing in the workspace; <code>sp-app</code> may depend on everything; no crate depends on <code>sp-app</code>.</figcaption>
+      </figure>
+
+      <h3>Process and threading model</h3>
+      <figure>
+        <div class="block">
+          <div class="cap">Threads</div>
+<pre>┌──────────────────────────────────────────────────────────────┐
+│ <b>UI thread — Iced runtime</b>                                    │
+│   update(Message) → State                                    │
+│   view(State) → Element                                      │
+│   scope canvas draws from an already-decimated snapshot       │
+└───────┬──────────────────────────────▲───────────────────────┘
+        │ Task::perform                │ Messages: progress, done, error
+        ▼                              │
+┌──────────────────────────────────────┴───────────────────────┐
+│ <b>Tokio worker pool</b>                                           │
+│   • CSV import  (streaming, chunked, cancellable)            │
+│   • Generation  (rayon fan-out over sample ranges)           │
+│   • Pyramid build, export, statistics                        │
+└───────┬──────────────────────────────▲───────────────────────┘
+        │ DbCommand (mpsc)             │ oneshot replies
+        ▼                              │
+┌──────────────────────────────────────┴───────────────────────┐
+│ <b>Store actor thread</b> — single SQLite writer (WAL)             │
+│ Read-only connection pool (N = cores) for queries            │
+└──────────────────────────────────────────────────────────────┘</pre>
+        </div>
+      </figure>
+      <ul>
+        <li><strong>Single writer, many readers.</strong> WAL mode plus one dedicated writer thread eliminates <code>SQLITE_BUSY</code> retry logic entirely.</li>
+        <li><strong>The UI never touches raw samples.</strong> The engine hands the canvas a <code>ViewportSnapshot</code> already reduced to roughly one min/max pair per horizontal pixel.</li>
+        <li><strong>Cancellation</strong> via a token checked at chunk boundaries — every 64 K samples or 1 000 CSV rows — so cancel latency stays under about 50 ms.</li>
+      </ul>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 5 ─────────────────────────────────────────────────────────────── -->
+    <section id="s5">
+      <h2><span class="num">05</span><span>Data model</span></h2>
+
+      <h3>Library layout on disk</h3>
+      <figure>
+        <div class="block">
+          <div class="cap">Library root</div>
+<pre>&lt;library-root&gt;/
+├── library.db            <i># SQLite: all metadata</i>
+├── library.db-wal
+├── samples/
+│   └── a3/a3f9c1…e2.sigbin   <i># content-addressed by blake3, 2-char fanout</i>
+├── pyramids/
+│   └── a3/a3f9c1…e2.sigmip   <i># derived; safe to delete and rebuild</i>
+└── imports/
+    └── 2026-09-04T12-00-00_capture.csv   <i># optional archived original</i></pre>
+        </div>
+        <figcaption>Default root on Windows: <code>%LOCALAPPDATA%\SignalPlayback\library</code>. The root is user-selectable; multiple libraries are supported, one open at a time in v1.</figcaption>
+      </figure>
+
+      <h3>SQLite schema</h3>
+      <figure>
+        <div class="block">
+          <div class="cap">0001_init.sql</div>
+<pre><u>PRAGMA</u> journal_mode = WAL;
+<u>PRAGMA</u> foreign_keys = ON;
+
+<i>-- Schema version and app-level key/value settings.</i>
+<u>CREATE TABLE</u> <b>app_meta</b> (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);  <i>-- seeded with ('schema_version','1')</i>
+
+<i>-- One import run, one generation batch, or one derived collection.</i>
+<u>CREATE TABLE</u> <b>dataset</b> (
+    id            INTEGER PRIMARY KEY,
+    name          TEXT    NOT NULL,
+    source_kind   TEXT    NOT NULL
+                  CHECK (source_kind IN ('csv_import','generated','derived')),
+    source_uri    TEXT,                    <i>-- original CSV path; NULL when generated</i>
+    profile_id    INTEGER REFERENCES import_profile(id),
+    created_utc   TEXT    NOT NULL,        <i>-- ISO-8601</i>
+    notes         TEXT
+);
+
+<i>-- A group block from the CSV, or a bundle of generated signals.</i>
+<u>CREATE TABLE</u> <b>signal_group</b> (
+    id              INTEGER PRIMARY KEY,
+    dataset_id      INTEGER NOT NULL REFERENCES dataset(id) ON DELETE CASCADE,
+    ordinal         INTEGER NOT NULL,      <i>-- block order within the source file</i>
+    name            TEXT,
+    declared_count  INTEGER NOT NULL,      <i>-- the 'count' field from the group header</i>
+    actual_count    INTEGER NOT NULL,      <i>-- signals actually parsed; may differ</i>
+    attributes      TEXT    NOT NULL DEFAULT '{}',  <i>-- JSON: unmapped group columns</i>
+    UNIQUE (dataset_id, ordinal)
+);
+
+<u>CREATE TABLE</u> <b>signal</b> (
+    id             INTEGER PRIMARY KEY,
+    group_id       INTEGER NOT NULL REFERENCES signal_group(id) ON DELETE CASCADE,
+    ordinal        INTEGER NOT NULL,
+    name           TEXT    NOT NULL,
+    units          TEXT,
+    dtype          TEXT    NOT NULL
+                   CHECK (dtype IN ('f32','f64','i16','i32','c64')),
+    sample_rate_hz REAL,                   <i>-- NULL ⇒ irregular, see time_blob_id</i>
+    t0_s           REAL    NOT NULL DEFAULT 0.0,
+    sample_count   INTEGER NOT NULL,
+    blob_id        INTEGER REFERENCES sample_blob(id),   <i>-- NULL ⇒ lazily generated</i>
+    time_blob_id   INTEGER REFERENCES sample_blob(id),   <i>-- explicit timestamps</i>
+    gen_spec       TEXT,                   <i>-- JSON GenSpec when generated</i>
+    <i>-- Cached summary statistics, computed at ingest:</i>
+    min_value      REAL, max_value REAL, mean_value REAL, rms_value REAL,
+    attributes     TEXT    NOT NULL DEFAULT '{}',
+    UNIQUE (group_id, ordinal)
+);
+
+<u>CREATE TABLE</u> <b>sample_blob</b> (
+    id        INTEGER PRIMARY KEY,
+    relpath   TEXT    NOT NULL UNIQUE,     <i>-- 'samples/a3/a3f9….sigbin'</i>
+    byte_len  INTEGER NOT NULL,
+    checksum  TEXT    NOT NULL,            <i>-- blake3 hex</i>
+    refcount  INTEGER NOT NULL DEFAULT 0   <i>-- identical signals share one blob</i>
+);
+
+<u>CREATE TABLE</u> <b>tag</b> (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+<u>CREATE TABLE</u> <b>signal_tag</b> (
+    signal_id INTEGER NOT NULL REFERENCES signal(id) ON DELETE CASCADE,
+    tag_id    INTEGER NOT NULL REFERENCES tag(id)    ON DELETE CASCADE,
+    PRIMARY KEY (signal_id, tag_id)
+);
+
+<i>-- Saved column-mapping rules, so a recurring file shape imports in one click.</i>
+<u>CREATE TABLE</u> <b>import_profile</b> (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    rules_json  TEXT NOT NULL,
+    created_utc TEXT NOT NULL
+);
+
+<i>-- An ordered set of signals to play together.</i>
+<u>CREATE TABLE</u> <b>playlist</b> (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);
+<u>CREATE TABLE</u> <b>playlist_item</b> (
+    playlist_id INTEGER NOT NULL REFERENCES playlist(id) ON DELETE CASCADE,
+    signal_id   INTEGER NOT NULL REFERENCES signal(id)   ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL,
+    t_offset_s  REAL    NOT NULL DEFAULT 0.0,  <i>-- per-item alignment nudge</i>
+    gain        REAL    NOT NULL DEFAULT 1.0,
+    colour      TEXT,                          <i>-- '#RRGGBB' override</i>
+    PRIMARY KEY (playlist_id, ordinal)
+);
+
+<u>CREATE INDEX</u> ix_signal_group  ON signal(group_id);
+<u>CREATE INDEX</u> ix_group_dataset ON signal_group(dataset_id);
+<u>CREATE INDEX</u> ix_signal_name   ON signal(name);
+
+<i>-- Full-text search across names, units, and flattened attributes.</i>
+<u>CREATE VIRTUAL TABLE</u> <b>signal_fts</b> <u>USING</u> fts5(
+    name, units, attributes, content='signal', content_rowid='id'
+);</pre>
+        </div>
+        <figcaption><strong>Migrations.</strong> Numbered SQL files embedded in the binary, applied in order inside a transaction and gated on <code>app_meta.schema_version</code>. Downgrades are refused with a clear message rather than attempted.</figcaption>
+      </figure>
+
+      <h3>Sample blob format (<code>.sigbin</code>)</h3>
+      <p>A fixed 64-byte header, then packed little-endian samples.</p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Offset</th><th>Size</th><th>Field</th></tr></thead>
+          <tbody class="num-col">
+            <tr><td>0</td><td>4</td><td>Magic <code>SGB1</code></td></tr>
+            <tr><td>4</td><td>2</td><td>Format version (u16)</td></tr>
+            <tr><td>6</td><td>1</td><td>DType — 0 = f32, 1 = f64, 2 = i16, 3 = i32, 4 = complex64</td></tr>
+            <tr><td>7</td><td>1</td><td>Channel count (u8), 1 for v1</td></tr>
+            <tr><td>8</td><td>8</td><td>Sample rate Hz (f64); 0.0 ⇒ irregular</td></tr>
+            <tr><td>16</td><td>8</td><td>t0 seconds (f64)</td></tr>
+            <tr><td>24</td><td>8</td><td>Sample count (u64)</td></tr>
+            <tr><td>32</td><td>8</td><td>Scale factor (f64), for integer dtypes</td></tr>
+            <tr><td>40</td><td>8</td><td>Offset (f64), for integer dtypes</td></tr>
+            <tr><td>48</td><td>16</td><td>Reserved, zeroed</td></tr>
+            <tr><td>64</td><td>…</td><td>Sample payload</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Blobs are immutable and content-addressed. Editing a signal writes a new blob and decrements the old blob's <code>refcount</code>; a vacuum pass removes blobs at refcount 0.</p>
+
+      <h3>Render pyramid (<code>.sigmip</code>)</h3>
+      <p>Rendering 100 M points per frame is not feasible, so each blob gets a derived multi-resolution min/max pyramid.</p>
+
+      <figure>
+        <div class="svgfig">
+          <svg viewBox="0 0 700 232" role="img" aria-label="Diagram: raw samples reduce through pyramid levels to one min-max pair per pixel">
+            <defs>
+              <linearGradient id="env" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="var(--trace-blue)" stop-opacity=".55"/>
+                <stop offset="1" stop-color="var(--trace-blue)" stop-opacity=".18"/>
+              </linearGradient>
+            </defs>
+
+            <!-- Level labels -->
+            <text x="0" y="20" fill="var(--ink-mute)" font-family="IBM Plex Mono, monospace" font-size="11">blob</text>
+            <text x="0" y="96" fill="var(--ink-mute)" font-family="IBM Plex Mono, monospace" font-size="11">L0 · 64:1</text>
+            <text x="0" y="152" fill="var(--ink-mute)" font-family="IBM Plex Mono, monospace" font-size="11">L3 · 512:1</text>
+            <text x="0" y="208" fill="var(--ink-mute)" font-family="IBM Plex Mono, monospace" font-size="11">drawn</text>
+
+            <!-- Raw dense trace -->
+            <rect x="88" y="6" width="560" height="34" fill="none" stroke="var(--rule)" stroke-width="1"/>
+            <path d="M88 23 L92 14 L96 31 L100 12 L104 33 L108 18 L112 28 L116 10 L120 35 L124 20 L128 25 L132 13 L136 32 L140 17 L144 29 L148 11 L152 34 L156 21 L160 26 L164 15 L168 30 L172 12 L176 33 L180 19 L184 27 L188 14 L192 31 L196 22 L200 25 L204 11 L208 34 L212 18 L216 29 L220 13 L224 32 L228 20 L232 26 L236 16 L240 30 L244 12 L248 33 L252 21 L256 24 L260 14 L264 31 L268 19 L272 28 L276 10 L280 35 L284 22 L288 25 L292 13 L296 32 L300 17 L304 29 L308 15 L312 30 L316 11 L320 34 L324 20 L328 26 L332 14 L336 31 L340 18 L344 28 L348 12 L352 33 L356 21 L360 25 L364 16 L368 30 L372 13 L376 32 L380 19 L384 27 L388 15 L392 29 L396 11 L400 34 L404 22 L408 24 L412 14 L416 31 L420 17 L424 30 L428 12 L432 33 L436 20 L440 26 L444 15 L448 29 L452 13 L456 32 L460 18 L464 28 L468 10 L472 35 L476 21 L480 25 L484 14 L488 31 L492 19 L496 27 L500 16 L504 30 L508 12 L512 33 L516 22 L520 24 L524 13 L528 32 L532 18 L536 29 L540 11 L544 34 L548 20 L552 26 L556 15 L560 30 L564 13 L568 31 L572 19 L576 28 L580 14 L584 32 L588 21 L592 25 L596 12 L600 33 L604 17 L608 29 L612 16 L616 30 L620 11 L624 34 L628 22 L632 24 L636 15 L640 31 L644 20 L648 26"
+                  fill="none" stroke="var(--trace-blue)" stroke-width=".8" opacity=".85"/>
+            <text x="88" y="54" fill="var(--ink-mute)" font-family="IBM Plex Mono, monospace" font-size="10.5">100 000 000 samples · mmap, never drawn directly</text>
+
+            <!-- L0 min/max bars: dense -->
+            <g fill="url(#env)">
+              <rect x="88" y="74" width="4" height="30"/><rect x="96" y="70" width="4" height="36"/><rect x="104" y="78" width="4" height="26"/><rect x="112" y="68" width="4" height="40"/><rect x="120" y="76" width="4" height="30"/><rect x="128" y="72" width="4" height="34"/><rect x="136" y="80" width="4" height="24"/><rect x="144" y="69" width="4" height="38"/><rect x="152" y="75" width="4" height="31"/><rect x="160" y="71" width="4" height="35"/><rect x="168" y="79" width="4" height="25"/><rect x="176" y="67" width="4" height="41"/><rect x="184" y="77" width="4" height="29"/><rect x="192" y="73" width="4" height="33"/><rect x="200" y="81" width="4" height="23"/><rect x="208" y="68" width="4" height="39"/><rect x="216" y="76" width="4" height="30"/><rect x="224" y="70" width="4" height="36"/><rect x="232" y="78" width="4" height="27"/><rect x="240" y="72" width="4" height="34"/><rect x="248" y="80" width="4" height="24"/><rect x="256" y="69" width="4" height="37"/><rect x="264" y="75" width="4" height="31"/><rect x="272" y="71" width="4" height="35"/><rect x="280" y="66" width="4" height="42"/><rect x="288" y="77" width="4" height="29"/><rect x="296" y="73" width="4" height="33"/><rect x="304" y="79" width="4" height="26"/><rect x="312" y="70" width="4" height="36"/><rect x="320" y="67" width="4" height="41"/><rect x="328" y="76" width="4" height="30"/><rect x="336" y="72" width="4" height="34"/><rect x="344" y="80" width="4" height="25"/><rect x="352" y="68" width="4" height="38"/><rect x="360" y="75" width="4" height="31"/><rect x="368" y="71" width="4" height="35"/><rect x="376" y="69" width="4" height="37"/><rect x="384" y="78" width="4" height="27"/><rect x="392" y="74" width="4" height="32"/><rect x="400" y="66" width="4" height="42"/><rect x="408" y="77" width="4" height="28"/><rect x="416" y="72" width="4" height="34"/><rect x="424" y="70" width="4" height="36"/><rect x="432" y="68" width="4" height="39"/><rect x="440" y="76" width="4" height="30"/><rect x="448" y="73" width="4" height="33"/><rect x="456" y="69" width="4" height="38"/><rect x="464" y="79" width="4" height="26"/><rect x="472" y="66" width="4" height="43"/><rect x="480" y="75" width="4" height="31"/><rect x="488" y="71" width="4" height="35"/><rect x="496" y="77" width="4" height="28"/><rect x="504" y="72" width="4" height="34"/><rect x="512" y="68" width="4" height="39"/><rect x="520" y="76" width="4" height="30"/><rect x="528" y="70" width="4" height="36"/><rect x="536" y="78" width="4" height="27"/><rect x="544" y="66" width="4" height="42"/><rect x="552" y="74" width="4" height="32"/><rect x="560" y="71" width="4" height="35"/><rect x="568" y="77" width="4" height="29"/><rect x="576" y="69" width="4" height="37"/><rect x="584" y="75" width="4" height="31"/><rect x="592" y="67" width="4" height="41"/><rect x="600" y="73" width="4" height="33"/><rect x="608" y="79" width="4" height="26"/><rect x="616" y="70" width="4" height="36"/><rect x="624" y="66" width="4" height="43"/><rect x="632" y="76" width="4" height="30"/><rect x="640" y="72" width="4" height="34"/><rect x="648" y="74" width="4" height="32"/>
+            </g>
+            <text x="88" y="122" fill="var(--ink-mute)" font-family="IBM Plex Mono, monospace" font-size="10.5">1 562 500 (min, max) pairs · too many for a 1 400 px viewport</text>
+
+            <!-- L3: coarse -->
+            <g fill="url(#env)">
+              <rect x="88" y="132" width="28" height="30"/><rect x="124" y="128" width="28" height="38"/><rect x="160" y="136" width="28" height="26"/><rect x="196" y="126" width="28" height="40"/><rect x="232" y="134" width="28" height="30"/><rect x="268" y="129" width="28" height="36"/><rect x="304" y="137" width="28" height="25"/><rect x="340" y="127" width="28" height="39"/><rect x="376" y="133" width="28" height="31"/><rect x="412" y="130" width="28" height="35"/><rect x="448" y="136" width="28" height="27"/><rect x="484" y="126" width="28" height="41"/><rect x="520" y="134" width="28" height="30"/><rect x="556" y="129" width="28" height="36"/><rect x="592" y="137" width="28" height="24"/><rect x="628" y="128" width="20" height="37"/>
+            </g>
+            <text x="88" y="182" fill="var(--ink-mute)" font-family="IBM Plex Mono, monospace" font-size="10.5">195 312 pairs · the level where samples-per-pixel lands in [1, 2]</text>
+
+            <!-- Drawn result -->
+            <rect x="88" y="192" width="560" height="26" fill="var(--surface-sub)" stroke="var(--rule)" stroke-width="1"/>
+            <path d="M88 205 L124 199 L160 209 L196 197 L232 207 L268 200 L304 210 L340 198 L376 206 L412 201 L448 208 L484 196 L520 205 L556 200 L592 209 L648 202"
+                  fill="none" stroke="var(--trace-blue)" stroke-width="1.6"/>
+            <text x="88" y="230" fill="var(--ink-mute)" font-family="IBM Plex Mono, monospace" font-size="10.5">one column per pixel · draw cost is O(viewport width), not O(sample count)</text>
+          </svg>
+        </div>
+        <figcaption>Level <em>k</em> stores one <code>(min, max)</code> f32 pair per <code>2^(k+6)</code> source samples. All levels are built in one linear pass — roughly 200 ms per 100 M samples — and cached to disk. Below one sample per pixel the renderer skips the pyramid, reads the raw blob, and draws a polyline with point markers.</figcaption>
+      </figure>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 6 ─────────────────────────────────────────────────────────────── -->
+    <section id="s6">
+      <h2><span class="num">06</span><span>CSV import format</span></h2>
+
+      <p>The file is a sequence of <strong>group blocks</strong>. Each block is a blank line, a group header row carrying a count column, a signal header row, one group data row, and then <em>count</em> signal rows — repeated for every group in the file.</p>
+
+      <figure>
+        <div class="block">
+          <div class="cap">Two group blocks</div>
+<pre><i>(blank line)</i>
+<b>group_id,name,count,fs_hz,capture_utc</b>          <i>← group header (has 'count')</i>
+<b>sig_id,name,units,gain,s0,s1,s2,…</b>              <i>← signal header</i>
+7,ANTENNA_A,<u>3</u>,10000,2026-09-04T11:02:00Z      <i>← group data row</i>
+1,IF_I,V,1.0,0.013,0.041,0.062,…                <i>← signal row 1 of 3</i>
+2,IF_Q,V,1.0,-0.004,0.019,0.055,…               <i>← signal row 2 of 3</i>
+3,AGC,dB,1.0,12.0,12.0,11.8,…                   <i>← signal row 3 of 3</i>
+<i>(blank line)</i>
+<b>group_id,name,count,fs_hz,capture_utc</b>          <i>← next block …</i></pre>
+        </div>
+      </figure>
+
+      <h3>Grammar</h3>
+      <figure>
+        <div class="block">
+          <div class="cap">EBNF</div>
+<pre>file          = block { block } [ trailing_ws ] ;
+block         = blank_line , group_header , signal_header , group_row , signal_row * <b>N</b> ;
+blank_line    = { WS } , EOL ;                <i>(* no non-delimiter content *)</i>
+group_header  = field , { SEP , field } , EOL ;   <i>(* must contain a count column *)</i>
+signal_header = field , { SEP , field } , EOL ;
+group_row     = field , { SEP , field } , EOL ;   <i>(* arity = |group_header| *)</i>
+signal_row    = field , { SEP , field } , EOL ;   <i>(* arity ≥ |signal_header| *)</i>
+field         = quoted | bare ;
+quoted        = '"' , { CHAR | '""' } , '"' ;</pre>
+        </div>
+        <figcaption>Where <code>N</code> is the integer in the group row's count column.</figcaption>
+      </figure>
+
+      <h3>Parser behaviour</h3>
+      <div class="tablewrap">
+        <table class="wide">
+          <thead><tr><th>Concern</th><th>Rule</th></tr></thead>
+          <tbody>
+            <tr><td>Leading blank line</td><td>The blank line is the block <em>separator</em>. A file that starts directly with a group header is accepted — an implicit separator is assumed at BOF.</td></tr>
+            <tr><td>Count column</td><td>Located by case-insensitive name match against <code>count</code>, <code>signal_count</code>, <code>num_signals</code>, <code>n_signals</code>, <code>nsig</code>. Overridable per import profile.</td></tr>
+            <tr><td>Count mismatch</td><td><em>Strict</em>: error, abort the import. <em>Tolerant</em> (default): consume rows until the next blank line, record <code>actual_count</code> beside <code>declared_count</code>, raise a warning.</td></tr>
+            <tr><td>Samples in a signal row</td><td>Columns named in the signal header are metadata; every column <strong>beyond</strong> the header's declared arity is a sample. If the header itself carries sample columns (<code>s0,s1,…</code>), the profile marks where metadata ends and samples begin.</td></tr>
+            <tr><td>Alternate layout</td><td>A profile flag selects <em>column-per-signal</em> layout instead — the signal header names signals and each following row is one time step across the group. Both layouts share the block framer.</td></tr>
+            <tr><td>Delimiter</td><td>Auto-detected from the first group header (<code>,</code> <code>;</code> tab <code>|</code>), overridable.</td></tr>
+            <tr><td>Encoding</td><td>UTF-8, with UTF-8/UTF-16 BOM stripped. Invalid sequences are reported with byte offsets, never silently replaced.</td></tr>
+            <tr><td>Line endings</td><td><code>LF</code> and <code>CRLF</code> both accepted; a lone <code>CR</code> is treated as a line ending, with a warning.</td></tr>
+            <tr><td>Comments</td><td>Lines starting with <code>#</code> are skipped everywhere except inside quoted fields. Configurable.</td></tr>
+            <tr><td>Missing values</td><td>Empty, <code>NaN</code>, <code>NA</code>, <code>null</code> → <code>f64::NAN</code>, drawn as a gap in the trace.</td></tr>
+            <tr><td>Numeric parsing</td><td>Decimal and scientific notation. Thousands separators rejected. Locale-independent: always <code>.</code> as the decimal point.</td></tr>
+            <tr><td>Errors</td><td>Every diagnostic carries block index, line number, byte offset, column index and message, and appears in a scrollable error panel with a jump-to-line action.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Import pipeline</h3>
+      <figure>
+        <div class="block">
+          <div class="cap">Stages</div>
+<pre>pick file → <b>sniff</b> (read first 2 blocks) → preview &amp; column mapping UI
+    → confirm → <b>streaming ingest</b> → per-signal blob write → stats + FTS index
+    → pyramid build (background) → dataset appears in library</pre>
+        </div>
+      </figure>
+      <p>The <strong>sniff</strong> pass reads only enough to show a preview table and suggest a profile, so a 4 GB file feels instant to open. The <strong>ingest</strong> pass streams the whole file once, writing sample blobs incrementally and holding at most one group in memory.</p>
+      <p>Import is transactional at the dataset level: a failure rolls back the SQLite rows and deletes any orphaned blobs.</p>
+
+      <h3>Export</h3>
+      <p>The writer reverses the grammar exactly, preserving original column order and unmapped attributes from the <code>attributes</code> JSON — this is what satisfies G1. A round-trip fixture set lives in <code>crates/sp-csv/tests/fixtures/</code>.</p>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 7 ─────────────────────────────────────────────────────────────── -->
+    <section id="s7">
+      <h2><span class="num">07</span><span>Signal generation</span></h2>
+
+      <h3>Spec model</h3>
+      <p>A generated signal is described by a serialisable DAG stored as JSON in <code>signal.gen_spec</code>. Samples are a <em>cache</em> of the spec, so deleting a blob is always safe.</p>
+      <figure>
+        <div class="block">
+          <div class="cap">sp-gen/spec.rs</div>
+<pre><u>pub struct</u> <b>GenSpec</b> {
+    <u>pub</u> timebase: Timebase,   <i>// sample_rate_hz, duration_s, t0_s</i>
+    <u>pub</u> dtype:    DType,
+    <u>pub</u> seed:     u64,        <i>// ChaCha12 seed; makes noise reproducible (G3)</i>
+    <u>pub</u> root:     Node,
+}
+
+<u>pub enum</u> <b>Node</b> {
+    <i>// ── Primitives ──────────────────────────────────────────────</i>
+    Sine      { freq_hz: f64, amp: f64, phase_rad: f64, offset: f64 },
+    Square    { freq_hz: f64, amp: f64, duty: f64, phase_rad: f64 },
+    Triangle  { freq_hz: f64, amp: f64, phase_rad: f64 },
+    Sawtooth  { freq_hz: f64, amp: f64, rising: bool },
+    Pulse     { period_s: f64, width_s: f64, amp: f64, rise_s: f64, fall_s: f64 },
+    Chirp     { f0_hz: f64, f1_hz: f64, sweep: Sweep, amp: f64 },  <i>// Lin|Log|Quad</i>
+    Dc        { level: f64 },
+    Ramp      { start: f64, end: f64 },
+    Step      { at_s: f64, before: f64, after: f64 },
+    Impulse   { at_s: f64, amp: f64 },
+    Noise     { kind: NoiseKind, amp: f64 },   <i>// Gaussian|Uniform|Pink|Brown</i>
+    Prbs      { order: u8, taps: Option&lt;u32&gt;, amp: f64 },
+    Expr      { source: String },              <i>// f(t) via `meval`, t in seconds</i>
+
+    <i>// ── Combinators ─────────────────────────────────────────────</i>
+    Sum       { terms: Vec&lt;Node&gt; },
+    Product   { terms: Vec&lt;Node&gt; },
+    Concat    { parts: Vec&lt;(Node, f64)&gt; },     <i>// (node, duration_s)</i>
+    Gain      { input: Box&lt;Node&gt;, factor: f64 },
+    Delay     { input: Box&lt;Node&gt;, by_s: f64 },
+    Clip      { input: Box&lt;Node&gt;, lo: f64, hi: f64 },
+    Envelope  { input: Box&lt;Node&gt;, env: EnvelopeSpec },  <i>// ADSR|Gaussian|Tukey</i>
+    Modulate  { carrier: Box&lt;Node&gt;, modulator: Box&lt;Node&gt;, kind: ModKind },
+                                               <i>// Am{depth}|Fm{dev_hz}|Pm{dev_rad}</i>
+    Resample  { input: Box&lt;Node&gt;, to_rate_hz: f64 },
+    FromSignal{ signal_id: SignalId },         <i>// use a stored signal as a source</i>
+}</pre>
+        </div>
+      </figure>
+
+      <h3>Rendering</h3>
+      <ul>
+        <li>A pure function <code>render(&amp;GenSpec, range) -&gt; SampleBuffer</code>, so any window can be produced independently. Rayon splits the range across cores.</li>
+        <li>Noise nodes derive a per-node stream by hashing <code>(seed, node_path)</code>. A range rendered in parallel chunks matches the same range rendered serially, and adding a node elsewhere in the tree does not perturb an existing node's noise.</li>
+        <li>Parameter validation happens up front: negative frequencies, duty outside (0, 1), and Nyquist violations (<code>freq_hz ≥ fs/2</code>) become blocking errors with a suggested fix.</li>
+      </ul>
+
+      <h3>Generator UI</h3>
+      <ul>
+        <li>Left: a node tree with add, remove, reorder. Right: parameters for the selected node.</li>
+        <li>A <strong>live preview</strong> strip renders the first ~2 seconds at reduced rate on every keystroke, debounced 150 ms, so the shape is visible before committing.</li>
+        <li><strong>Sweep mode</strong>: mark one numeric parameter as swept — start, stop, step, or an explicit list — to emit a whole group in one action, e.g. 20 sine waves from 100 Hz to 2 kHz. The sweep becomes a <code>signal_group</code> with the swept value in <code>attributes</code>.</li>
+        <li>Presets are <code>GenSpec</code> JSON files; a small built-in library ships with the app.</li>
+      </ul>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 8 ─────────────────────────────────────────────────────────────── -->
+    <section id="s8">
+      <h2><span class="num">08</span><span>Playback engine</span></h2>
+
+      <h3>Transport state machine</h3>
+      <figure>
+        <div class="block">
+          <div class="cap">sp-engine/transport.rs</div>
+<pre>                 ┌──────────┐  play   ┌──────────┐
+        seek ───►│ <b>Stopped</b>  ├────────►│ <b>Playing</b>  │◄─── rate change (no transition)
+                 └────▲─────┘         └────┬─────┘
+                      │ stop               │ pause
+                      │              ┌─────▼────┐
+                      └──────────────┤  <b>Paused</b>  │
+                             stop    └──────────┘</pre>
+        </div>
+        <figcaption><code>Playing</code> advances the playhead, <code>Paused</code> retains it, <code>Stopped</code> resets it to the loop start. Seek is legal in every state and does not change state.</figcaption>
+      </figure>
+
+      <h3>Clock</h3>
+      <p>Playback time is <strong>decoupled from frame rate</strong>. Each tick:</p>
+      <figure>
+        <div class="block">
+          <div class="cap">sp-engine/clock.rs</div>
+<pre>now        = Instant::now()
+dt_wall    = now - last_tick
+playhead  += dt_wall.as_secs_f64() * rate      <i>// rate ∈ [0.01, 100.0], may be negative</i>
+last_tick  = now</pre>
+        </div>
+      </figure>
+      <ul>
+        <li>A monotonic <code>Instant</code> avoids wall-clock jumps.</li>
+        <li>If <code>dt_wall &gt; 250 ms</code> — window unfocused, breakpoint hit — the tick is <strong>clamped</strong> rather than applied, so the playhead does not teleport after a stall.</li>
+        <li>At the loop end: wrap to loop start (<code>Loop</code>), clamp and pause (<code>Once</code>), or reverse (<code>PingPong</code>).</li>
+        <li>Ticks are driven by an Iced subscription on window redraw requests, so the engine never runs faster than the display and idles at zero CPU when paused.</li>
+      </ul>
+
+      <h3>Timeline and alignment</h3>
+      <p>All signals map onto one <strong>absolute timeline</strong> in seconds. A signal's sample <em>i</em> sits at <code>t = t0_s + i / sample_rate_hz</code>, or at <code>time_blob[i]</code> when irregular. Signals with different rates therefore overlay correctly with no resampling. A playlist's <code>t_offset_s</code> nudges an individual trace for manual alignment.</p>
+
+      <h3>Scope rendering</h3>
+      <p>Two display modes: <strong>playhead mode</strong>, where the viewport is fixed and a vertical cursor sweeps across it, and <strong>scrolling mode</strong>, where the playhead is pinned near 80% width and the window scrolls under it like a strip-chart recorder.</p>
+      <p>Rendering runs in three Iced canvas layers, so a moving playhead never re-tessellates the traces.</p>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Layer</th><th>Contents</th><th>Invalidated when</th></tr></thead>
+          <tbody>
+            <tr><td>Grid</td><td>Axes, gridlines, tick labels</td><td>Viewport changes</td></tr>
+            <tr><td>Traces</td><td>Signal geometry from the pyramid</td><td>Viewport or signal set changes</td></tr>
+            <tr><td>Overlay</td><td>Playhead, cursors, markers, hover readout, selection band</td><td>Every tick — cheap</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Interactions.</strong> Scroll zooms time about the pointer; shift+scroll pans; ctrl+scroll zooms amplitude; drag is a box zoom; double-click fits; <code>Home</code>/<code>End</code> jump to bounds; space toggles play/pause; <code>[</code> and <code>]</code> set the loop in and out points.</p>
+      <p><strong>Per-trace controls.</strong> Visibility, colour, gain, vertical offset, and a <strong>stacked vs. overlaid</strong> layout toggle — stacked gives each signal its own horizontal lane.</p>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 9 ─────────────────────────────────────────────────────────────── -->
+    <section id="s9">
+      <h2><span class="num">09</span><span>User interface</span></h2>
+
+      <h3>Screens</h3>
+      <div class="tablewrap">
+        <table class="wide">
+          <thead><tr><th>Screen</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>Library</td><td>Tree of Dataset → Group → Signal with search and tag filters, plus a sortable detail table: name, units, rate, duration, sample count, min/max/RMS. Multi-select feeds the scope or a playlist.</td></tr>
+            <tr><td>Import</td><td>File picker → preview grid of the first blocks → column-mapping panel → profile save/load → progress with a live error list.</td></tr>
+            <tr><td>Generate</td><td>Node tree editor, parameter form, live preview, sweep configuration, preset browser.</td></tr>
+            <tr><td>Scope</td><td>Transport bar, timeline ruler with loop region, trace list with per-trace controls, the canvas, and a cursor readout panel.</td></tr>
+            <tr><td>Inspector</td><td>Single-signal detail: full metadata, editable attributes and tags, statistics, histogram, FFT magnitude, virtualised raw sample table.</td></tr>
+            <tr><td>Settings</td><td>Library location, theme, default sample rate, strict/tolerant import, decimation quality, keyboard map.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Application shape</h3>
+      <figure>
+        <div class="block">
+          <div class="cap">sp-app/state.rs</div>
+<pre><u>enum</u> <b>Screen</b> { Library, Import(ImportState), Generate(GenState),
+              Scope(ScopeState), Inspector(SignalId), Settings }
+
+<u>struct</u> <b>App</b> {
+    store:   StoreHandle,       <i>// channel to the writer actor</i>
+    screen:  Screen,
+    library: LibraryIndex,      <i>// cached metadata; samples stay on disk</i>
+    scope:   ScopeState,        <i>// survives screen switches, so playback keeps position</i>
+    toasts:  Vec&lt;Toast&gt;,
+    modal:   Option&lt;Modal&gt;,
+}
+
+<u>enum</u> <b>Message</b> {
+    Nav(Screen),
+    Library(library::Message),
+    Import(import::Message),
+    Generate(generate::Message),
+    Scope(scope::Message),
+    Store(StoreEvent),          <i>// async DB results</i>
+    Tick(Instant),              <i>// playback clock</i>
+    Progress { job: JobId, done: u64, total: u64 },
+    JobFinished(JobId, Result&lt;JobOutcome, JobError&gt;),
+    Error(AppError),
+}</pre>
+        </div>
+        <figcaption>Each screen module owns its own <code>State</code>/<code>Message</code>/<code>update</code>/<code>view</code>, and the root <code>update</code> delegates. Long jobs return a <code>JobId</code> immediately; progress arrives as messages.</figcaption>
+      </figure>
+
+      <h3>UX principles</h3>
+      <ul>
+        <li><strong>No modal blocking on IO.</strong> Import and generation run in the background; the library stays browsable.</li>
+        <li><strong>Destructive actions confirm, and undo where it is cheap.</strong> Delete moves to a session trash table; permanent delete is a separate explicit action.</li>
+        <li><strong>Errors are data, not dialogs.</strong> Import problems land in a filterable list the user works through, not a popup per row.</li>
+        <li><strong>Keyboard first</strong> for transport and navigation. Every action has a shortcut.</li>
+      </ul>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 10 ────────────────────────────────────────────────────────────── -->
+    <section id="s10">
+      <h2><span class="num">10</span><span>Performance budget</span></h2>
+      <div class="tablewrap">
+        <table class="wide">
+          <thead><tr><th>Operation</th><th>Target</th><th>Approach</th></tr></thead>
+          <tbody>
+            <tr><td>Scope frame</td><td class="num-col">&lt; 8 ms @ 1080p, 8 traces</td><td>Pyramid decimation to ≈1 pair per pixel; layered canvas caches</td></tr>
+            <tr><td>Playhead tick</td><td class="num-col">&lt; 0.5 ms</td><td>Overlay-layer redraw only</td></tr>
+            <tr><td>CSV sniff</td><td class="num-col">&lt; 100 ms on a 4 GB file</td><td>Bounded read of the first two blocks; never a full scan</td></tr>
+            <tr><td>CSV ingest</td><td class="num-col">≥ 50 MB/s single-threaded</td><td>Streaming reader, no per-field <code>String</code>, direct write into a blob buffer</td></tr>
+            <tr><td>Generation</td><td class="num-col">≥ 100 M samples/s</td><td>Sine on 8 cores; rayon chunking, no per-sample allocation</td></tr>
+            <tr><td>Pyramid build</td><td class="num-col">1 linear pass</td><td>All levels built in one traversal of the blob</td></tr>
+            <tr><td>Library query</td><td class="num-col">&lt; 50 ms @ 10 000 signals</td><td>Indexed SQLite + FTS5, metadata only</td></tr>
+            <tr><td>Cold start</td><td class="num-col">&lt; 500 ms</td><td>Lazy pyramid load, no eager sample reads</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Benchmarks live in <code>crates/*/benches/</code> using <code>criterion</code> and run in CI against a fixed fixture set.</p>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 11 ────────────────────────────────────────────────────────────── -->
+    <section id="s11">
+      <h2><span class="num">11</span><span>Cross-cutting concerns</span></h2>
+
+      <h3>Error handling</h3>
+      <p>A <code>thiserror</code> enum per crate; <code>sp-app</code> maps them to user-facing text. Nothing panics on bad input — a corrupt CSV or a truncated blob produces a diagnostic. Panics inside worker tasks are caught at the task boundary and reported as a job failure.</p>
+
+      <h3>Integrity</h3>
+      <p>Blob checksums are verified on first read after app start and after any crash recovery. A <strong>Verify Library</strong> action rehashes everything and reports mismatches in both directions — rows without blobs, blobs without rows.</p>
+
+      <h3>Testing</h3>
+      <ul>
+        <li>Unit tests per crate; <code>proptest</code> properties for the CSV round-trip (G1) and for generator determinism across chunk boundaries (G3).</li>
+        <li>Golden-file tests for the parser against a fixture corpus that includes malformed files.</li>
+        <li><code>sp-engine</code> transport tests drive the state machine with a mock clock — no UI needed.</li>
+        <li>A headless smoke test opens a library, imports a fixture, and renders a viewport.</li>
+      </ul>
+
+      <h3>Observability, distribution, accessibility</h3>
+      <ul>
+        <li><code>tracing</code> spans around every job, a Log panel in the app, and a rolling file log in the library root. <code>--verbose</code> raises the level.</li>
+        <li><code>cargo build --release</code> produces a single <code>.exe</code>. Windows is the primary target; Linux and macOS build from the same source, since every dependency is cross-platform. An optional MSI via <code>cargo-wix</code> later.</li>
+        <li>Trace palettes are colour-blind-safe by default (Okabe–Ito). Trace identity is also carried by a legend and line style, never by colour alone. Minimum 14 px UI text, full keyboard navigation.</li>
+      </ul>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 12 ────────────────────────────────────────────────────────────── -->
+    <section id="s12">
+      <h2><span class="num">12</span><span>Potential features</span></h2>
+      <p>Grouped by area, and tiered. The tiers are contractual: nothing beyond MVP enters v1 without something else being cut.</p>
+      <div class="tierkey">
+        <span class="tier t-mvp">MVP</span><span style="font-size:13.5px;color:var(--ink-mute)">ships in v1</span>
+        <span class="tier t-v1" style="margin-left:14px">V1.x</span><span style="font-size:13.5px;color:var(--ink-mute)">near-term</span>
+        <span class="tier t-v2" style="margin-left:14px">V2</span><span style="font-size:13.5px;color:var(--ink-mute)">larger effort</span>
+        <span class="tier t-str" style="margin-left:14px">STRETCH</span><span style="font-size:13.5px;color:var(--ink-mute)">speculative</span>
+      </div>
+
+      <div class="features">
+
+        <section>
+          <h3>Import &amp; ingest</h3>
+          <ul>
+            <li><span class="tier t-mvp">MVP</span><span>Grouped-block CSV import with preview and column mapping</span></li>
+            <li><span class="tier t-mvp">MVP</span><span>Saved import profiles for recurring file shapes</span></li>
+            <li><span class="tier t-mvp">MVP</span><span>Strict vs. tolerant count handling with a diagnostics list</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Drag-and-drop import; multiple files in one action</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Watch-folder auto-import</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Import from clipboard paste</span></li>
+            <li><span class="tier t-v2">V2</span><span>More formats: WAV, MATLAB <code>.mat</code>, HDF5, SigMF, Parquet, <code>.npy</code>, TDMS, VCD</span></li>
+            <li><span class="tier t-v2">V2</span><span>Instrument save formats — Tektronix / Keysight scope CSV and WFM</span></li>
+            <li><span class="tier t-v2">V2</span><span>Incremental append — extend a stored signal from a newer capture</span></li>
+            <li><span class="tier t-str">STRETCH</span><span>Streaming ingest from a live socket into the database</span></li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>Generation</h3>
+          <ul>
+            <li><span class="tier t-mvp">MVP</span><span>Sine, square, triangle, sawtooth, DC, ramp, step, impulse, noise</span></li>
+            <li><span class="tier t-mvp">MVP</span><span>Sum/product composition, gain, delay, envelope</span></li>
+            <li><span class="tier t-mvp">MVP</span><span>Deterministic seeded noise</span></li>
+            <li><span class="tier t-mvp">MVP</span><span>Parameter sweep generating a whole group at once</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Chirps (linear/log/quadratic) and AM/FM/PM modulation</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Arbitrary <code>f(t)</code> expression node</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>PRBS / m-sequence generator</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Preset library with import and export</span></li>
+            <li><span class="tier t-v2">V2</span><span>Digital modulation: ASK/FSK/PSK/QPSK/QAM with pulse shaping</span></li>
+            <li><span class="tier t-v2">V2</span><span>Impairment stack: AWGN at a target SNR, phase noise, IQ imbalance, DC offset, clock drift, dropouts, clipping</span></li>
+            <li><span class="tier t-v2">V2</span><span>Multi-tone / comb generator with per-tone phase</span></li>
+            <li><span class="tier t-v2">V2</span><span>Draw-a-waveform — sketch on the canvas, fit to samples</span></li>
+            <li><span class="tier t-v2">V2</span><span>Derive from stored signals: mix, splice, resample</span></li>
+            <li><span class="tier t-str">STRETCH</span><span>Node-graph visual editor with drag-wired connections</span></li>
+            <li><span class="tier t-str">STRETCH</span><span>Fit a generator spec that approximates a recorded signal</span></li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>Database &amp; library</h3>
+          <ul>
+            <li><span class="tier t-mvp">MVP</span><span>Dataset → group → signal hierarchy, search, sortable detail table</span></li>
+            <li><span class="tier t-mvp">MVP</span><span>Tags with filter-by-tag</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Saved smart searches (“all signals &gt; 1 s tagged <code>calibration</code>”)</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Bulk edit: rename, retag, set units across a selection</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Duplicate detection via blob checksum; dedupe on ingest</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Library statistics: count, total size, sample-rate distribution</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Maintenance: vacuum, verify, rebuild pyramids</span></li>
+            <li><span class="tier t-v2">V2</span><span>Multiple libraries open at once, with cross-library compare</span></li>
+            <li><span class="tier t-v2">V2</span><span>Versioning — keep prior revisions of an edited signal</span></li>
+            <li><span class="tier t-v2">V2</span><span>Archive/restore a dataset as a portable <code>.splib</code> bundle</span></li>
+            <li><span class="tier t-v2">V2</span><span>Provenance graph — what was derived from what</span></li>
+            <li><span class="tier t-str">STRETCH</span><span>Optional remote or shared library backend</span></li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>Playback &amp; visualization</h3>
+          <ul>
+            <li><span class="tier t-mvp">MVP</span><span>Play, pause, stop, seek, rate, loop; playhead and scrolling modes</span></li>
+            <li><span class="tier t-mvp">MVP</span><span>Multi-signal overlay and stacked lanes; per-trace colour, gain, offset</span></li>
+            <li><span class="tier t-mvp">MVP</span><span>Zoom, pan, box zoom, fit, hover readout</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Two time cursors with Δt, Δy and 1/Δt readout</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Markers and annotations pinned to the timeline, stored in the DB</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>A/B loop region with a per-region rate</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Bookmarked playhead positions</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Y-axis autoscale modes: per-trace, shared, fixed, percentile</span></li>
+            <li><span class="tier t-v2">V2</span><span>XY (Lissajous) plot mode for signal pairs</span></li>
+            <li><span class="tier t-v2">V2</span><span>Spectrogram / waterfall lane synchronised to the playhead</span></li>
+            <li><span class="tier t-v2">V2</span><span>Live FFT lane updating at the playhead</span></li>
+            <li><span class="tier t-v2">V2</span><span>Eye diagram and constellation views</span></li>
+            <li><span class="tier t-v2">V2</span><span>Trigger modes — start playback at an edge or level crossing</span></li>
+            <li><span class="tier t-v2">V2</span><span>Logic-analyser rendering for boolean-valued signals</span></li>
+            <li><span class="tier t-str">STRETCH</span><span>Synchronised video or telemetry track alongside the signals</span></li>
+            <li><span class="tier t-str">STRETCH</span><span>GPU compute-shader path for traces beyond 1 G samples</span></li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>Analysis</h3>
+          <ul>
+            <li><span class="tier t-v1">V1.x</span><span>Per-signal statistics: min, max, mean, RMS, σ, peak-to-peak, zero crossings</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Histogram view</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>FFT magnitude and phase, windowed (Hann, Hamming, Blackman-Harris, flat-top)</span></li>
+            <li><span class="tier t-v2">V2</span><span>THD, SNR, SINAD, SFDR, ENOB measurements</span></li>
+            <li><span class="tier t-v2">V2</span><span>FIR/IIR low, high and band-pass filters applied as a derived signal</span></li>
+            <li><span class="tier t-v2">V2</span><span>Cross-correlation and time-delay estimation between two signals</span></li>
+            <li><span class="tier t-v2">V2</span><span>Envelope detection, peak finding, pulse measurements — rise time, width, duty</span></li>
+            <li><span class="tier t-v2">V2</span><span>Signal math bar (<code>sig1 - sig2 * 0.5</code>) producing a derived signal</span></li>
+            <li><span class="tier t-str">STRETCH</span><span>Anomaly flagging across a whole dataset</span></li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>Export &amp; interop</h3>
+          <ul>
+            <li><span class="tier t-mvp">MVP</span><span>Export to the native grouped CSV format, round-trip faithful</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Export a selection or a time range only</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Export the scope view as PNG or SVG</span></li>
+            <li><span class="tier t-v2">V2</span><span>Export to WAV, <code>.npy</code>, Parquet, MATLAB, HDF5, SigMF</span></li>
+            <li><span class="tier t-v2">V2</span><span>Copy samples to the clipboard as CSV for a spreadsheet</span></li>
+            <li><span class="tier t-v2">V2</span><span>Generate a PDF/HTML report with plots, statistics and metadata</span></li>
+            <li><span class="tier t-str">STRETCH</span><span>Python binding via <code>pyo3</code> to read the library from analysis scripts</span></li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>Automation &amp; extensibility</h3>
+          <ul>
+            <li><span class="tier t-v1">V1.x</span><span>CLI mode: <code>signalplayback import|generate|export</code> for scripting and CI</span></li>
+            <li><span class="tier t-v2">V2</span><span>Scriptable batch jobs — a job file describing generate → process → export</span></li>
+            <li><span class="tier t-v2">V2</span><span>Plugin interface for custom generators and import formats</span></li>
+            <li><span class="tier t-str">STRETCH</span><span>Embedded scripting (Rhai or Lua) for on-the-fly signal math</span></li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>Quality of life</h3>
+          <ul>
+            <li><span class="tier t-mvp">MVP</span><span>Persistent window layout and last-opened library</span></li>
+            <li><span class="tier t-mvp">MVP</span><span>Light and dark theme</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Undo/redo for library edits</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Recent files and recent datasets</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Command palette (Ctrl+K) over every action and signal</span></li>
+            <li><span class="tier t-v1">V1.x</span><span>Configurable keyboard shortcuts</span></li>
+            <li><span class="tier t-v2">V2</span><span>Workspaces — save and restore a full scope setup</span></li>
+            <li><span class="tier t-v2">V2</span><span>Session crash recovery</span></li>
+            <li><span class="tier t-v2">V2</span><span>Localisation scaffolding</span></li>
+          </ul>
+        </section>
+
+      </div>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 13 ────────────────────────────────────────────────────────────── -->
+    <section id="s13">
+      <h2><span class="num">13</span><span>Milestones</span></h2>
+      <div class="track">
+        <ol>
+          <li>
+            <span class="ms">M0</span>
+            <div>
+              <h4>Skeleton</h4>
+              <p>Workspace, <code>sp-core</code> types, Iced window with screen navigation, logging.</p>
+              <span class="exit">exit — app launches, screens switch, CI builds and clippy is clean</span>
+            </div>
+          </li>
+          <li>
+            <span class="ms">M1</span>
+            <div>
+              <h4>Store</h4>
+              <p>SQLite schema and migrations, blob read/write, store actor, library screen.</p>
+              <span class="exit">exit — signals insert and list; Verify Library passes</span>
+            </div>
+          </li>
+          <li>
+            <span class="ms">M2</span>
+            <div>
+              <h4>Import</h4>
+              <p>Block framer, parser, mapping UI, streaming ingest, error list.</p>
+              <span class="exit">exit — fixture corpus imports; round-trip property test passes (G1)</span>
+            </div>
+          </li>
+          <li>
+            <span class="ms">M3</span>
+            <div>
+              <h4>Generate</h4>
+              <p><code>GenSpec</code>, primitives, combinators, generator UI, sweeps.</p>
+              <span class="exit">exit — determinism property test passes (G3); presets load</span>
+            </div>
+          </li>
+          <li>
+            <span class="ms">M4</span>
+            <div>
+              <h4>Playback</h4>
+              <p>Pyramid builder, viewport, scope canvas, transport, clock.</p>
+              <span class="exit">exit — a 100 M-sample signal plays at 60 fps (G2)</span>
+            </div>
+          </li>
+          <li>
+            <span class="ms">M5</span>
+            <div>
+              <h4>Polish</h4>
+              <p>Inspector, tags and search, export, settings, statistics, packaging.</p>
+              <span class="exit">exit — full loop demoable end-to-end; release binary produced</span>
+            </div>
+          </li>
+        </ol>
+      </div>
+      <p>M1, M2 and M3 are largely independent once M0 lands, and can proceed in parallel.</p>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 14 ────────────────────────────────────────────────────────────── -->
+    <section id="s14">
+      <h2><span class="num">14</span><span>Assumptions and open questions</span></h2>
+      <div class="note warn">
+        <span class="lede">Confirm before M2</span>
+        <p>Items 1–4 concern the CSV format and change the design materially. A single real sample file settles all four.</p>
+      </div>
+      <ol>
+        <li><strong>Block row order.</strong> This document takes the stated order literally: group header → signal header → group data row → signal rows. The more conventional layout would put the group data row immediately after the group header. The framer will <strong>auto-detect</strong> both, by testing which row's arity matches which header, but a sample file would settle it.</li>
+        <li><strong>Where samples live in a signal row.</strong> Assumed: each signal row is one complete signal, metadata columns first and sample values trailing. The alternative — the signal header names the signals and each following row is one time step — is supported via a profile flag, but only one should be the default.</li>
+        <li><strong>Timebase source.</strong> Assumed the sample rate comes from a group-level column and the time axis is implicit. If files instead carry an explicit time column per signal, <code>time_blob_id</code> covers it, but the mapping UI needs a “this column is time” affordance.</li>
+        <li><strong>Group <code>count</code> semantics.</strong> Assumed to be the number of signal rows in the block. If it means samples per signal instead, the framer's block-termination rule changes.</li>
+        <li><strong>Numeric precision.</strong> Default storage is <code>f32</code> — half the memory, ample for most captured signals — with <code>f64</code> available per signal. Confirm <code>f32</code> is an acceptable default.</li>
+        <li><strong>Library scale.</strong> The design targets 10 000 signals and roughly 100 GB of samples. An order of magnitude beyond that would argue for a columnar store instead.</li>
+        <li><strong>Complex signals.</strong> <code>c64</code> is reserved in the dtype enum but not implemented in v1. Confirm whether I/Q pairs arrive as two real signals, as assumed, or as one complex signal.</li>
+      </ol>
+    </section>
+
+    <div class="ruler"></div>
+
+    <!-- 15 ────────────────────────────────────────────────────────────── -->
+    <section id="s15">
+      <h2><span class="num">15</span><span>Risks</span></h2>
+      <div class="tablewrap">
+        <table class="wide">
+          <thead><tr><th>Risk</th><th>Impact</th><th>Mitigation</th></tr></thead>
+          <tbody>
+            <tr><td>CSV format assumptions wrong</td><td>Rework of <code>sp-csv</code></td><td>Auto-detecting framer plus profile overrides; confirm against a real file before M2</td></tr>
+            <tr><td>Iced canvas performance at 8+ dense traces</td><td>Misses G2</td><td>Pyramid decimation caps draw cost at viewport width; layered caches; wgpu backend; fall back to instanced GPU line rendering if needed</td></tr>
+            <tr><td>Iced API churn between releases</td><td>Build breakage</td><td>Pin the minor version; isolate all Iced usage inside <code>sp-app</code></td></tr>
+            <tr><td>Blob store and SQLite drift after a crash</td><td>Orphaned or missing samples</td><td>Write the blob first, then commit the row; Verify Library reconciles both directions</td></tr>
+            <tr><td>Scope creep from §12</td><td>M1–M5 slip</td><td>Tiers are contractual — nothing beyond MVP enters v1 without cutting something else</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>SignalPlayback · Design Document · Draft v0.1</span>
+    <span>2026-09-04</span>
+    <span>Source of truth: docs/DESIGN.md</span>
+  </footer>
+
+</div>
