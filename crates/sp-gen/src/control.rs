@@ -16,23 +16,29 @@ use crate::error::{GenError, Result};
 pub const CHUNK_SAMPLES: u64 = 65_536;
 
 /// What a generation has done so far.
+///
+/// The two shapes of output are counted through one pair of names: a waveform
+/// generation writes signals of samples (§8.1), a pulse-train generation
+/// writes groups of pulses (§8.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GenProgress {
-    /// Signals written; a sweep writes one per rung (§8.3).
-    pub signals_done: u32,
-    pub signals_total: u32,
-    pub samples_done: u64,
-    pub samples_total: u64,
+    /// Signals written in waveform mode — a sweep writes one per rung (§8.3) —
+    /// or groups written in pulse-train mode.
+    pub items_done: u32,
+    pub items_total: u32,
+    /// Samples written in waveform mode, pulses in pulse-train mode.
+    pub values_done: u64,
+    pub values_total: u64,
 }
 
 impl GenProgress {
     /// Completion in `0.0..=1.0`.
     #[must_use]
     pub fn fraction(&self) -> Option<f32> {
-        if self.samples_total == 0 {
+        if self.values_total == 0 {
             return None;
         }
-        Some((self.samples_done as f32 / self.samples_total as f32).clamp(0.0, 1.0))
+        Some((self.values_done as f32 / self.values_total as f32).clamp(0.0, 1.0))
     }
 }
 
@@ -139,8 +145,8 @@ mod tests {
             sink.lock().unwrap().push(progress);
         }));
         control.report(GenProgress {
-            samples_done: 50,
-            samples_total: 200,
+            values_done: 50,
+            values_total: 200,
             ..GenProgress::default()
         });
         let seen = seen.lock().unwrap();

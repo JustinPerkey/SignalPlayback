@@ -15,7 +15,9 @@ pub mod time;
 pub use artifact::{
     Artifact, ArtifactSchema, ColumnSpec, FieldRef, FieldSpec, OverlayForm, ViewHint,
 };
-pub use group::{Dataset, GroupId, GroupMeta, SignalGroup, SourceKind};
+pub use group::{
+    Dataset, DatasetId, GroupId, GroupMeta, SignalGroup, SignalTrain, SourceKind, TrainId,
+};
 pub use props::{
     Attributes, PropKind, PropScope, PropertyDef, PropertyError, PropertySet, PropertyValue,
 };

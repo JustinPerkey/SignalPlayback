@@ -7,10 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
-use sp_core::{DType, PropKind, PropScope, PropertyDef, SampleRange};
+use sp_core::{DType, PropKind, PropScope, PropertyDef, SampleRange, TimeUnit};
 use sp_csv::profile::CountMode;
 use sp_csv::{ingest, sniff_file, ColumnRule, ImportControl, ImportProfile, ImportRequest};
-use sp_store::{library, props, pulses, Store};
+use sp_store::{library, props, pulses, trains, Store};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -44,16 +44,28 @@ fn the_sample_file_imports_as_two_groups_of_two_pulses() {
     assert_eq!(report.pulses, 4);
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
 
-    let (groups, fields, toa) = store
+    let dataset_id = report.dataset_id;
+    let (trains, extent, groups, fields, toa) = store
         .read(move |conn| {
-            let groups = library::list_groups(conn, report.dataset_id)?;
+            let trains = trains::list_trains(conn, dataset_id)?;
+            let extent = trains::train_extent(conn, report.train_id)?;
+            let groups = library::list_groups(conn, report.train_id)?;
             let fields = pulses::list_fields(conn, groups[0].id)?;
             let toa = pulses::read_toa(conn, groups[0].id, SampleRange::first(2))?;
-            Ok((groups, fields, toa))
+            Ok((trains, extent, groups, fields, toa))
         })
         .unwrap();
 
+    // One file is one train, and the two blocks are its segments rather than
+    // two independent captures (DESIGN.md 6.6).
+    assert_eq!(trains.len(), 1);
+    assert_eq!(trains[0].id, report.train_id);
+    assert_eq!(trains[0].display_name(), "sample");
+    assert_eq!(trains[0].toa_unit, Some(TimeUnit::Microseconds));
+    assert_eq!(extent, (2, 4), "two groups, four pulses across the train");
+
     assert_eq!(groups.len(), 2);
+    assert!(groups.iter().all(|g| g.train_id == report.train_id));
     assert_eq!(groups[0].name.as_deref(), Some("1"));
     assert_eq!(groups[0].declared_count, 2);
     assert_eq!(groups[0].actual_count, 2);
@@ -84,7 +96,7 @@ fn a_text_column_and_missing_cells_survive_the_import() {
 
     let (groups, fields, power) = store
         .read(move |conn| {
-            let groups = library::list_groups(conn, report.dataset_id)?;
+            let groups = library::list_groups(conn, report.train_id)?;
             let fields = pulses::list_fields(conn, groups[0].id)?;
             let power = pulses::read_field(conn, groups[0].id, 1, SampleRange::first(3))?;
             Ok((groups, fields, power))
@@ -159,7 +171,7 @@ fn a_short_block_imports_with_the_counts_that_disagree_both_recorded() {
         .any(|d| d.message.contains("declared 4")));
 
     let groups = store
-        .read(move |conn| library::list_groups(conn, report.dataset_id))
+        .read(move |conn| library::list_groups(conn, report.train_id))
         .unwrap();
     assert_eq!(groups[0].declared_count, 4);
     assert_eq!(groups[0].actual_count, 2);
@@ -254,7 +266,7 @@ fn a_mapped_column_is_read_as_the_property_it_is_bound_to() {
     let report = import(&store, "sample.csv", profile);
 
     let groups = store
-        .read(move |conn| library::list_groups(conn, report.dataset_id))
+        .read(move |conn| library::list_groups(conn, report.train_id))
         .unwrap();
     assert_eq!(groups[0].attributes.get_i64("channel"), Some(1));
     assert_eq!(groups[1].attributes.get_i64("channel"), Some(2));

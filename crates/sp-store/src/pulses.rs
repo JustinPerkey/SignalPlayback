@@ -2,10 +2,9 @@
 //! and cross-group search over them (`docs/DESIGN.md` §6.6).
 
 use rusqlite::{params, Connection, Row};
-use sp_core::group::DatasetId;
 use sp_core::{
     Attributes, DType, FieldRange, GroupId, PulseField, PulseRef, SampleBuffer, SampleRange,
-    Samples, TimeUnit, Timebase,
+    Samples, TimeUnit, Timebase, TrainId,
 };
 
 use crate::blob::{self, BlobId, DEFAULT_CHUNK_SIZE};
@@ -52,7 +51,8 @@ impl NewPulseField {
 /// A group of pulse records to store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewPulseGroup {
-    pub dataset_id: DatasetId,
+    /// The train this group is a segment of (§6.6).
+    pub train_id: TrainId,
     pub ordinal: u32,
     pub name: Option<String>,
     /// The `count` field from the group row; the actual count is the TOA
@@ -68,9 +68,9 @@ pub struct NewPulseGroup {
 
 impl NewPulseGroup {
     #[must_use]
-    pub fn new(dataset_id: DatasetId, ordinal: u32, toa_seconds: Vec<f64>) -> Self {
+    pub fn new(train_id: TrainId, ordinal: u32, toa_seconds: Vec<f64>) -> Self {
         Self {
-            dataset_id,
+            train_id,
             ordinal,
             name: None,
             declared_count: toa_seconds.len() as u32,
@@ -147,10 +147,10 @@ pub fn insert_pulse_group_chunked(
 
     conn.execute(
         "INSERT INTO signal_group
-             (dataset_id, ordinal, name, declared_count, actual_count, toa_blob_id, toa_unit, attributes)
+             (train_id, ordinal, name, declared_count, actual_count, toa_blob_id, toa_unit, attributes)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
-            group.dataset_id.get(),
+            group.train_id.get(),
             group.ordinal,
             group.name,
             group.declared_count,

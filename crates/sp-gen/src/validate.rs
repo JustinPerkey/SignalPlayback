@@ -13,7 +13,13 @@ use std::fmt;
 
 use crate::expr;
 use crate::spec::{ConcatPart, EnvelopeSpec, GenSpec, ModKind, Node, Sweep};
+use crate::train::{FieldValue, Pri, TrainSpec};
 use crate::tree::{self, ROOT};
+
+/// Pulses above which a train is worth a second look before it is written.
+/// Nothing stops one — goal G2 asks for 10 M pulse records — but a slipped
+/// decimal in the PRI is far more likely than the intent.
+const LARGE_TRAIN: u64 = 10_000_000;
 
 /// Whether an issue blocks generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -173,6 +179,255 @@ pub fn validate(spec: &GenSpec) -> Issues {
 
     node(&mut issues, &spec.root, ROOT, rate, spec.duration_s);
     issues
+}
+
+/// Checks a pulse-train spec (§8.5).
+///
+/// Issues are addressed the way a waveform spec's are, so the generator screen
+/// renders both through one list: `""` for the train's own settings, `/pri`
+/// for the interval, `/fields/<n>` for a column.
+#[must_use]
+pub fn validate_train(spec: &TrainSpec) -> Issues {
+    let mut issues = Issues::default();
+
+    if spec.groups == 0 {
+        issues.push(
+            Severity::Error,
+            "",
+            Some("groups"),
+            "a train with no groups holds nothing",
+            "use one group or more",
+        );
+    }
+    if spec.pulses_per_group == 0 {
+        issues.push(
+            Severity::Error,
+            "",
+            Some("pulses_per_group"),
+            "a group with no pulses holds nothing",
+            "use one pulse or more",
+        );
+    }
+    if !spec.t0_s.is_finite() {
+        issues.push(
+            Severity::Error,
+            "",
+            Some("t0_s"),
+            "the start time is not a number",
+            "enter a time in seconds",
+        );
+    }
+    if spec.pulses() > LARGE_TRAIN {
+        issues.push(
+            Severity::Warning,
+            "",
+            Some("pulses_per_group"),
+            format!(
+                "{} pulses is a large train; check the PRI and the counts",
+                spec.pulses()
+            ),
+            "reduce the groups or the pulses per group if that was not meant",
+        );
+    }
+
+    pri(&mut issues, &spec.pri, spec.pulses());
+
+    if spec.fields.is_empty() {
+        issues.push(
+            Severity::Error,
+            "",
+            Some("fields"),
+            "a pulse record is a time of arrival plus at least one field",
+            "add a field such as pulse width, power or angle",
+        );
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for (index, field) in spec.fields.iter().enumerate() {
+        let pointer = format!("/fields/{index}");
+        let key = sp_core::pulse::normalise_key(&field.name);
+        if field.name.trim().is_empty() || key.is_empty() {
+            issues.push(
+                Severity::Error,
+                &pointer,
+                Some("name"),
+                "a field needs a name, which is also its property key",
+                "give it a name such as 'pulse width'",
+            );
+        } else if seen.contains(&key) {
+            issues.push(
+                Severity::Error,
+                &pointer,
+                Some("name"),
+                format!(
+                    "'{}' collides with an earlier field's key '{key}'",
+                    field.name
+                ),
+                "rename one of them; keys are the normalised names",
+            );
+        } else {
+            seen.push(key);
+        }
+        field_value(&mut issues, &field.value, &pointer);
+    }
+
+    issues
+}
+
+fn pri(issues: &mut Issues, spec: &Pri, pulses: u64) {
+    let positive = |issues: &mut Issues, field: &str, value: f64| {
+        if !value.is_finite() || value <= 0.0 {
+            issues.push(
+                Severity::Error,
+                "/pri",
+                Some(field),
+                format!("{field} is not a positive number of seconds"),
+                "set an interval above zero",
+            );
+        }
+    };
+    match spec {
+        Pri::Fixed { pri_s } => positive(issues, "pri_s", *pri_s),
+        Pri::Stagger { positions } => {
+            if positions.is_empty() {
+                issues.push(
+                    Severity::Error,
+                    "/pri",
+                    Some("positions"),
+                    "a stagger needs at least one position",
+                    "add an interval, or switch to a fixed PRI",
+                );
+            }
+            for (index, position) in positions.iter().enumerate() {
+                if !position.is_finite() || *position <= 0.0 {
+                    issues.push(
+                        Severity::Error,
+                        "/pri",
+                        Some(&format!("positions/{index}")),
+                        format!("position {index} is not a positive number of seconds"),
+                        "every stagger position is an interval above zero",
+                    );
+                }
+            }
+        }
+        Pri::Jitter { pri_s, fraction } => {
+            positive(issues, "pri_s", *pri_s);
+            if !fraction.is_finite() || !(0.0..1.0).contains(fraction) {
+                issues.push(
+                    Severity::Error,
+                    "/pri",
+                    Some("fraction"),
+                    format!("a jitter of {fraction} is outside 0..1"),
+                    "use a fraction of the PRI; 0.05 is 5% peak-to-peak",
+                );
+            }
+        }
+        Pri::Drift { pri_s, per_pulse_s } => {
+            positive(issues, "pri_s", *pri_s);
+            if !per_pulse_s.is_finite() {
+                issues.push(
+                    Severity::Error,
+                    "/pri",
+                    Some("per_pulse_s"),
+                    "the drift is not a number",
+                    "enter a change per pulse in seconds",
+                );
+            } else if pulses > 1 {
+                let last = pri_s + per_pulse_s * (pulses - 1) as f64;
+                if last <= 0.0 {
+                    issues.push(
+                        Severity::Error,
+                        "/pri",
+                        Some("per_pulse_s"),
+                        format!("the interval drifts to {last} s before the train ends"),
+                        "reduce the drift, shorten the train, or raise the PRI",
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn field_value(issues: &mut Issues, value: &FieldValue, pointer: &str) {
+    let finite = |issues: &mut Issues, field: &str, value: f64| {
+        if !value.is_finite() {
+            issues.push(
+                Severity::Error,
+                pointer,
+                Some(field),
+                format!("{field} is not a number"),
+                "enter a finite value",
+            );
+        }
+    };
+    match value {
+        FieldValue::Constant { value } => finite(issues, "value", *value),
+        FieldValue::Uniform { lo, hi } => {
+            finite(issues, "lo", *lo);
+            finite(issues, "hi", *hi);
+            if lo.is_finite() && hi.is_finite() && lo >= hi {
+                issues.push(
+                    Severity::Error,
+                    pointer,
+                    Some("lo"),
+                    format!("the low bound {lo} is not below the high bound {hi}"),
+                    "swap them, or use a constant",
+                );
+            }
+        }
+        FieldValue::Gaussian { mean, sigma } => {
+            finite(issues, "mean", *mean);
+            if !sigma.is_finite() || *sigma < 0.0 {
+                issues.push(
+                    Severity::Error,
+                    pointer,
+                    Some("sigma"),
+                    "a spread cannot be negative",
+                    "use zero for a constant field",
+                );
+            }
+        }
+        FieldValue::Ramp { start, end } => {
+            finite(issues, "start", *start);
+            finite(issues, "end", *end);
+        }
+        FieldValue::Sequence { values } => {
+            if values.is_empty() {
+                issues.push(
+                    Severity::Error,
+                    pointer,
+                    Some("values"),
+                    "the sequence has no values",
+                    "add a value, or use a constant",
+                );
+            }
+            if let Some(bad) = values.iter().find(|v| !v.is_finite()) {
+                issues.push(
+                    Severity::Error,
+                    pointer,
+                    Some("values"),
+                    format!("'{bad}' is not a finite value"),
+                    "every value in the sequence is a number",
+                );
+            }
+        }
+        FieldValue::Scan {
+            mean,
+            amp,
+            period_pulses,
+        } => {
+            finite(issues, "mean", *mean);
+            finite(issues, "amp", *amp);
+            if !period_pulses.is_finite() || *period_pulses <= 0.0 {
+                issues.push(
+                    Severity::Error,
+                    pointer,
+                    Some("period_pulses"),
+                    "a scan needs a period of at least one pulse",
+                    "set how many pulses one sweep of the scan takes",
+                );
+            }
+        }
+    }
 }
 
 /// One issue standing for a sweep that will not expand, so the generator

@@ -295,9 +295,12 @@ impl App {
             (Some(store), _) => {
                 let counts = self.library.summary().map_or_else(String::new, |s| {
                     format!(
-                        " · {} dataset{} · {} group{} · {} signal{} · {} pulse field{} · {}",
+                        " · {} dataset{} · {} train{} · {} group{} · {} signal{} · \
+                         {} pulse field{} · {}",
                         s.datasets,
                         plural(s.datasets),
+                        s.trains,
+                        plural(s.trains),
                         s.groups,
                         plural(s.groups),
                         s.signals,

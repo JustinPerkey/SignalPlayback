@@ -87,14 +87,20 @@ impl Stream {
 /// A `u64` draw as a float in `[0, 1)`, using the 53 bits an `f64` can hold
 /// exactly.
 #[must_use]
-fn unit(bits: u64) -> f64 {
+pub fn unit(bits: u64) -> f64 {
     (bits >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// A `u64` draw as a float in `[-1, 1)`.
+#[must_use]
+pub fn unit_signed(bits: u64) -> f64 {
+    2.0 * unit(bits) - 1.0
 }
 
 /// One standard normal draw by the Box-Muller transform. Deterministic given
 /// the two draws, which is what G3 asks of it.
 #[must_use]
-fn gaussian(a: u64, b: u64) -> f64 {
+pub fn gaussian(a: u64, b: u64) -> f64 {
     // `ln(0)` is the one input Box-Muller cannot take; nudge it into (0, 1].
     let u1 = 1.0 - unit(a);
     let u2 = unit(b);

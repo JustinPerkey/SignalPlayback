@@ -9,8 +9,8 @@ use sp_core::{
 };
 use sp_store::blob::{self, BlobKind, BlobWriter, HEADER_LEN};
 use sp_store::{
-    library, props, pulses, verify, NewDataset, NewGroup, NewPulseField, NewPulseGroup, NewSignal,
-    PropertyQuery, PulsePredicate, Store,
+    library, props, pulses, trains, verify, NewDataset, NewGroup, NewPulseField, NewPulseGroup,
+    NewSignal, NewTrain, PropertyQuery, PulsePredicate, Store,
 };
 
 fn open() -> (tempfile::TempDir, Store) {
@@ -36,8 +36,10 @@ fn signals_insert_and_list() {
                 &tx,
                 &NewDataset::new("capture 1", SourceKind::CsvImport).with_source_uri("c:/x.csv"),
             )?;
+            let train_id =
+                trains::insert_train(&tx, &NewTrain::new(dataset_id, 0).named("capture 1"))?;
             let group_id =
-                library::insert_group(&tx, &NewGroup::new(dataset_id, 0, 2).named("ANT_A"))?;
+                library::insert_group(&tx, &NewGroup::new(train_id, 0, 2).named("ANT_A"))?;
             let mut ids = Vec::new();
             for (ordinal, name) in ["ch0", "ch1"].into_iter().enumerate() {
                 let gain = ordinal as f64 + 1.0;
@@ -73,9 +75,15 @@ fn signals_insert_and_list() {
             assert_eq!(datasets[0].source_kind, SourceKind::CsvImport);
             assert_eq!(datasets[0].source_uri.as_deref(), Some("c:/x.csv"));
 
-            let groups = library::list_groups(conn, dataset_id)?;
+            // Groups hang off a train, not off the dataset (§6.6).
+            let trains = trains::list_trains(conn, dataset_id)?;
+            assert_eq!(trains.len(), 1);
+            assert_eq!(trains[0].display_name(), "capture 1");
+
+            let groups = library::list_groups(conn, trains[0].id)?;
             assert_eq!(groups.len(), 1);
             assert_eq!(groups[0].id, group_id);
+            assert_eq!(groups[0].train_id, trains[0].id);
             assert_eq!(groups[0].name.as_deref(), Some("ANT_A"));
             assert!(!groups[0].is_pulse_group());
 
@@ -340,7 +348,8 @@ fn property_definitions_and_queries() {
 
             let dataset_id =
                 library::insert_dataset(&tx, &NewDataset::new("gen", SourceKind::Generated))?;
-            let group_id = library::insert_group(&tx, &NewGroup::new(dataset_id, 0, 4))?;
+            let train_id = trains::insert_train(&tx, &NewTrain::new(dataset_id, 0))?;
+            let group_id = library::insert_group(&tx, &NewGroup::new(train_id, 0, 4))?;
             let mut ids = Vec::new();
             for i in 0..4u32 {
                 let mut attrs = Attributes::new();
@@ -490,7 +499,8 @@ fn tags_attach_and_filter() {
         .write(|conn| {
             let tx = conn.transaction()?;
             let d = library::insert_dataset(&tx, &NewDataset::new("t", SourceKind::Generated))?;
-            let g = library::insert_group(&tx, &NewGroup::new(d, 0, 2))?;
+            let t = trains::insert_train(&tx, &NewTrain::new(d, 0))?;
+            let g = library::insert_group(&tx, &NewGroup::new(t, 0, 2))?;
             let mk = |i: u32| {
                 NewSignal::new(
                     g,
@@ -535,7 +545,7 @@ fn pulse_groups_store_columns_and_search_across_groups() {
     let (_dir, store) = open();
 
     // Mirrors sample/sample.csv: two groups of two pulses, TOA in µs.
-    let (dataset_id, g1, g2) = store
+    let (train_id, g1, g2) = store
         .write(|conn| {
             let tx = conn.transaction()?;
             let dataset_id = library::insert_dataset(
@@ -543,13 +553,20 @@ fn pulse_groups_store_columns_and_search_across_groups() {
                 &NewDataset::new("sample.csv", SourceKind::CsvImport),
             )?;
             let unit = TimeUnit::Microseconds;
+            // One file is one train; its two blocks are segments of it.
+            let train_id = trains::insert_train(
+                &tx,
+                &NewTrain::new(dataset_id, 0)
+                    .named("sample.csv")
+                    .with_toa_unit(unit),
+            )?;
             let mut attrs = Attributes::new();
             attrs.insert("total_time", 1000.0);
             attrs.insert("info", "info");
             let g1 = pulses::insert_pulse_group(
                 &tx,
                 &NewPulseGroup::new(
-                    dataset_id,
+                    train_id,
                     0,
                     vec![unit.to_seconds(10.0), unit.to_seconds(20.0)],
                 )
@@ -563,7 +580,7 @@ fn pulse_groups_store_columns_and_search_across_groups() {
             let g2 = pulses::insert_pulse_group(
                 &tx,
                 &NewPulseGroup::new(
-                    dataset_id,
+                    train_id,
                     1,
                     vec![unit.to_seconds(30.0), unit.to_seconds(40.0)],
                 )
@@ -574,14 +591,18 @@ fn pulse_groups_store_columns_and_search_across_groups() {
                 .with_attributes(attrs),
             )?;
             tx.commit()?;
-            Ok((dataset_id, g1, g2))
+            Ok((train_id, g1, g2))
         })
         .unwrap();
 
     store
         .read(|conn| {
-            let groups = library::list_groups(conn, dataset_id)?;
+            let groups = library::list_groups(conn, train_id)?;
             assert_eq!(groups.len(), 2);
+            // Both blocks belong to the one capture, and the train knows how
+            // much it holds without reading a column.
+            assert_eq!(trains::train_extent(conn, train_id)?, (2, 4));
+            assert!(trains::get_train(conn, train_id)?.is_pulse_train());
             assert!(groups[0].is_pulse_group());
             assert_eq!(groups[0].toa_unit, Some(TimeUnit::Microseconds));
             assert_eq!(groups[0].actual_count, 2);
@@ -653,7 +674,8 @@ fn verify_passes_on_a_healthy_library_and_catches_damage() {
         .write(|conn| {
             let tx = conn.transaction()?;
             let d = library::insert_dataset(&tx, &NewDataset::new("v", SourceKind::Generated))?;
-            let g = library::insert_group(&tx, &NewGroup::new(d, 0, 1))?;
+            let t = trains::insert_train(&tx, &NewTrain::new(d, 0))?;
+            let g = library::insert_group(&tx, &NewGroup::new(t, 0, 1))?;
             let s = library::insert_signal_chunked(
                 &tx,
                 &NewSignal::new(
@@ -667,7 +689,7 @@ fn verify_passes_on_a_healthy_library_and_catches_damage() {
             )?;
             let p = pulses::insert_pulse_group(
                 &tx,
-                &NewPulseGroup::new(d, 1, vec![0.0, 1.0, 2.0])
+                &NewPulseGroup::new(t, 1, vec![0.0, 1.0, 2.0])
                     .with_field(NewPulseField::new("w", vec![1.0, 2.0, 3.0])),
             )?;
             assert_ne!(p, g);
@@ -744,7 +766,8 @@ fn a_rolled_back_import_leaves_no_trace() {
         .write(|conn| {
             let tx = conn.transaction()?;
             let d = library::insert_dataset(&tx, &NewDataset::new("x", SourceKind::CsvImport))?;
-            let g = library::insert_group(&tx, &NewGroup::new(d, 0, 1))?;
+            let t = trains::insert_train(&tx, &NewTrain::new(d, 0))?;
+            let g = library::insert_group(&tx, &NewGroup::new(t, 0, 1))?;
             library::insert_signal(
                 &tx,
                 &NewSignal::new(

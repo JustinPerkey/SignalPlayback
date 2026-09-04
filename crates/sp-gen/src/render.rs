@@ -168,8 +168,8 @@ pub fn render_values(
             fill(&spec.root, &frame, span, slice, &ctx);
             let so_far = done.fetch_add(span.len(), Ordering::Relaxed) + span.len();
             control.report(GenProgress {
-                samples_done: so_far,
-                samples_total: total,
+                values_done: so_far,
+                values_total: total,
                 ..GenProgress::default()
             });
             Ok(())
@@ -910,7 +910,7 @@ mod tests {
         let sink = seen.clone();
         let control = GenControl::new().with_progress(Arc::new(move |progress| {
             let mut slot = sink.lock().unwrap();
-            if progress.samples_done > slot.samples_done {
+            if progress.values_done > slot.values_done {
                 *slot = progress;
             }
         }));
@@ -918,8 +918,8 @@ mod tests {
         let total = spec.sample_count();
         render_values(&spec, SampleRange::first(total), &Sources::new(), &control).unwrap();
         let seen = *seen.lock().unwrap();
-        assert_eq!(seen.samples_done, total);
-        assert_eq!(seen.samples_total, total);
+        assert_eq!(seen.values_done, total);
+        assert_eq!(seen.values_total, total);
     }
 
     #[test]

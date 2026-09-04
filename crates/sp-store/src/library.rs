@@ -9,7 +9,7 @@ use sp_core::group::DatasetId;
 use sp_core::time::{now_utc, Timestamp};
 use sp_core::{
     Attributes, DType, Dataset, Domain, GroupId, Provenance, RunId, SampleBuffer, SampleRange,
-    Signal, SignalGroup, SignalId, SignalStats, SourceKind, TimeUnit, Timebase,
+    Signal, SignalGroup, SignalId, SignalStats, SourceKind, TimeUnit, Timebase, TrainId,
 };
 use time::format_description::well_known::Rfc3339;
 
@@ -48,9 +48,12 @@ impl NewDataset {
 
 /// What to insert as a group of sampled signals. Pulse groups go through
 /// [`crate::pulses::insert_pulse_group`], which also writes the columns.
+///
+/// A group hangs off a train, not off a dataset: it is one segment of a
+/// capture (§6.6).
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewGroup {
-    pub dataset_id: DatasetId,
+    pub train_id: TrainId,
     pub ordinal: u32,
     pub name: Option<String>,
     pub declared_count: u32,
@@ -60,9 +63,9 @@ pub struct NewGroup {
 
 impl NewGroup {
     #[must_use]
-    pub fn new(dataset_id: DatasetId, ordinal: u32, count: u32) -> Self {
+    pub fn new(train_id: TrainId, ordinal: u32, count: u32) -> Self {
         Self {
-            dataset_id,
+            train_id,
             ordinal,
             name: None,
             declared_count: count,
@@ -146,6 +149,7 @@ impl NewSignal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LibrarySummary {
     pub datasets: u64,
+    pub trains: u64,
     pub groups: u64,
     pub signals: u64,
     pub pulse_fields: u64,
@@ -236,15 +240,20 @@ pub fn list_datasets(conn: &Connection) -> Result<Vec<Dataset>> {
 /// Deletes a dataset with everything under it, releasing the blobs its
 /// signals and pulse fields referenced.
 pub fn delete_dataset(conn: &Connection, id: DatasetId) -> Result<()> {
+    const GROUPS_OF_DATASET: &str =
+        "SELECT g.id FROM signal_group g JOIN signal_train t ON t.id = g.train_id
+          WHERE t.dataset_id = ?1";
     let blobs = referenced_blobs(
         conn,
-        "SELECT s.blob_id FROM signal s JOIN signal_group g ON g.id = s.group_id WHERE g.dataset_id = ?1
-         UNION ALL
-         SELECT s.time_blob_id FROM signal s JOIN signal_group g ON g.id = s.group_id WHERE g.dataset_id = ?1
-         UNION ALL
-         SELECT g.toa_blob_id FROM signal_group g WHERE g.dataset_id = ?1
-         UNION ALL
-         SELECT f.blob_id FROM pulse_field f JOIN signal_group g ON g.id = f.group_id WHERE g.dataset_id = ?1",
+        &format!(
+            "SELECT s.blob_id FROM signal s WHERE s.group_id IN ({GROUPS_OF_DATASET})
+             UNION ALL
+             SELECT s.time_blob_id FROM signal s WHERE s.group_id IN ({GROUPS_OF_DATASET})
+             UNION ALL
+             SELECT g.toa_blob_id FROM signal_group g WHERE g.id IN ({GROUPS_OF_DATASET})
+             UNION ALL
+             SELECT f.blob_id FROM pulse_field f WHERE f.group_id IN ({GROUPS_OF_DATASET})"
+        ),
         id.get(),
     )?;
     let deleted = conn.execute("DELETE FROM dataset WHERE id = ?1", [id.get()])?;
@@ -255,6 +264,24 @@ pub fn delete_dataset(conn: &Connection, id: DatasetId) -> Result<()> {
         blob::release(conn, blob_id)?;
     }
     Ok(())
+}
+
+/// Every blob the groups under a train reference, for a delete.
+pub(crate) fn blobs_under_train(conn: &Connection, train_id: TrainId) -> Result<Vec<BlobId>> {
+    const GROUPS_OF_TRAIN: &str = "SELECT id FROM signal_group WHERE train_id = ?1";
+    referenced_blobs(
+        conn,
+        &format!(
+            "SELECT s.blob_id FROM signal s WHERE s.group_id IN ({GROUPS_OF_TRAIN})
+             UNION ALL
+             SELECT s.time_blob_id FROM signal s WHERE s.group_id IN ({GROUPS_OF_TRAIN})
+             UNION ALL
+             SELECT g.toa_blob_id FROM signal_group g WHERE g.id IN ({GROUPS_OF_TRAIN})
+             UNION ALL
+             SELECT f.blob_id FROM pulse_field f WHERE f.group_id IN ({GROUPS_OF_TRAIN})"
+        ),
+        train_id.get(),
+    )
 }
 
 fn referenced_blobs(conn: &Connection, sql: &str, id: i64) -> Result<Vec<BlobId>> {
@@ -276,10 +303,10 @@ fn referenced_blobs(conn: &Connection, sql: &str, id: i64) -> Result<Vec<BlobId>
 pub fn insert_group(conn: &Connection, group: &NewGroup) -> Result<GroupId> {
     conn.execute(
         "INSERT INTO signal_group
-             (dataset_id, ordinal, name, declared_count, actual_count, toa_blob_id, toa_unit, attributes)
+             (train_id, ordinal, name, declared_count, actual_count, toa_blob_id, toa_unit, attributes)
          VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
         params![
-            group.dataset_id.get(),
+            group.train_id.get(),
             group.ordinal,
             group.name,
             group.declared_count,
@@ -291,13 +318,13 @@ pub fn insert_group(conn: &Connection, group: &NewGroup) -> Result<GroupId> {
 }
 
 const GROUP_COLUMNS: &str =
-    "id, dataset_id, ordinal, name, declared_count, actual_count, toa_unit, attributes";
+    "id, train_id, ordinal, name, declared_count, actual_count, toa_unit, attributes";
 
 fn group_from_row(row: &Row<'_>) -> Result<SignalGroup> {
     let toa_unit: Option<String> = row.get(6)?;
     Ok(SignalGroup {
         id: GroupId::new(row.get(0)?),
-        dataset_id: DatasetId::new(row.get(1)?),
+        train_id: TrainId::new(row.get(1)?),
         ordinal: row.get(2)?,
         name: row.get(3)?,
         declared_count: row.get(4)?,
@@ -321,10 +348,33 @@ pub fn get_group(conn: &Connection, id: GroupId) -> Result<SignalGroup> {
     })
 }
 
-/// A dataset's groups in block order.
-pub fn list_groups(conn: &Connection, dataset_id: DatasetId) -> Result<Vec<SignalGroup>> {
+/// A train's groups in block order.
+pub fn list_groups(conn: &Connection, train_id: TrainId) -> Result<Vec<SignalGroup>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {GROUP_COLUMNS} FROM signal_group WHERE dataset_id = ?1 ORDER BY ordinal"
+        "SELECT {GROUP_COLUMNS} FROM signal_group WHERE train_id = ?1 ORDER BY ordinal"
+    ))?;
+    let rows = stmt.query_and_then([train_id.get()], group_from_row)?;
+    rows.collect()
+}
+
+/// Every group in a dataset, train by train and then in block order — what an
+/// export walks.
+pub fn list_groups_in_dataset(
+    conn: &Connection,
+    dataset_id: DatasetId,
+) -> Result<Vec<SignalGroup>> {
+    // The join brings a second `id` and `ordinal` into scope, so the group's
+    // own columns have to be named.
+    let qualified = GROUP_COLUMNS
+        .split(", ")
+        .map(|column| format!("g.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {qualified} FROM signal_group g
+         JOIN signal_train t ON t.id = g.train_id
+         WHERE t.dataset_id = ?1
+         ORDER BY t.ordinal, g.ordinal"
     ))?;
     let rows = stmt.query_and_then([dataset_id.get()], group_from_row)?;
     rows.collect()
@@ -682,6 +732,7 @@ pub fn summary(conn: &Connection) -> Result<LibrarySummary> {
     };
     Ok(LibrarySummary {
         datasets: count("SELECT COUNT(*) FROM dataset")?,
+        trains: count("SELECT COUNT(*) FROM signal_train")?,
         groups: count("SELECT COUNT(*) FROM signal_group")?,
         signals: count("SELECT COUNT(*) FROM signal")?,
         pulse_fields: count("SELECT COUNT(*) FROM pulse_field")?,

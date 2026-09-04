@@ -40,7 +40,9 @@ pub fn export_dataset<W: Write>(
     out: &mut W,
 ) -> Result<()> {
     let layout = layout_of(conn, dataset_id)?;
-    let groups = library::list_groups(conn, dataset_id)?;
+    // Every group in the dataset, train by train: a file is one train, so an
+    // export of a single imported dataset walks one (§6.6).
+    let groups = library::list_groups_in_dataset(conn, dataset_id)?;
 
     for line in &layout.preamble {
         writeln!(out, "{line}").map_err(CsvError::Io)?;

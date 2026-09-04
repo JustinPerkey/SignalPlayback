@@ -273,7 +273,7 @@ of the source" option stores it as a compressed blob when the provenance matters
 CREATE TABLE app_meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
-);  -- seeded with ('schema_version','1')
+);  -- seeded with ('schema_version','2')
 
 -- One import run, one generation batch, or one derived collection.
 CREATE TABLE dataset (
@@ -288,11 +288,24 @@ CREATE TABLE dataset (
     attributes    TEXT    NOT NULL DEFAULT '{}'   -- JSON property values
 );
 
--- A group block from the CSV, or a bundle of generated signals.
--- The group is also the unit of processing (§9).
+-- One capture: everything a source file carries. One imported file is one
+-- train, and the groups under it are its segments, not separate recordings
+-- (§6.6).
+CREATE TABLE signal_train (
+    id          INTEGER PRIMARY KEY,
+    dataset_id  INTEGER NOT NULL REFERENCES dataset(id) ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL,
+    name        TEXT,
+    toa_unit    TEXT,                      -- set for a train of pulse records
+    attributes  TEXT    NOT NULL DEFAULT '{}',
+    UNIQUE (dataset_id, ordinal)
+);
+
+-- One block within a train: a dwell, a scan, a generation batch. The group is
+-- the unit of processing (§9).
 CREATE TABLE signal_group (
     id              INTEGER PRIMARY KEY,
-    dataset_id      INTEGER NOT NULL REFERENCES dataset(id) ON DELETE CASCADE,
+    train_id        INTEGER NOT NULL REFERENCES signal_train(id) ON DELETE CASCADE,
     ordinal         INTEGER NOT NULL,
     name            TEXT,
     declared_count  INTEGER NOT NULL,      -- the 'count' field from the group header
@@ -301,7 +314,7 @@ CREATE TABLE signal_group (
     toa_blob_id     INTEGER REFERENCES sample_blob(id),
     toa_unit        TEXT,                  -- source unit, e.g. 'us'; NULL for sampled groups
     attributes      TEXT    NOT NULL DEFAULT '{}',   -- JSON property values
-    UNIQUE (dataset_id, ordinal)
+    UNIQUE (train_id, ordinal)
 );
 
 CREATE TABLE signal (
@@ -635,8 +648,25 @@ what keeps G1 true across schema evolution.
 The project's CSV format (§7) carries **pulse records** rather than sampled waveforms: a
 group is a collection of pulses, and a pulse is one record — a time of arrival plus a fixed
 set of numeric fields (`pulse width`, `power`, `angle`, …). Groups routinely hold millions
-of them. Pulses are never processed across groups, but *searching* for pulses across groups
-is a first-class operation.
+of them.
+
+**Groups are not independent — they are segments of a train.** One signal train resolves to
+several groups, and those groups are one capture: a file's blocks are its dwells or scans,
+not separate recordings. A `signal_train` therefore sits between a dataset and its groups,
+and **one imported file is one train**. Generation produces a train too (§8.5), so an
+imported and a generated capture are the same shape and are interchangeable as pipeline
+input.
+
+The train is what a capture is named, listed and reasoned about as; the group stays the
+unit of *processing* (§9.1), and a stage that needs the rest of the capture reaches it
+through `GroupMeta::train_id`. Searching for pulses across groups remains a first-class
+operation and is unchanged by the train level.
+
+```
+dataset ── train ─┬─ group 0 ── toa[] + one column per field
+                  ├─ group 1 ── …
+                  └─ group 2 ── …
+```
 
 Two views of the same bytes serve those two needs.
 
@@ -665,6 +695,14 @@ group 7   toa[]  = [10 µs, 20 µs, 30 µs, …]      ← shared irregular timeb
 **Naming and annotation.** A `pulse` row is created lazily, only for a pulse the user names
 or tags, keyed by `(group_id, index)`. A file with 10 M pulses of which 40 are interesting
 costs 40 rows, not 10 M.
+
+**Why a train row rather than one column per field spanning the whole capture.** Storing a
+train as a single pair of columns with groups as `(start, count)` spans would make a
+whole-capture scan one read. It was rejected for now: a group's columns are already
+content-addressed blobs that dedupe and stream independently, ingest can flush at each
+group boundary with one group in memory (§7.4), and a group stays independently
+re-importable. The train row buys the missing relationship at the cost of one join, and
+leaves the column layout — the part that is expensive to change — alone.
 
 **Cross-group search.** Each `pulse_field` records min/max — a zone map — so a predicate
 such as `pulse_width < 2 AND angle BETWEEN 30 AND 40` first eliminates whole groups in
@@ -772,6 +810,10 @@ boundary, so peak memory is one group rather than one file.
 
 Import is transactional at the dataset level: a failure rolls back the SQLite rows and
 deletes any orphaned blobs.
+
+An import writes **one train** and hangs every group it frames off it (§6.6); export walks
+the dataset's trains in order and then each train's groups, which is what makes the round
+trip a fixed point.
 
 ### 7.5 Export
 
@@ -911,6 +953,42 @@ Generation exists primarily to feed §9. Three patterns get first-class support:
 - **Preprocessed inputs** — generation can emit `digital_logic` or `symbols` signals
   directly, so a stage that expects an already-sliced input can be tested without first
   running the analog front end.
+
+### 8.5 Pulse-Train Generation
+
+§8.1 synthesises *sampled* signals. An import carries *pulse records* (§6.6), so a
+generated waveform can never stand in for a captured train — different shape, different
+viewer, different stage inputs. A `TrainSpec` is the other half of generation, and emits
+exactly what an import does: a train, its groups, a time-of-arrival column and one column
+per field.
+
+```rust
+pub struct TrainSpec {
+    pub toa_unit: TimeUnit,   // as a file would express it; storage is seconds
+    pub t0_s:     f64,
+    pub groups:   u32,        // dwells, scans, blocks of a file
+    pub pulses_per_group: u32,
+    pub seed:     u64,        // makes the jitter and the random fields reproducible (G3)
+    pub pri:      Pri,        // Fixed | Stagger{positions} | Jitter{fraction} | Drift{per_pulse}
+    pub fields:   Vec<FieldSpec>,   // name, unit, and how the value varies
+}
+
+pub enum FieldValue {
+    Constant{value}, Uniform{lo,hi}, Gaussian{mean,sigma},
+    Ramp{start,end}, Sequence{values}, Scan{mean,amp,period_pulses},
+}
+```
+
+Everything is a function of the **pulse index within the train**, for the same reason the
+sample renderer is a function of the sample index: a group renders identically whether or
+not the groups before it were rendered, and the same spec and seed reproduce the same
+numbers (G3). The interval patterns all have closed forms — a stagger is whole cycles plus
+a partial, a drift is an arithmetic series — and jitter dithers each arrival rather than
+accumulating, so the train never walks away from its nominal PRF.
+
+The generator screen carries both modes. The parameter form and the validator are the same
+machinery in each: a spec is edited through JSON pointers into its serialised form, so a
+train's `/pri/mode` and a node's `/root/env/shape` are handled by one code path.
 
 ---
 
@@ -1698,7 +1776,7 @@ larger effort · **[Stretch]** speculative.
 | **M0 — Skeleton** | Workspace, `sp-core` types, Iced window with screen nav, logging | App launches, screens switch, CI builds and clippy is clean |
 | **M1 — Store** | SQLite schema + migrations, chunked blob store, store actor, property definitions, library screen | Signals insert and list; property queries work; a column round-trips through chunked BLOB storage byte-for-byte; `Verify Library` passes |
 | **M2 — Import** | Block framer, parser, mapping UI (incl. property binding), streaming ingest, error list | Fixture corpus imports; round-trip property test passes (G1) |
-| **M3 — Generate** | `GenSpec`, primitives, combinators, generator UI, sweeps | Determinism property test passes (G3); presets load |
+| **M3 — Generate** | `GenSpec`, primitives, combinators, generator UI, sweeps, pulse-train mode | Determinism property test passes (G3); presets load; a generated train is the same shape as an imported one |
 | **M4 — Playback** | Pyramid builder, viewport, scope canvas, transport, clock, domain renderers | 100 M-sample signal plays at 60 fps (G2) |
 | **M5 — Pipeline** | `Stage` trait, registry, ports, scheduler, run recording, first `sp-dsp` stages | A pipeline runs over a dataset group-by-group and every stage's output is persisted |
 | **M6 — Results** | Artifact model + viewers, stage rail, results screen, global playhead, comparison | Any (group, stage) is inspectable with its artifacts; pinned comparison works (G7) |
@@ -1741,11 +1819,14 @@ noted.
    ports (§9.3). If real algorithms need genuine branching — two parallel chains reconciled
    at the end — that is a v2 graph editor, and knowing now would change the pipeline model
    rather than extend it later.
-7. ⚠ **Cross-group state.** The design assumes stages are independent per group, with
-   `begin_run`/`end_run` as the only cross-group hooks. If an algorithm needs to carry
-   adaptive state *between* groups in order (a tracker, an adaptive equaliser), group
-   parallelism must become opt-out per stage. A `sequential` flag in `StageDescriptor`
-   covers it cheaply, but only if it goes in before the scheduler is written.
+7. ⚠ **Cross-group state — now likelier than assumed.** The design assumes stages are
+   independent per group, with `begin_run`/`end_run` as the only cross-group hooks. Groups
+   are segments of one train (§6.6), so an algorithm that carries adaptive state *between*
+   them in order — a tracker, a deinterleaver, an adaptive equaliser — is the expected
+   case rather than the exception, and group parallelism must become opt-out per stage. A
+   `sequential` flag in `StageDescriptor`, plus a scope that runs a stage over a whole
+   train, covers it cheaply, but only if it goes in before the scheduler is written
+   (**decide at M5**).
 8. **Stage output signal count.** Assumed a stage may add and drop signals freely within a
    group. If downstream stages must see a fixed signal count matching the group's declared
    `count`, that is a validation rule worth stating now.

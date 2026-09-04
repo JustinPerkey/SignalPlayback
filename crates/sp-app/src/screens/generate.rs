@@ -27,11 +27,12 @@ use iced::widget::{
 use iced::{mouse, Alignment, Element, Length, Point, Rectangle, Subscription, Task, Theme};
 use serde_json::Value;
 use sp_core::{DType, Domain, SampleRange};
-use sp_gen::generate::{GenReport, GenRequest};
+use sp_gen::generate::{GenReport, GenRequest, TrainRequest};
 use sp_gen::sweep::{ParamRef, ParamSweep, SweepValues};
+use sp_gen::train::{FieldSpec, FieldValue, TrainSpec};
 use sp_gen::{
-    tree, validate, GenControl, GenProgress, GenSpec, Issue, Node, NodeKind, Preset, Severity,
-    Sources,
+    tree, validate, validate_train, GenControl, GenProgress, GenSpec, Issue, Issues, Node,
+    NodeKind, Preset, Severity, Sources,
 };
 use sp_store::Store;
 
@@ -47,6 +48,9 @@ const PREVIEW_SECONDS: f64 = 2.0;
 /// Samples the preview will render before it gives up on covering the whole
 /// window; a megasample-rate spec previews its first slice instead.
 const PREVIEW_SAMPLE_CAP: u64 = 4_000_000;
+
+/// Pulses the preview shows of a train, for the same reason.
+const PREVIEW_PULSES: u64 = 20_000;
 
 /// How long the spec must sit still before the preview re-renders (§8.3).
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -132,23 +136,141 @@ const MOD_VARIANTS: [Variant; 3] = [
     },
 ];
 
+const PRI_VARIANTS: [Variant; 4] = [
+    Variant {
+        key: "fixed",
+        label: "Fixed",
+    },
+    Variant {
+        key: "stagger",
+        label: "Stagger",
+    },
+    Variant {
+        key: "jitter",
+        label: "Jitter",
+    },
+    Variant {
+        key: "drift",
+        label: "Drift",
+    },
+];
+
+const FIELD_VARIANTS: [Variant; 6] = [
+    Variant {
+        key: "constant",
+        label: "Constant",
+    },
+    Variant {
+        key: "uniform",
+        label: "Uniform",
+    },
+    Variant {
+        key: "gaussian",
+        label: "Gaussian",
+    },
+    Variant {
+        key: "ramp",
+        label: "Ramp",
+    },
+    Variant {
+        key: "sequence",
+        label: "Sequence",
+    },
+    Variant {
+        key: "scan",
+        label: "Scan",
+    },
+];
+
+const UNIT_VARIANTS: [Variant; 4] = [
+    Variant {
+        key: "seconds",
+        label: "Seconds",
+    },
+    Variant {
+        key: "milliseconds",
+        label: "Milliseconds",
+    },
+    Variant {
+        key: "microseconds",
+        label: "Microseconds",
+    },
+    Variant {
+        key: "nanoseconds",
+        label: "Nanoseconds",
+    },
+];
+
 /// The default JSON of a tagged sub-object, for switching its variant. Setting
 /// only the tag would leave the sibling fields belonging to the old variant.
-fn variant_object(tag: &str, key: &str) -> Option<Value> {
-    let object = match (tag, key) {
-        ("shape", "adsr") => serde_json::json!({
+///
+/// Keyed by the tag's full pointer, not by its name: `mode` tags both a
+/// modulation and a pulse interval, and `shape` tags both an envelope and a
+/// field's distribution.
+fn variant_object(pointer: &str, key: &str) -> Option<Value> {
+    let object = match (tag_of(pointer)?, key) {
+        (Tag::Envelope, "adsr") => serde_json::json!({
             "shape": "adsr", "attack_s": 0.01, "decay_s": 0.05, "sustain": 0.7, "release_s": 0.05
         }),
-        ("shape", "gaussian") => {
+        (Tag::Envelope, "gaussian") => {
             serde_json::json!({ "shape": "gaussian", "center_s": 0.5, "sigma_s": 0.1 })
         }
-        ("shape", "tukey") => serde_json::json!({ "shape": "tukey", "alpha": 0.1 }),
-        ("mode", "am") => serde_json::json!({ "mode": "am", "depth": 0.5 }),
-        ("mode", "fm") => serde_json::json!({ "mode": "fm", "dev_hz": 1000.0 }),
-        ("mode", "pm") => serde_json::json!({ "mode": "pm", "dev_rad": 1.0 }),
+        (Tag::Envelope, "tukey") => serde_json::json!({ "shape": "tukey", "alpha": 0.1 }),
+        (Tag::Modulation, "am") => serde_json::json!({ "mode": "am", "depth": 0.5 }),
+        (Tag::Modulation, "fm") => serde_json::json!({ "mode": "fm", "dev_hz": 1000.0 }),
+        (Tag::Modulation, "pm") => serde_json::json!({ "mode": "pm", "dev_rad": 1.0 }),
+        (Tag::Pri, "fixed") => serde_json::json!({ "mode": "fixed", "pri_s": 1e-3 }),
+        (Tag::Pri, "stagger") => {
+            serde_json::json!({ "mode": "stagger", "positions": [1e-3, 1.2e-3, 0.8e-3] })
+        }
+        (Tag::Pri, "jitter") => {
+            serde_json::json!({ "mode": "jitter", "pri_s": 1e-3, "fraction": 0.05 })
+        }
+        (Tag::Pri, "drift") => {
+            serde_json::json!({ "mode": "drift", "pri_s": 1e-3, "per_pulse_s": 1e-7 })
+        }
+        (Tag::FieldValue, "constant") => serde_json::json!({ "shape": "constant", "value": 1.0 }),
+        (Tag::FieldValue, "uniform") => {
+            serde_json::json!({ "shape": "uniform", "lo": 0.0, "hi": 1.0 })
+        }
+        (Tag::FieldValue, "gaussian") => {
+            serde_json::json!({ "shape": "gaussian", "mean": 1.0, "sigma": 0.1 })
+        }
+        (Tag::FieldValue, "ramp") => {
+            serde_json::json!({ "shape": "ramp", "start": 0.0, "end": 1.0 })
+        }
+        (Tag::FieldValue, "sequence") => {
+            serde_json::json!({ "shape": "sequence", "values": [1.0, 2.0, 3.0] })
+        }
+        (Tag::FieldValue, "scan") => {
+            serde_json::json!({ "shape": "scan", "mean": 0.0, "amp": 1.0, "period_pulses": 256.0 })
+        }
         _ => return None,
     };
     Some(object)
+}
+
+/// Which tagged enum a pointer names the tag of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tag {
+    Envelope,
+    Modulation,
+    Pri,
+    FieldValue,
+}
+
+fn tag_of(pointer: &str) -> Option<Tag> {
+    if pointer.ends_with("/env/shape") {
+        Some(Tag::Envelope)
+    } else if pointer.ends_with("/kind/mode") {
+        Some(Tag::Modulation)
+    } else if pointer.ends_with("/pri/mode") {
+        Some(Tag::Pri)
+    } else if pointer.ends_with("/value/shape") {
+        Some(Tag::FieldValue)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +325,27 @@ impl fmt::Display for TargetChoice {
     }
 }
 
+/// What the screen generates. An import carries pulse records (§6.6), so a
+/// waveform cannot stand in for a capture; the two modes cover both shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Waveform,
+    PulseTrain,
+}
+
+impl Mode {
+    const ALL: [Self; 2] = [Self::Waveform, Self::PulseTrain];
+}
+
+impl fmt::Display for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Waveform => "Waveform (sampled signal)",
+            Self::PulseTrain => "Pulse train (records)",
+        })
+    }
+}
+
 /// Whether a sweep steps a range or walks a list (§8.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepMode {
@@ -234,10 +377,8 @@ pub struct Preview {
     columns: Vec<(f32, f32)>,
     min: f64,
     max: f64,
-    seconds: f64,
-    samples: u64,
-    /// Set when the window shown is only the front of the signal.
-    truncated: bool,
+    /// What the strip is showing, written by whichever builder made it.
+    caption: String,
 }
 
 /// A running generation, and the two things the UI reaches into it for.
@@ -249,7 +390,12 @@ struct Job {
 
 #[derive(Debug)]
 pub struct State {
+    mode: Mode,
     spec: GenSpec,
+    /// The pulse train, when the screen is generating records rather than
+    /// samples. Kept alongside the waveform spec so switching modes back and
+    /// forth does not discard either.
+    train: TrainSpec,
     /// JSON pointer of the node the parameter form is showing.
     selected: String,
     /// In-progress text per field, so a half-typed number does not snap back.
@@ -292,7 +438,9 @@ impl Default for State {
     fn default() -> Self {
         let spec = GenSpec::default();
         let mut state = Self {
+            mode: Mode::Waveform,
             spec,
+            train: TrainSpec::default(),
             selected: tree::ROOT.to_owned(),
             drafts: HashMap::new(),
             draft_errors: HashMap::new(),
@@ -326,6 +474,12 @@ impl Default for State {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ModePicked(Mode),
+
+    // Pulse-train fields
+    AddField,
+    RemoveField(usize),
+
     // Presets
     PresetPicked(usize),
     BrowsePreset,
@@ -404,6 +558,35 @@ impl State {
 
     pub fn update(&mut self, store: Option<&Store>, message: Message) -> Task<Message> {
         match message {
+            Message::ModePicked(mode) => {
+                if self.mode != mode {
+                    self.mode = mode;
+                    self.drafts.clear();
+                    self.draft_errors.clear();
+                    self.preview = None;
+                    self.preview_error = None;
+                    self.touch();
+                }
+                Task::none()
+            }
+            Message::AddField => {
+                self.train.fields.push(FieldSpec::new(
+                    format!("field {}", self.train.fields.len() + 1),
+                    FieldValue::Constant { value: 1.0 },
+                ));
+                self.drafts.clear();
+                self.touch();
+                Task::none()
+            }
+            Message::RemoveField(index) => {
+                if index < self.train.fields.len() {
+                    self.train.fields.remove(index);
+                    self.drafts.clear();
+                    self.draft_errors.clear();
+                    self.touch();
+                }
+                Task::none()
+            }
             Message::PresetPicked(index) => {
                 if let Some(preset) = self.presets.get(index) {
                     self.spec = preset.spec.clone();
@@ -522,11 +705,11 @@ impl State {
                 Task::none()
             }
             Message::VariantPicked(pointer, variant) => {
-                let tag = pointer.rsplit('/').next().unwrap_or_default().to_owned();
-                match variant_object(&tag, variant.key) {
+                match variant_object(&pointer, variant.key) {
                     // A tagged sub-object is replaced whole, so no field of the
                     // old variant survives into the new one.
                     Some(object) => {
+                        let tag = pointer.rsplit('/').next().unwrap_or_default();
                         let parent = pointer
                             .strip_suffix(&format!("/{tag}"))
                             .unwrap_or(&pointer)
@@ -557,7 +740,11 @@ impl State {
                 Task::none()
             }
             Message::RandomiseSeed => {
-                self.spec.seed = fresh_seed();
+                let seed = fresh_seed();
+                match self.mode {
+                    Mode::Waveform => self.spec.seed = seed,
+                    Mode::PulseTrain => self.train.seed = seed,
+                }
                 self.drafts.remove("/seed");
                 self.touch();
                 Task::none()
@@ -623,11 +810,22 @@ impl State {
                 }
                 self.dirty_since = None;
                 self.previewing = true;
-                let spec = self.spec.clone();
-                Task::perform(
-                    jobs::blocking(move || build_preview(&spec).map(Box::new)),
-                    Message::Previewed,
-                )
+                match self.mode {
+                    Mode::Waveform => {
+                        let spec = self.spec.clone();
+                        Task::perform(
+                            jobs::blocking(move || build_preview(&spec).map(Box::new)),
+                            Message::Previewed,
+                        )
+                    }
+                    Mode::PulseTrain => {
+                        let spec = self.train.clone();
+                        Task::perform(
+                            jobs::blocking(move || build_train_preview(&spec).map(Box::new)),
+                            Message::Previewed,
+                        )
+                    }
+                }
             }
             Message::Previewed(result) => {
                 self.previewing = false;
@@ -697,18 +895,55 @@ impl State {
         self.touch();
     }
 
+    /// The spec the parameter form is editing, as JSON. Both modes are edited
+    /// through the same pointers, so the form itself does not branch.
+    fn document(&self) -> Value {
+        let document = match self.mode {
+            Mode::Waveform => serde_json::to_value(&self.spec),
+            Mode::PulseTrain => serde_json::to_value(&self.train),
+        };
+        document.unwrap_or(Value::Null)
+    }
+
+    /// Takes an edited document back, or says why it will not fit.
+    fn adopt(&mut self, document: Value) -> Result<(), String> {
+        match self.mode {
+            Mode::Waveform => {
+                self.spec = serde_json::from_value(document).map_err(|e| e.to_string())?;
+            }
+            Mode::PulseTrain => {
+                self.train = serde_json::from_value(document).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn value_at(&self, pointer: &str) -> Option<Value> {
+        self.document().pointer(pointer).cloned()
+    }
+
     /// Applies a typed field. The raw text is kept either way, so a value
     /// being typed does not snap back to what the spec still holds.
     fn apply_field(&mut self, pointer: &str, raw: &str) {
         self.drafts.insert(pointer.to_owned(), raw.to_owned());
         self.draft_errors.remove(pointer);
 
-        let current = tree::get_json(&self.spec, pointer);
-        let replacement = match current {
+        let empty = raw.trim().is_empty();
+        let replacement = match self.value_at(pointer) {
+            // Clearing an optional text box unsets it rather than storing "".
+            Some(Value::String(_)) if empty && is_optional_text(pointer) => Value::Null,
             Some(Value::String(_)) => Value::String(raw.to_owned()),
-            // `taps` is the one optional number; an empty box means "use the
-            // built-in maximal-length polynomial".
-            Some(Value::Null) | Some(Value::Number(_)) if raw.trim().is_empty() => Value::Null,
+            // A list is typed as text: `1e-3, 1.2e-3, 0.8e-3`.
+            Some(Value::Array(_)) => match parse_list(raw) {
+                Ok(values) => Value::Array(values),
+                Err(error) => {
+                    self.draft_errors.insert(pointer.to_owned(), error);
+                    return;
+                }
+            },
+            // `taps` is an optional number, a field's `unit` optional text;
+            // an empty box means neither is set.
+            Some(Value::Null) | Some(Value::Number(_)) if empty => Value::Null,
             Some(Value::Number(number)) => {
                 let Ok(parsed) = raw.trim().parse::<f64>() else {
                     self.draft_errors
@@ -728,6 +963,7 @@ impl State {
                     }
                 }
             }
+            Some(Value::Null) if is_optional_text(pointer) => Value::String(raw.to_owned()),
             Some(Value::Null) => match raw.trim().parse::<f64>() {
                 Ok(parsed) => Value::from(parsed.round() as i64),
                 Err(_) => {
@@ -744,9 +980,19 @@ impl State {
     /// Writes a value into the spec, keeping the old spec if it will not take
     /// it — a `u8` order of 900, say.
     fn apply_json(&mut self, pointer: &str, value: Value) {
-        match tree::set_json(&self.spec, pointer, value) {
-            Ok(spec) => {
-                self.spec = spec;
+        let mut document = self.document();
+        match document.pointer_mut(pointer) {
+            Some(slot) => *slot = value,
+            None => {
+                self.draft_errors.insert(
+                    pointer.to_owned(),
+                    format!("'{pointer}' is not a field of this spec"),
+                );
+                return;
+            }
+        }
+        match self.adopt(document) {
+            Ok(()) => {
                 self.draft_errors.remove(pointer);
                 self.touch();
             }
@@ -761,11 +1007,24 @@ impl State {
         if let Some(draft) = self.drafts.get(pointer) {
             return draft.clone();
         }
-        match tree::get_json(&self.spec, pointer) {
+        match self.value_at(pointer) {
             Some(Value::String(text)) => text,
             Some(Value::Number(number)) => number.to_string(),
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|value| value.as_f64().map_or_else(String::new, format_number))
+                .collect::<Vec<_>>()
+                .join(", "),
             Some(Value::Null) | None => String::new(),
             Some(other) => other.to_string(),
+        }
+    }
+
+    /// Everything wrong with whichever spec is active.
+    fn issues(&self) -> Issues {
+        match self.mode {
+            Mode::Waveform => validate(&self.spec),
+            Mode::PulseTrain => validate_train(&self.train),
         }
     }
 
@@ -850,10 +1109,12 @@ impl State {
             self.error = Some("No library is open.".to_owned());
             return Task::none();
         };
-        let issues = validate(&self.spec);
-        if issues.blocks() {
+        if self.issues().blocks() {
             self.error = Some("Fix the errors below before generating.".to_owned());
             return Task::none();
+        }
+        if self.mode == Mode::PulseTrain {
+            return self.start_train(store);
         }
         let sweep = match self.sweep() {
             Some(Ok(sweep)) => Some(sweep),
@@ -890,6 +1151,38 @@ impl State {
         Task::perform(
             jobs::write(store.clone(), move |conn| {
                 Ok(sp_gen::generate(conn, &request, &control)
+                    .map(Box::new)
+                    .map_err(|error| error.to_string()))
+            }),
+            |outcome| Message::Generated(outcome.and_then(|inner| inner)),
+        )
+    }
+
+    /// Writes the pulse train. It lands as a train of groups — the shape an
+    /// import produces (§6.6) — so a pipeline cannot tell the two apart.
+    fn start_train(&mut self, store: &Store) -> Task<Message> {
+        let progress = Arc::new(Mutex::new(GenProgress::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sink = progress.clone();
+        let control = GenControl::new()
+            .with_cancel(cancel.clone())
+            .with_progress(Arc::new(move |update| {
+                *sink.lock().expect("progress mutex") = update;
+            }));
+
+        let mut request = TrainRequest::new(self.train.clone()).named(self.dataset_name.trim());
+        request.train_name = Some(self.preset_name());
+
+        self.job = Some(Job { progress, cancel });
+        self.shown_progress = GenProgress::default();
+        self.report = None;
+        self.error = None;
+        self.notice = None;
+
+        tracing::info!(name = %request.dataset_name(), "pulse-train generation started");
+        Task::perform(
+            jobs::write(store.clone(), move |conn| {
+                Ok(sp_gen::generate_train(conn, &request, &control)
                     .map(Box::new)
                     .map_err(|error| error.to_string()))
             }),
@@ -957,8 +1250,22 @@ impl State {
             .spacing(6),
         );
 
+        if self.mode == Mode::PulseTrain {
+            // The node tree and the presets are waveform machinery; a train is
+            // described entirely by its parameter form.
+            pane = pane.push(
+                text(
+                    "A pulse train has no node tree: its intervals and fields are the whole \
+                     description. Presets above load a waveform and switch back to that mode.",
+                )
+                .size(11)
+                .style(text::secondary),
+            );
+            return pane.into();
+        }
+
         pane = pane.push(section("Nodes"));
-        let issues = validate(&self.spec);
+        let issues = self.issues();
         let mut rows = column![].spacing(2).width(Length::Fill);
         for node_ref in tree::outline(&self.spec) {
             let selected = node_ref.pointer == self.selected;
@@ -1051,14 +1358,24 @@ impl State {
 
         pane = pane.push(self.preview_strip());
 
-        let body = column![
-            self.signal_settings(),
-            self.parameter_form(),
-            self.sweep_panel(),
-            self.issue_list(),
-        ]
-        .spacing(10)
-        .width(Length::Fill);
+        let body: Element<'_, Message> = match self.mode {
+            Mode::Waveform => column![
+                self.output_settings(),
+                self.signal_settings(),
+                self.parameter_form(),
+                self.sweep_panel(),
+                self.issue_list(),
+            ]
+            .spacing(10)
+            .width(Length::Fill)
+            .into(),
+            Mode::PulseTrain => {
+                column![self.output_settings(), self.train_form(), self.issue_list(),]
+                    .spacing(10)
+                    .width(Length::Fill)
+                    .into()
+            }
+        };
 
         pane = pane.push(horizontal_rule(1));
         pane = pane.push(scrollable(body).height(Length::Fill));
@@ -1066,14 +1383,16 @@ impl State {
     }
 
     fn action_row(&self) -> Element<'_, Message> {
-        let issues = validate(&self.spec);
-        let ready = !issues.blocks() && self.job.is_none();
-        let label = match self.sweep().and_then(Result::ok) {
-            Some(sweep) => match sweep.values.count() {
-                Some(rungs) => format!("Generate {rungs} signals"),
+        let ready = !self.issues().blocks() && self.job.is_none();
+        let label = match self.mode {
+            Mode::PulseTrain => format!("Generate {} groups", self.train.groups),
+            Mode::Waveform => match self.sweep().and_then(Result::ok) {
+                Some(sweep) => match sweep.values.count() {
+                    Some(rungs) => format!("Generate {rungs} signals"),
+                    None => "Generate".to_owned(),
+                },
                 None => "Generate".to_owned(),
             },
-            None => "Generate".to_owned(),
         };
 
         let mut generate = button(text(label).size(13))
@@ -1093,16 +1412,22 @@ impl State {
             );
         }
         actions = actions.push(Space::with_width(Length::Fill));
-        actions = actions.push(
-            text(format!(
+        let extent = match self.mode {
+            Mode::Waveform => format!(
                 "{} samples · {} s at {}",
                 self.spec.sample_count(),
                 format_number(self.spec.duration_s),
                 format_hz(self.spec.sample_rate_hz()),
-            ))
-            .size(11)
-            .style(text::secondary),
-        );
+            ),
+            Mode::PulseTrain => format!(
+                "{} pulses in {} group(s) · {} s · mean PRI {} s",
+                self.train.pulses(),
+                self.train.groups,
+                format_number(self.train.duration_s()),
+                format_number(self.train.pri.mean_s()),
+            ),
+        };
+        actions = actions.push(text(extent).size(11).style(text::secondary));
         actions.into()
     }
 
@@ -1112,14 +1437,18 @@ impl State {
             Some(fraction) => progress_bar(0.0..=1.0, fraction).height(6).into(),
             None => Space::with_height(Length::Fixed(6.0)).into(),
         };
+        let (items, values) = match self.mode {
+            Mode::Waveform => ("signal", "samples"),
+            Mode::PulseTrain => ("group", "pulses"),
+        };
         column![
             bar,
             text(format!(
-                "{} of {} signal(s) · {} of {} samples",
-                progress.signals_done,
-                progress.signals_total,
-                progress.samples_done,
-                progress.samples_total,
+                "{} of {} {items}(s) · {} of {} {values}",
+                progress.items_done,
+                progress.items_total,
+                progress.values_done,
+                progress.values_total,
             ))
             .size(11)
             .style(text::secondary),
@@ -1132,16 +1461,10 @@ impl State {
         let caption: Element<'_, Message> = match (&self.preview, &self.preview_error) {
             (_, Some(error)) => text(error).size(11).style(text::danger).into(),
             (Some(preview), None) => text(format!(
-                "First {} s · {} samples · {} to {}{}",
-                format_number(preview.seconds),
-                preview.samples,
+                "{} · {} to {}",
+                preview.caption,
                 format_number(preview.min),
                 format_number(preview.max),
-                if preview.truncated {
-                    " · window truncated to keep the preview instant"
-                } else {
-                    ""
-                },
             ))
             .size(11)
             .style(text::secondary)
@@ -1174,23 +1497,42 @@ impl State {
         .into()
     }
 
-    fn signal_settings(&self) -> Element<'_, Message> {
+    /// What every mode needs: what to call the result, and which shape it is.
+    fn output_settings(&self) -> Element<'_, Message> {
+        let name_label = match self.mode {
+            Mode::Waveform => "Signal name",
+            Mode::PulseTrain => "Train name",
+        };
         column![
-            section("Signal"),
+            section("Output"),
+            labelled(
+                "Generates",
+                pick_list(Mode::ALL.to_vec(), Some(self.mode), Message::ModePicked)
+                    .text_size(13)
+                    .into(),
+            ),
             labelled(
                 "Dataset name",
-                text_input("From the signal name", &self.dataset_name)
+                text_input("From the name below", &self.dataset_name)
                     .on_input(Message::DatasetNameChanged)
                     .size(13)
                     .into(),
             ),
             labelled(
-                "Signal name",
+                name_label,
                 text_input("Generated", &self.signal_name)
                     .on_input(Message::SignalNameChanged)
                     .size(13)
                     .into(),
             ),
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    fn signal_settings(&self) -> Element<'_, Message> {
+        column![
+            section("Signal"),
             labelled(
                 "Sample rate (Hz)",
                 self.number_input("/timebase/sample_rate_hz", "48000"),
@@ -1355,6 +1697,133 @@ impl State {
         }
     }
 
+    /// The pulse train's parameters, generated from its serialised fields the
+    /// same way the node form is.
+    fn train_form(&self) -> Element<'_, Message> {
+        let mut form = column![section("Train")].spacing(6);
+        form = form.push(labelled("Groups", self.number_input("/groups", "4")));
+        form = form.push(labelled(
+            "Pulses per group",
+            self.number_input("/pulses_per_group", "256"),
+        ));
+        form = form.push(labelled(
+            "Start time (s)",
+            self.number_input("/t0_s", "0.0"),
+        ));
+        form = form.push(labelled(
+            "Seed",
+            row![
+                self.number_input("/seed", "0"),
+                button(text("New").size(12))
+                    .padding([5, 9])
+                    .style(button::secondary)
+                    .on_press(Message::RandomiseSeed),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into(),
+        ));
+        form = form.push(self.variant_row("Time of arrival in", "/toa_unit"));
+
+        form = form.push(section("Interval"));
+        form = form.push(self.variant_row("Pattern", "/pri/mode"));
+        if let Some(Value::Object(pri)) = self.value_at("/pri") {
+            for (key, value) in &pri {
+                if key == "mode" {
+                    continue;
+                }
+                form = form.push(labelled(
+                    humanise(key),
+                    self.scalar_input(&format!("/pri/{key}"), value),
+                ));
+            }
+        }
+
+        form = form.push(section("Fields"));
+        form = form.push(
+            text("One column per field, exactly as an imported file carries them.")
+                .size(11)
+                .style(text::secondary),
+        );
+        for index in 0..self.train.fields.len() {
+            form = form.push(self.field_block(index));
+        }
+        form = form.push(
+            button(text("Add field").size(12))
+                .padding([5, 9])
+                .style(button::secondary)
+                .on_press(Message::AddField),
+        );
+        form.into()
+    }
+
+    /// One pulse field: its name, its unit, and how it varies.
+    fn field_block(&self, index: usize) -> Element<'_, Message> {
+        let base = format!("/fields/{index}");
+        let mut block = column![
+            horizontal_rule(1),
+            row![
+                self.text_input(&format!("{base}/name"), "pulse width"),
+                container(self.text_input(&format!("{base}/unit"), "unit"))
+                    .width(Length::Fixed(110.0)),
+                button(text("Remove").size(12))
+                    .padding([5, 9])
+                    .style(button::danger)
+                    .on_press(Message::RemoveField(index)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(6);
+
+        block = block.push(self.variant_row("Varies as", &format!("{base}/value/shape")));
+        if let Some(Value::Object(value)) = self.value_at(&format!("{base}/value")) {
+            for (key, nested) in &value {
+                if key == "shape" {
+                    continue;
+                }
+                block = block.push(labelled(
+                    humanise(key),
+                    self.scalar_input(&format!("{base}/value/{key}"), nested),
+                ));
+            }
+        }
+        block.into()
+    }
+
+    /// A pick-list row for a tagged or plain enum at `pointer`.
+    fn variant_row(&self, label: &str, pointer: &str) -> Element<'_, Message> {
+        let variants = variants_for(pointer).unwrap_or(&[]);
+        let current = self.value_at(pointer).and_then(|value| match value {
+            Value::String(key) => variants.iter().find(|v| v.key == key).copied(),
+            _ => None,
+        });
+        let owned = pointer.to_owned();
+        labelled(
+            label.to_owned(),
+            pick_list(variants.to_vec(), current, move |variant| {
+                Message::VariantPicked(owned.clone(), variant)
+            })
+            .text_size(13)
+            .into(),
+        )
+    }
+
+    /// The right control for a scalar or list value.
+    fn scalar_input(&self, pointer: &str, value: &Value) -> Element<'_, Message> {
+        match value {
+            Value::Bool(flag) => {
+                let owned = pointer.to_owned();
+                checkbox("", *flag)
+                    .size(15)
+                    .on_toggle(move |on| Message::FlagToggled(owned.clone(), on))
+                    .into()
+            }
+            Value::Array(_) => self.text_input(pointer, "1e-3, 1.2e-3"),
+            _ => self.number_input(pointer, ""),
+        }
+    }
+
     fn sweep_panel(&self) -> Element<'_, Message> {
         let mut panel = column![section("Sweep")].spacing(6);
         panel = panel.push(
@@ -1465,7 +1934,7 @@ impl State {
     }
 
     fn issue_list(&self) -> Element<'_, Message> {
-        let issues = validate(&self.spec);
+        let issues = self.issues();
         if issues.is_empty() {
             return Space::with_height(Length::Fixed(0.0)).into();
         }
@@ -1511,6 +1980,52 @@ fn issue_row(issue: &Issue) -> Element<'static, Message> {
 
 /// Renders the front of the signal and reduces it to one min/max pair per
 /// column. Runs off the UI thread (§4.2).
+fn build_train_preview(spec: &TrainSpec) -> Result<Preview, String> {
+    let issues = validate_train(spec);
+    if issues.blocks() {
+        return Err(issues.errors().next().map_or_else(
+            || "the train is not renderable".to_owned(),
+            |issue| issue.message.clone(),
+        ));
+    }
+    let Some(field) = spec.fields.first() else {
+        return Err("the train has no fields to preview".to_owned());
+    };
+
+    // Enough pulses to show the shape without rendering a whole capture.
+    let mut values = Vec::new();
+    let mut span_s = 0.0;
+    let mut shown = 0u32;
+    for group in 0..spec.groups {
+        if values.len() as u64 >= PREVIEW_PULSES {
+            break;
+        }
+        values.extend(spec.field_values(0, group));
+        if let Some(last) = spec.toa_seconds(group).last() {
+            span_s = last - spec.t0_s;
+        }
+        shown += 1;
+    }
+    if values.is_empty() {
+        return Err("the train renders no pulses".to_owned());
+    }
+
+    let truncated = shown < spec.groups;
+    let caption = format!(
+        "{} · {} pulse(s) over {} group(s), {} s{}",
+        field.name,
+        values.len(),
+        shown,
+        format_number(span_s),
+        if truncated {
+            " · front of the train"
+        } else {
+            ""
+        },
+    );
+    Ok(reduce(&values, caption))
+}
+
 fn build_preview(spec: &GenSpec) -> Result<Preview, String> {
     let issues = validate(spec);
     if issues.blocks() {
@@ -1536,6 +2051,21 @@ fn build_preview(spec: &GenSpec) -> Result<Preview, String> {
     )
     .map_err(|error| error.to_string())?;
 
+    let caption = format!(
+        "First {} s · {count} samples{}",
+        format_number(count as f64 / rate),
+        if count < available {
+            " · window truncated to keep the preview instant"
+        } else {
+            ""
+        },
+    );
+    Ok(reduce(&values, caption))
+}
+
+/// Reduces a series to one min/max pair per column, which is all a strip this
+/// size can show.
+fn reduce(values: &[f64], caption: String) -> Preview {
     let per_column = values.len().div_ceil(PREVIEW_COLUMNS).max(1);
     let mut columns = Vec::with_capacity(values.len().div_ceil(per_column));
     let mut min = f64::INFINITY;
@@ -1561,15 +2091,12 @@ fn build_preview(spec: &GenSpec) -> Result<Preview, String> {
         min = 0.0;
         max = 0.0;
     }
-
-    Ok(Preview {
+    Preview {
         columns,
         min,
         max,
-        seconds: count as f64 / rate,
-        samples: count,
-        truncated: count < available,
-    })
+        caption,
+    }
 }
 
 /// The preview strip: a min/max trace with a zero line.
@@ -1656,15 +2183,54 @@ fn is_child_key(key: &str) -> bool {
     )
 }
 
-/// The variants a string field picks from, when it is an enum.
-fn variants_for(field: &str) -> Option<&'static [Variant]> {
-    match field {
-        "sweep" => Some(&SWEEP_VARIANTS),
-        "kind" => Some(&NOISE_VARIANTS),
-        "shape" => Some(&ENVELOPE_VARIANTS),
-        "mode" => Some(&MOD_VARIANTS),
-        _ => None,
+/// The variants a string field picks from, when it is an enum. Matched on the
+/// whole pointer because the same leaf name tags more than one enum.
+fn variants_for(pointer: &str) -> Option<&'static [Variant]> {
+    match tag_of(pointer) {
+        Some(Tag::Envelope) => return Some(&ENVELOPE_VARIANTS),
+        Some(Tag::Modulation) => return Some(&MOD_VARIANTS),
+        Some(Tag::Pri) => return Some(&PRI_VARIANTS),
+        Some(Tag::FieldValue) => return Some(&FIELD_VARIANTS),
+        None => {}
     }
+    if pointer.ends_with("/sweep") {
+        Some(&SWEEP_VARIANTS)
+    } else if pointer.ends_with("/kind") {
+        Some(&NOISE_VARIANTS)
+    } else if pointer.ends_with("/toa_unit") {
+        Some(&UNIT_VARIANTS)
+    } else {
+        None
+    }
+}
+
+/// Whether a `null` slot at this pointer is optional *text* rather than an
+/// optional number. Only one field is: a pulse field's unit.
+fn is_optional_text(pointer: &str) -> bool {
+    pointer.ends_with("/unit")
+}
+
+/// Parses a typed list — `1e-3, 1.2e-3 0.8e-3` — into JSON numbers. A stagger
+/// and a field sequence are both edited this way, since neither has a fixed
+/// length the generic form could lay out.
+fn parse_list(raw: &str) -> Result<Vec<Value>, String> {
+    let mut out = Vec::new();
+    for token in raw
+        .split([',', ';', ' ', '\n', '\t'])
+        .filter(|token| !token.trim().is_empty())
+    {
+        let parsed = token
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| format!("'{}' is not a number", token.trim()))?;
+        let number = serde_json::Number::from_f64(parsed)
+            .ok_or_else(|| format!("'{}' is not a finite value", token.trim()))?;
+        out.push(Value::Number(number));
+    }
+    if out.is_empty() {
+        return Err("the list is empty".to_owned());
+    }
+    Ok(out)
 }
 
 /// A field name as a label: `freq_hz` reads as "Freq hz".
@@ -2009,8 +2575,173 @@ mod tests {
         );
         let preview = build_preview(&state.spec).unwrap();
         assert!(preview.columns.len() <= PREVIEW_COLUMNS);
-        assert!(preview.truncated, "10 s is longer than the preview window");
-        assert!((preview.seconds - PREVIEW_SECONDS).abs() < 1e-9);
+        assert!(
+            preview.caption.contains("truncated"),
+            "10 s is longer than the preview window: {}",
+            preview.caption
+        );
+        assert!(preview.caption.contains(&format_number(PREVIEW_SECONDS)));
+    }
+
+    #[test]
+    fn the_screen_generates_a_pulse_train_as_well_as_a_waveform() {
+        let mut state = state();
+        assert_eq!(state.mode, Mode::Waveform);
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        assert_eq!(state.mode, Mode::PulseTrain);
+        assert!(!state.issues().blocks(), "{}", state.issues());
+        assert!(build_train_preview(&state.train).is_ok());
+    }
+
+    #[test]
+    fn switching_modes_keeps_both_specs() {
+        let mut state = state();
+        let _ = state.update(
+            None,
+            Message::FieldEdited("/root/freq_hz".into(), "250".into()),
+        );
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        let _ = state.update(None, Message::FieldEdited("/groups".into(), "7".into()));
+        assert_eq!(state.train.groups, 7);
+
+        let _ = state.update(None, Message::ModePicked(Mode::Waveform));
+        assert_eq!(
+            tree::get_json(&state.spec, "/root/freq_hz"),
+            Some(Value::from(250.0))
+        );
+        assert_eq!(state.train.groups, 7, "the train survived the round trip");
+    }
+
+    #[test]
+    fn a_train_field_is_edited_through_the_same_pointers_as_a_node() {
+        let mut state = state();
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        let _ = state.update(
+            None,
+            Message::FieldEdited("/fields/0/name".into(), "pw".into()),
+        );
+        assert_eq!(state.train.fields[0].name, "pw");
+
+        let _ = state.update(
+            None,
+            Message::FieldEdited("/fields/0/unit".into(), "ns".into()),
+        );
+        assert_eq!(state.train.fields[0].unit.as_deref(), Some("ns"));
+
+        // Clearing an optional field empties it rather than failing to parse.
+        let _ = state.update(
+            None,
+            Message::FieldEdited("/fields/0/unit".into(), String::new()),
+        );
+        assert_eq!(state.train.fields[0].unit, None);
+    }
+
+    #[test]
+    fn a_field_shape_is_replaced_whole_when_it_changes() {
+        let mut state = state();
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        let _ = state.update(
+            None,
+            Message::VariantPicked("/fields/0/value/shape".into(), FIELD_VARIANTS[3]),
+        );
+        assert!(matches!(
+            state.train.fields[0].value,
+            FieldValue::Ramp { .. }
+        ));
+        let Some(Value::Object(value)) = state.value_at("/fields/0/value") else {
+            panic!("still an object");
+        };
+        assert!(
+            !value.contains_key("sigma"),
+            "the old variant's field is gone"
+        );
+    }
+
+    #[test]
+    fn the_two_mode_tags_named_mode_do_not_collide() {
+        // `mode` tags both a modulation and a pulse interval; the pointer is
+        // what tells them apart.
+        assert_eq!(tag_of("/root/kind/mode"), Some(Tag::Modulation));
+        assert_eq!(tag_of("/pri/mode"), Some(Tag::Pri));
+        assert_eq!(tag_of("/root/env/shape"), Some(Tag::Envelope));
+        assert_eq!(tag_of("/fields/2/value/shape"), Some(Tag::FieldValue));
+        assert_eq!(tag_of("/root/freq_hz"), None);
+    }
+
+    #[test]
+    fn a_pri_pattern_is_replaced_whole_when_it_changes() {
+        let mut state = state();
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        let _ = state.update(
+            None,
+            Message::VariantPicked("/pri/mode".into(), PRI_VARIANTS[1]),
+        );
+        assert!(matches!(
+            state.train.pri,
+            sp_gen::train::Pri::Stagger { .. }
+        ));
+
+        // A stagger's positions are typed as a list.
+        let _ = state.update(
+            None,
+            Message::FieldEdited("/pri/positions".into(), "1e-3, 2e-3, 3e-3".into()),
+        );
+        let sp_gen::train::Pri::Stagger { positions } = &state.train.pri else {
+            panic!("still a stagger");
+        };
+        assert_eq!(positions, &[1e-3, 2e-3, 3e-3]);
+        assert_eq!(state.field_text("/pri/positions"), "1e-3, 2e-3, 3e-3");
+    }
+
+    #[test]
+    fn a_list_that_will_not_parse_is_reported_and_the_spec_is_left_alone() {
+        let mut state = state();
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        let _ = state.update(
+            None,
+            Message::VariantPicked("/pri/mode".into(), PRI_VARIANTS[1]),
+        );
+        let before = state.train.clone();
+        let _ = state.update(
+            None,
+            Message::FieldEdited("/pri/positions".into(), "1e-3, wobble".into()),
+        );
+        assert_eq!(state.train, before);
+        assert!(state.draft_errors.contains_key("/pri/positions"));
+    }
+
+    #[test]
+    fn fields_can_be_added_and_removed() {
+        let mut state = state();
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        let before = state.train.fields.len();
+        let _ = state.update(None, Message::AddField);
+        assert_eq!(state.train.fields.len(), before + 1);
+        let _ = state.update(None, Message::RemoveField(0));
+        assert_eq!(state.train.fields.len(), before);
+        // Removing past the end is a no-op rather than a panic.
+        let _ = state.update(None, Message::RemoveField(99));
+        assert_eq!(state.train.fields.len(), before);
+    }
+
+    #[test]
+    fn a_train_with_no_fields_blocks_generation() {
+        let mut state = state();
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        while !state.train.fields.is_empty() {
+            let _ = state.update(None, Message::RemoveField(0));
+        }
+        assert!(state.issues().blocks());
+        assert!(build_train_preview(&state.train).is_err());
+        let _ = state.update(None, Message::Start);
+        assert!(state.error.is_some());
+    }
+
+    #[test]
+    fn a_list_parses_the_separators_a_user_would_type() {
+        assert_eq!(parse_list("1, 2; 3 4").unwrap().len(), 4);
+        assert!(parse_list("").is_err());
+        assert!(parse_list("1, x").is_err());
     }
 
     #[test]
@@ -2031,6 +2762,21 @@ mod tests {
 
         for kind in NodeKind::ALL {
             let _ = state.update(None, Message::NodeKindPicked(tree::ROOT.into(), kind));
+            let _ = state.view();
+        }
+
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        state.preview = build_train_preview(&state.train).ok();
+        let _ = state.view();
+        for variant in PRI_VARIANTS {
+            let _ = state.update(None, Message::VariantPicked("/pri/mode".into(), variant));
+            let _ = state.view();
+        }
+        for variant in FIELD_VARIANTS {
+            let _ = state.update(
+                None,
+                Message::VariantPicked("/fields/0/value/shape".into(), variant),
+            );
             let _ = state.view();
         }
 
