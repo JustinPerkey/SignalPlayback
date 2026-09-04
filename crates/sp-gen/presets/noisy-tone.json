@@ -1,0 +1,18 @@
+{
+  "name": "Noisy tone",
+  "description": "A 1 kHz tone under Gaussian noise. Sweep the noise amplitude for an impairment ladder (DESIGN.md 8.4).",
+  "spec": {
+    "timebase": { "sample_rate_hz": 48000.0, "t0_s": 0.0 },
+    "duration_s": 1.0,
+    "dtype": "f32",
+    "domain": "analog",
+    "seed": 1,
+    "root": {
+      "node": "sum",
+      "terms": [
+        { "node": "sine", "freq_hz": 1000.0, "amp": 1.0, "phase_rad": 0.0, "offset": 0.0 },
+        { "node": "noise", "kind": "gaussian", "amp": 0.1 }
+      ]
+    }
+  }
+}

@@ -21,6 +21,7 @@ pub mod library;
 pub mod profiles;
 pub mod props;
 pub mod pulses;
+pub mod trains;
 pub mod verify;
 
 pub use blob::{BlobId, BlobInfo, BlobKind, BlobWriter, ColumnHeader, DEFAULT_CHUNK_SIZE};
@@ -30,6 +31,7 @@ pub use library::{LibrarySummary, NewDataset, NewGroup, NewSignal};
 pub use profiles::SavedProfile;
 pub use props::PropertyQuery;
 pub use pulses::{NewPulseField, NewPulseGroup, PulsePredicate};
+pub use trains::NewTrain;
 pub use verify::VerifyReport;
 
 /// Re-exported so callers can compose jobs without depending on `rusqlite`

@@ -1,0 +1,16 @@
+{
+  "name": "Linear chirp",
+  "description": "100 Hz to 10 kHz across one second, tapered so the ends do not click.",
+  "spec": {
+    "timebase": { "sample_rate_hz": 48000.0, "t0_s": 0.0 },
+    "duration_s": 1.0,
+    "dtype": "f32",
+    "domain": "analog",
+    "seed": 0,
+    "root": {
+      "node": "envelope",
+      "input": { "node": "chirp", "f0_hz": 100.0, "f1_hz": 10000.0, "sweep": "linear", "amp": 1.0 },
+      "env": { "shape": "tukey", "alpha": 0.1 }
+    }
+  }
+}

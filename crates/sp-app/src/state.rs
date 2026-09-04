@@ -6,7 +6,7 @@ use iced::widget::{button, column, container, horizontal_rule, row, scrollable, 
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
 use sp_store::Store;
 
-use crate::screens::{self, import, library, properties, Screen, Section};
+use crate::screens::{self, generate, import, library, properties, Screen, Section};
 
 /// Everything the UI reads.
 ///
@@ -23,6 +23,7 @@ pub struct App {
     store_error: Option<String>,
     library: library::State,
     import: import::State,
+    generate: generate::State,
     properties: properties::State,
     log_dir: Option<PathBuf>,
 }
@@ -35,6 +36,7 @@ pub enum Message {
     ToggleTheme,
     Library(library::Message),
     Import(import::Message),
+    Generate(generate::Message),
     Properties(properties::Message),
 }
 
@@ -75,6 +77,7 @@ impl App {
             store_error,
             library: library::State::default(),
             import: import::State::default(),
+            generate: generate::State::default(),
             properties: properties::State::default(),
             log_dir,
         };
@@ -83,6 +86,7 @@ impl App {
             Some(store) => Task::batch([
                 app.library.load(&store).map(Message::Library),
                 app.import.load(&store).map(Message::Import),
+                app.generate.load(&store).map(Message::Generate),
                 app.properties.load(&store).map(Message::Properties),
             ]),
             None => Task::none(),
@@ -134,6 +138,19 @@ impl App {
                     _ => task,
                 }
             }
+            Message::Generate(message) => {
+                let task = self
+                    .generate
+                    .update(self.store.as_ref(), message)
+                    .map(Message::Generate);
+                // A generation that committed changes what the library holds.
+                match (self.generate.take_completed(), self.store.clone()) {
+                    (true, Some(store)) => {
+                        Task::batch([task, self.library.load(&store).map(Message::Library)])
+                    }
+                    _ => task,
+                }
+            }
             Message::Properties(message) => self
                 .properties
                 .update(self.store.as_ref(), message)
@@ -144,6 +161,7 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             self.import.subscription().map(Message::Import),
+            self.generate.subscription().map(Message::Generate),
             Self::shortcuts(),
         ])
     }
@@ -172,6 +190,7 @@ impl App {
         let body: Element<'_, Message> = match self.screen {
             Screen::Library => self.library.view().map(Message::Library),
             Screen::Import => self.import.view().map(Message::Import),
+            Screen::Generate => self.generate.view().map(Message::Generate),
             Screen::Properties => self.properties.view().map(Message::Properties),
             other => screens::placeholder(other),
         };
@@ -276,9 +295,12 @@ impl App {
             (Some(store), _) => {
                 let counts = self.library.summary().map_or_else(String::new, |s| {
                     format!(
-                        " · {} dataset{} · {} group{} · {} signal{} · {} pulse field{} · {}",
+                        " · {} dataset{} · {} train{} · {} group{} · {} signal{} · \
+                         {} pulse field{} · {}",
                         s.datasets,
                         plural(s.datasets),
+                        s.trains,
+                        plural(s.trains),
                         s.groups,
                         plural(s.groups),
                         s.signals,

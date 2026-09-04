@@ -1,8 +1,12 @@
-//! Datasets and signal groups.
+//! Datasets, signal trains and signal groups.
 //!
-//! A group is a block from an imported CSV file or a bundle of generated
-//! signals, and it is also the unit of processing: one group enters stage 1 of
-//! a pipeline and the whole sequence is recorded (`docs/DESIGN.md` §9.1).
+//! A **train** is one capture: everything one source file carries. A **group**
+//! is one block within it — a dwell, a scan, a generation batch. Groups are
+//! segments of a train, not independent captures, so the train is what a
+//! signal is stored and reasoned about under (`docs/DESIGN.md` §6.6).
+//!
+//! The group remains the unit of processing: one group enters stage 1 of a
+//! pipeline and the whole sequence is recorded (§9.1).
 
 use std::fmt;
 use std::str::FromStr;
@@ -18,6 +22,11 @@ crate::id_newtype! {
     /// Identifies a dataset: one import run, one generation batch, or one
     /// derived collection.
     DatasetId
+}
+
+crate::id_newtype! {
+    /// Identifies a signal train: one capture, holding one or more groups.
+    TrainId
 }
 
 crate::id_newtype! {
@@ -91,12 +100,49 @@ pub struct Dataset {
     pub attributes: Attributes,
 }
 
-/// A group block from a CSV file, or a bundle of generated signals.
+/// One signal train: everything a single source file carries.
+///
+/// A train exists because groups are *not* independent — a train resolves to
+/// several of them, and the pulses in those groups are one capture (§6.6). It
+/// is the level a signal is named, tagged and searched at; the groups under it
+/// are its segments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignalTrain {
+    pub id: TrainId,
+    pub dataset_id: DatasetId,
+    /// Position within the dataset. One imported file is one train, so this is
+    /// zero for a single-file import.
+    pub ordinal: u32,
+    pub name: Option<String>,
+    /// Source unit of the train's time-of-arrival columns, for a train of
+    /// pulse records. `None` for a train of sampled signals.
+    pub toa_unit: Option<TimeUnit>,
+    pub attributes: Attributes,
+}
+
+impl SignalTrain {
+    /// Whether this train holds pulse records rather than sampled signals.
+    #[must_use]
+    pub fn is_pulse_train(&self) -> bool {
+        self.toa_unit.is_some()
+    }
+
+    /// The train's name, falling back to its position for an unnamed one.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| format!("Train {}", self.ordinal))
+    }
+}
+
+/// One block within a train: a group row and the pulses it declares, or a
+/// bundle of generated signals.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignalGroup {
     pub id: GroupId,
-    pub dataset_id: DatasetId,
-    /// Position within the dataset; matches block order in the source file.
+    pub train_id: TrainId,
+    /// Position within the train; matches block order in the source file.
     pub ordinal: u32,
     pub name: Option<String>,
     /// The `count` field from the group header row.
@@ -138,6 +184,7 @@ impl SignalGroup {
     pub fn meta(&self) -> GroupMeta {
         GroupMeta {
             id: self.id,
+            train_id: self.train_id,
             ordinal: self.ordinal,
             name: self.name.clone(),
             toa_unit: self.toa_unit,
@@ -154,6 +201,9 @@ impl SignalGroup {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupMeta {
     pub id: GroupId,
+    /// The train the group is a segment of; a stage that needs the whole
+    /// capture reaches the sibling groups through it (§6.6).
+    pub train_id: TrainId,
     pub ordinal: u32,
     pub name: Option<String>,
     /// Set when the group holds pulse records; see [`SignalGroup::toa_unit`].
@@ -176,7 +226,7 @@ mod tests {
     fn group(declared: u32, actual: u32) -> SignalGroup {
         SignalGroup {
             id: GroupId::new(1),
-            dataset_id: DatasetId::new(1),
+            train_id: TrainId::new(1),
             ordinal: 3,
             name: None,
             declared_count: declared,
@@ -220,5 +270,32 @@ mod tests {
         let mut named = group(1, 1);
         named.name = Some("ANTENNA_A".into());
         assert_eq!(named.display_name(), "ANTENNA_A");
+    }
+
+    #[test]
+    fn a_group_carries_its_train_through_to_a_stage() {
+        // Groups are segments of one capture, so a stage that needs the rest
+        // of the train has to be able to find it.
+        let group = group(2, 2);
+        assert_eq!(group.meta().train_id, TrainId::new(1));
+    }
+
+    #[test]
+    fn a_toa_unit_is_what_marks_a_train_as_pulse_records() {
+        let mut train = SignalTrain {
+            id: TrainId::new(1),
+            dataset_id: DatasetId::new(1),
+            ordinal: 0,
+            name: None,
+            toa_unit: None,
+            attributes: Attributes::new(),
+        };
+        assert!(!train.is_pulse_train());
+        assert_eq!(train.display_name(), "Train 0");
+
+        train.toa_unit = Some(TimeUnit::Microseconds);
+        train.name = Some("capture-01".into());
+        assert!(train.is_pulse_train());
+        assert_eq!(train.display_name(), "capture-01");
     }
 }

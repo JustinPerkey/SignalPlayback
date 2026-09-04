@@ -17,10 +17,13 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use crate::error::{Result, StoreError};
 
 /// The newest schema this build understands.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Numbered migrations, applied in order inside one transaction each.
-const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../schema/0001_init.sql"))];
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../schema/0001_init.sql")),
+    (2, include_str!("../schema/0002_trains.sql")),
+];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -262,6 +265,21 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             supported: SCHEMA_VERSION,
         });
     }
+    if current == SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // A migration may rebuild a table other tables reference — 0002 does, to
+    // move `signal_group` under a train. SQLite's own procedure for that is to
+    // disable foreign keys around it and re-check them afterwards; the pragma
+    // is a no-op inside a transaction, so it has to be set out here.
+    conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+    let outcome = apply_migrations(conn, current).and_then(|()| check_foreign_keys(conn));
+    conn.execute_batch("PRAGMA foreign_keys = ON")?;
+    outcome
+}
+
+fn apply_migrations(conn: &mut Connection, current: u32) -> Result<()> {
     for &(version, sql) in MIGRATIONS {
         if version <= current {
             continue;
@@ -275,6 +293,21 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             [version.to_string()],
         )?;
         tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Refuses to hand back a library a migration left with a dangling reference,
+/// rather than turning foreign keys back on over one.
+fn check_foreign_keys(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        let parent: String = row.get(2)?;
+        return Err(StoreError::corrupt(format!(
+            "after migrating, a row in '{table}' points at a missing '{parent}'"
+        )));
     }
     Ok(())
 }
@@ -299,6 +332,96 @@ mod tests {
             .read(|conn| Ok(conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?))
             .unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    /// Builds a schema-1 library holding a dataset, two groups and a signal,
+    /// which is what an existing user's file looks like.
+    fn version_1_library(path: &Path) {
+        let mut conn = Connection::open(path).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(MIGRATIONS[0].1).unwrap();
+        tx.execute(
+            "INSERT INTO app_meta (key, value) VALUES ('schema_version', '1')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO dataset (id, name, source_kind, created_utc)
+             VALUES (1, 'sample.csv', 'csv_import', '2026-09-04T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO signal_group (id, dataset_id, ordinal, name, declared_count,
+                                       actual_count, toa_unit)
+             VALUES (1, 1, 0, '1', 2, 2, 'us'), (2, 1, 1, '2', 2, 2, 'us')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO signal (id, group_id, ordinal, name, dtype, sample_count)
+             VALUES (1, 2, 0, 's', 'f32', 0)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn a_version_1_library_gains_one_train_per_dataset() {
+        // One file was one dataset, and one file is one train (§6.6), so the
+        // groups a v1 library hung off its dataset move under a single train.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        version_1_library(&path);
+
+        let mut conn = Connection::open(&path).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let (train_id, name, unit): (i64, String, String) = conn
+            .query_row("SELECT id, name, toa_unit FROM signal_train", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(name, "sample.csv");
+        assert_eq!(unit, "us", "the train takes the unit its groups agreed on");
+
+        let groups: Vec<(i64, i64, i64)> = conn
+            .prepare("SELECT id, train_id, ordinal FROM signal_group ORDER BY ordinal")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(groups, [(1, train_id, 0), (2, train_id, 1)]);
+
+        // Group ids are preserved, so the rows that referenced them still do.
+        let group_of_signal: i64 = conn
+            .query_row("SELECT group_id FROM signal WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(group_of_signal, 2);
+
+        // And the rebuild left nothing dangling.
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        let dangling: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(dangling, 0);
+    }
+
+    #[test]
+    fn migrating_a_current_library_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+        drop(Store::open(&path).unwrap());
+        let mut conn = Connection::open(&path).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]

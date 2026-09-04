@@ -1,0 +1,19 @@
+{
+  "name": "Pulse train",
+  "description": "A 1 kHz PRF trapezoidal pulse train at 1 MS/s: known edges for a detector to find (DESIGN.md 8.4).",
+  "spec": {
+    "timebase": { "sample_rate_hz": 1000000.0, "t0_s": 0.0 },
+    "duration_s": 0.01,
+    "dtype": "f32",
+    "domain": "analog",
+    "seed": 0,
+    "root": {
+      "node": "pulse",
+      "period_s": 0.001,
+      "width_s": 0.00005,
+      "amp": 1.0,
+      "rise_s": 0.000005,
+      "fall_s": 0.000005
+    }
+  }
+}

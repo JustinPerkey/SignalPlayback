@@ -1,5 +1,9 @@
 //! Streaming ingest into the library (`docs/DESIGN.md` §7.4).
 //!
+//! One file is one **signal train**, and the group blocks in it are that
+//! train's segments (§6.6) — they are not independent captures, so every group
+//! an import writes hangs off the one train it created.
+//!
 //! One pass over the file, appending to one column buffer per pulse field and
 //! flushing each group's columns to a blob at the group boundary, so peak
 //! memory is one group rather than one file. The whole import is one SQLite
@@ -13,8 +17,11 @@ use std::path::Path;
 
 use sp_core::group::DatasetId;
 use sp_core::props::PropertyValue;
+use sp_core::TrainId;
 use sp_core::{Attributes, DType, PropScope, PropertyDef, SourceKind};
-use sp_store::{library, props, Connection, NewDataset, NewPulseField, NewPulseGroup};
+use sp_store::{
+    library, props, trains, Connection, NewDataset, NewPulseField, NewPulseGroup, NewTrain,
+};
 
 use crate::control::{ImportControl, ImportProgress};
 use crate::diag::{Diagnostic, Diagnostics};
@@ -82,6 +89,8 @@ impl ImportRequest {
 #[derive(Debug, Clone)]
 pub struct ImportReport {
     pub dataset_id: DatasetId,
+    /// The train the file became. One file is one train (§6.6).
+    pub train_id: TrainId,
     pub name: String,
     pub groups: u32,
     pub pulses: u64,
@@ -173,10 +182,18 @@ pub fn import_reader<R: BufRead>(
         sp_store::profiles::link_dataset(&tx, dataset_id, profile_id)?;
     }
 
+    // The file is the train; its blocks are segments of it.
+    let train_id = trains::insert_train(
+        &tx,
+        &NewTrain::new(dataset_id, 0)
+            .named(&name)
+            .with_toa_unit(layout.time_unit),
+    )?;
+
     let mut groups = 0u32;
     let mut pulses = 0u64;
     while let Some(block) = framer.next_group(control)? {
-        let group = build_group(dataset_id, &layout, &block, &defs, framer.diagnostics_mut());
+        let group = build_group(train_id, &layout, &block, &defs, framer.diagnostics_mut());
         sp_store::pulses::insert_pulse_group(&tx, &group)?;
         groups += 1;
         pulses += u64::from(block.actual_count());
@@ -194,6 +211,7 @@ pub fn import_reader<R: BufRead>(
 
     let report = ImportReport {
         dataset_id,
+        train_id,
         name,
         groups,
         pulses,
@@ -213,7 +231,7 @@ pub fn import_reader<R: BufRead>(
 
 /// Turns one framed block into the group the store writes.
 fn build_group(
-    dataset_id: DatasetId,
+    train_id: TrainId,
     layout: &Layout,
     block: &GroupBlock,
     defs: &[PropertyDef],
@@ -236,8 +254,7 @@ fn build_group(
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
 
-    let mut group =
-        NewPulseGroup::new(dataset_id, block.index, block.toa_seconds(layout.time_unit));
+    let mut group = NewPulseGroup::new(train_id, block.index, block.toa_seconds(layout.time_unit));
     group.name = name;
     group.declared_count = block.declared_count;
     group.toa_unit = layout.time_unit;

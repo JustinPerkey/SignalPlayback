@@ -1,5 +1,10 @@
-//! The Library screen (`docs/DESIGN.md` §12.1): a tree of dataset → group,
-//! a detail table for the selected group, and full-text search over signals.
+//! The Library screen (`docs/DESIGN.md` §12.1): a tree of dataset → train →
+//! group, a detail table for the selected group, and full-text search over
+//! signals.
+//!
+//! The train level is there because groups are not independent: one capture
+//! resolves to several of them (§6.6), and a tree that hung groups straight
+//! off a dataset said otherwise.
 //!
 //! Everything shown is metadata read from the store; a pulse group's table
 //! previews the first rows of its columns and nothing more is materialised.
@@ -11,8 +16,10 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Task, Theme};
 use sp_core::group::DatasetId;
-use sp_core::{Dataset, GroupId, PulseField, SampleRange, Signal, SignalGroup};
-use sp_store::{library, pulses, LibrarySummary, Store};
+use sp_core::{
+    Dataset, GroupId, PulseField, SampleRange, Signal, SignalGroup, SignalTrain, TrainId,
+};
+use sp_store::{library, pulses, trains, LibrarySummary, Store};
 
 use crate::jobs;
 
@@ -23,19 +30,30 @@ const PULSE_PREVIEW_ROWS: u64 = 200;
 #[derive(Debug, Clone, Default)]
 pub struct LibraryIndex {
     pub datasets: Vec<Dataset>,
-    pub groups: HashMap<DatasetId, Vec<SignalGroup>>,
+    pub trains: HashMap<DatasetId, Vec<SignalTrain>>,
+    pub groups: HashMap<TrainId, Vec<SignalGroup>>,
     pub summary: LibrarySummary,
 }
 
 impl LibraryIndex {
-    fn group(&self, id: GroupId) -> Option<(&Dataset, &SignalGroup)> {
+    /// The dataset, train and group a group id resolves to.
+    fn group(&self, id: GroupId) -> Option<(&Dataset, &SignalTrain, &SignalGroup)> {
         self.datasets.iter().find_map(|dataset| {
-            self.groups
-                .get(&dataset.id)?
-                .iter()
-                .find(|group| group.id == id)
-                .map(|group| (dataset, group))
+            self.trains.get(&dataset.id)?.iter().find_map(|train| {
+                self.groups
+                    .get(&train.id)?
+                    .iter()
+                    .find(|group| group.id == id)
+                    .map(|group| (dataset, train, group))
+            })
         })
+    }
+
+    /// Pulses and sampled signals a train holds across its groups.
+    fn train_extent(&self, train: &SignalTrain) -> (usize, u64) {
+        let groups = self.groups.get(&train.id).map_or(&[][..], Vec::as_slice);
+        let records = groups.iter().map(|g| u64::from(g.actual_count)).sum();
+        (groups.len(), records)
     }
 }
 
@@ -59,6 +77,7 @@ pub struct State {
     loading: bool,
     error: Option<String>,
     collapsed: HashSet<DatasetId>,
+    collapsed_trains: HashSet<TrainId>,
     selected: Option<GroupId>,
     detail: Option<(GroupId, GroupDetail)>,
     detail_error: Option<String>,
@@ -71,6 +90,7 @@ pub enum Message {
     Refresh,
     Loaded(Result<LibraryIndex, String>),
     ToggleDataset(DatasetId),
+    ToggleTrain(TrainId),
     SelectGroup(GroupId),
     DetailLoaded(GroupId, Result<GroupDetail, String>),
     SearchChanged(String),
@@ -125,6 +145,12 @@ impl State {
                 }
                 Task::none()
             }
+            Message::ToggleTrain(id) => {
+                if !self.collapsed_trains.remove(&id) {
+                    self.collapsed_trains.insert(id);
+                }
+                Task::none()
+            }
             Message::SelectGroup(id) => {
                 self.selected = Some(id);
                 self.detail_error = None;
@@ -135,7 +161,7 @@ impl State {
                     .index
                     .as_ref()
                     .and_then(|index| index.group(id))
-                    .is_some_and(|(_, group)| group.is_pulse_group());
+                    .is_some_and(|(_, _, group)| group.is_pulse_group());
                 Task::perform(
                     jobs::read(store.clone(), move |conn| load_detail(conn, id, is_pulse)),
                     move |result| Message::DetailLoaded(id, result),
@@ -292,20 +318,19 @@ impl State {
             }
             Some(index) => {
                 for dataset in &index.datasets {
-                    let groups = index.groups.get(&dataset.id);
+                    let trains = index.trains.get(&dataset.id).map_or(&[][..], Vec::as_slice);
                     let collapsed = self.collapsed.contains(&dataset.id);
-                    let arrow = if collapsed { "▸" } else { "▾" };
-                    let group_count = groups.map_or(0, Vec::len);
                     list = list.push(
                         button(
                             row![
-                                text(arrow).size(13),
+                                text(if collapsed { "▸" } else { "▾" }).size(13),
                                 text(&dataset.name).size(14),
                                 Space::with_width(Length::Fill),
                                 text(format!(
-                                    "{} · {group_count} group{}",
+                                    "{} · {} train{}",
                                     dataset.source_kind.label(),
-                                    if group_count == 1 { "" } else { "s" }
+                                    trains.len(),
+                                    if trains.len() == 1 { "" } else { "s" }
                                 ))
                                 .size(11)
                                 .style(text::secondary),
@@ -321,35 +346,75 @@ impl State {
                     if collapsed {
                         continue;
                     }
-                    for group in groups.into_iter().flatten() {
-                        let active = self.selected == Some(group.id);
-                        let kind = if group.is_pulse_group() {
-                            format!("{} pulses", group.actual_count)
+
+                    for train in trains {
+                        let folded = self.collapsed_trains.contains(&train.id);
+                        let (group_count, records) = index.train_extent(train);
+                        let noun = if train.is_pulse_train() {
+                            "pulse"
                         } else {
-                            format!("{} signals", group.actual_count)
+                            "signal"
                         };
                         list = list.push(
                             button(
                                 row![
-                                    text(group.display_name()).size(13),
+                                    Space::with_width(Length::Fixed(12.0)),
+                                    text(if folded { "▸" } else { "▾" }).size(12),
+                                    text(train.display_name()).size(13),
                                     Space::with_width(Length::Fill),
-                                    text(kind).size(11).style(if active {
-                                        text::base
-                                    } else {
-                                        text::secondary
-                                    }),
+                                    // The counts are the train's, across every
+                                    // group in it: that is the capture (§6.6).
+                                    text(format!(
+                                        "{group_count} group{} · {records} {noun}{}",
+                                        if group_count == 1 { "" } else { "s" },
+                                        if records == 1 { "" } else { "s" },
+                                    ))
+                                    .size(11)
+                                    .style(text::secondary),
                                 ]
+                                .spacing(5)
                                 .align_y(Alignment::Center),
                             )
                             .width(Length::Fill)
                             .padding([4, 8])
-                            .style(if active {
-                                button::primary
-                            } else {
-                                button::text
-                            })
-                            .on_press(Message::SelectGroup(group.id)),
+                            .style(button::text)
+                            .on_press(Message::ToggleTrain(train.id)),
                         );
+                        if folded {
+                            continue;
+                        }
+
+                        for group in index.groups.get(&train.id).into_iter().flatten() {
+                            let active = self.selected == Some(group.id);
+                            let kind = if group.is_pulse_group() {
+                                format!("{} pulses", group.actual_count)
+                            } else {
+                                format!("{} signals", group.actual_count)
+                            };
+                            list = list.push(
+                                button(
+                                    row![
+                                        Space::with_width(Length::Fixed(28.0)),
+                                        text(group.display_name()).size(13),
+                                        Space::with_width(Length::Fill),
+                                        text(kind).size(11).style(if active {
+                                            text::base
+                                        } else {
+                                            text::secondary
+                                        }),
+                                    ]
+                                    .align_y(Alignment::Center),
+                                )
+                                .width(Length::Fill)
+                                .padding([4, 8])
+                                .style(if active {
+                                    button::primary
+                                } else {
+                                    button::text
+                                })
+                                .on_press(Message::SelectGroup(group.id)),
+                            );
+                        }
                     }
                 }
             }
@@ -374,15 +439,18 @@ impl State {
             )
             .into();
         };
-        let Some((dataset, group)) = index.group(selected) else {
+        let Some((dataset, train, group)) = index.group(selected) else {
             return Space::new(Length::Fill, Length::Fill).into();
         };
 
+        let (train_groups, train_records) = index.train_extent(train);
         let mut header = column![
             text(group.display_name()).size(22),
+            // The group is a segment, so the line says which capture of.
             text(format!(
-                "{} · block {} · declared {} · read {}{}",
+                "{} · {} · block {} of {train_groups} · declared {} · read {}{}",
                 dataset.name,
+                train.display_name(),
                 group.ordinal,
                 group.declared_count,
                 group.actual_count,
@@ -391,6 +459,13 @@ impl State {
                     .map_or_else(String::new, |unit| format!(" · time of arrival in {unit}")),
             ))
             .size(12)
+            .style(text::secondary),
+            text(format!(
+                "The train holds {train_records} record{} across {train_groups} group{}.",
+                if train_records == 1 { "" } else { "s" },
+                if train_groups == 1 { "" } else { "s" },
+            ))
+            .size(11)
             .style(text::secondary),
         ]
         .spacing(4);
@@ -442,12 +517,18 @@ impl State {
 
 fn load_index(conn: &sp_store::Connection) -> sp_store::Result<LibraryIndex> {
     let datasets = library::list_datasets(conn)?;
-    let mut groups = HashMap::with_capacity(datasets.len());
+    let mut index_trains = HashMap::with_capacity(datasets.len());
+    let mut groups = HashMap::new();
     for dataset in &datasets {
-        groups.insert(dataset.id, library::list_groups(conn, dataset.id)?);
+        let list = trains::list_trains(conn, dataset.id)?;
+        for train in &list {
+            groups.insert(train.id, library::list_groups(conn, train.id)?);
+        }
+        index_trains.insert(dataset.id, list);
     }
     Ok(LibraryIndex {
         datasets,
+        trains: index_trains,
         groups,
         summary: library::summary(conn)?,
     })
