@@ -10,6 +10,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::props::Attributes;
+use crate::pulse::TimeUnit;
 use crate::signal::ParseTokenError;
 use crate::time::Timestamp;
 
@@ -100,17 +101,28 @@ pub struct SignalGroup {
     pub name: Option<String>,
     /// The `count` field from the group header row.
     pub declared_count: u32,
-    /// Signal rows actually read. Differs from `declared_count` only after a
+    /// Pulse rows actually read. Differs from `declared_count` only after a
     /// tolerant-mode import warning (§7.3).
     pub actual_count: u32,
+    /// Source unit of the group's time-of-arrival column, for a group of pulse
+    /// records (§6.6). `None` for a group of sampled signals, which carries its
+    /// timebase on each signal instead.
+    pub toa_unit: Option<TimeUnit>,
     pub attributes: Attributes,
 }
 
 impl SignalGroup {
-    /// Whether the block's declared signal count matched what was read.
+    /// Whether the block's declared count matched what was read.
     #[must_use]
     pub fn count_matches(&self) -> bool {
         self.declared_count == self.actual_count
+    }
+
+    /// Whether this group holds pulse records rather than sampled signals.
+    /// Decides which viewer the library opens and how a stage reads the group.
+    #[must_use]
+    pub fn is_pulse_group(&self) -> bool {
+        self.toa_unit.is_some()
     }
 
     /// The group's name, falling back to its position for unnamed blocks.
@@ -128,6 +140,7 @@ impl SignalGroup {
             id: self.id,
             ordinal: self.ordinal,
             name: self.name.clone(),
+            toa_unit: self.toa_unit,
             attributes: self.attributes.clone(),
         }
     }
@@ -136,14 +149,24 @@ impl SignalGroup {
 /// The group identity and properties carried through a pipeline run.
 ///
 /// This is the metadata half of the `GroupFrame` that `sp-proc` will flow
-/// between stages (§9.3); the signal half stays lazily memory-mapped and so
-/// cannot live in this crate.
+/// between stages (§9.3); the signal half is read lazily from the store, by
+/// span, and so cannot live in this crate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupMeta {
     pub id: GroupId,
     pub ordinal: u32,
     pub name: Option<String>,
+    /// Set when the group holds pulse records; see [`SignalGroup::toa_unit`].
+    pub toa_unit: Option<TimeUnit>,
     pub attributes: Attributes,
+}
+
+impl GroupMeta {
+    /// Whether this group holds pulse records rather than sampled signals.
+    #[must_use]
+    pub fn is_pulse_group(&self) -> bool {
+        self.toa_unit.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +181,7 @@ mod tests {
             name: None,
             declared_count: declared,
             actual_count: actual,
+            toa_unit: None,
             attributes: Attributes::new(),
         }
     }
@@ -175,6 +199,19 @@ mod tests {
     fn count_mismatch_is_visible_on_the_group() {
         assert!(group(3, 3).count_matches());
         assert!(!group(3, 2).count_matches());
+    }
+
+    #[test]
+    fn a_toa_unit_is_what_marks_a_group_as_pulse_records() {
+        let mut sampled = group(3, 3);
+        assert!(!sampled.is_pulse_group());
+        assert!(!sampled.meta().is_pulse_group());
+
+        sampled.toa_unit = Some(TimeUnit::Microseconds);
+        assert!(sampled.is_pulse_group());
+        // The marker has to reach a stage, which only ever sees the metadata.
+        assert!(sampled.meta().is_pulse_group());
+        assert_eq!(sampled.meta().toa_unit, Some(TimeUnit::Microseconds));
     }
 
     #[test]

@@ -117,13 +117,14 @@ impl Screen {
     pub const fn purpose(self) -> &'static str {
         match self {
             Self::Library => {
-                "Tree of Dataset → Group → Signal with search, property filters, and a sortable \
-                 detail table. Multi-select feeds the scope, a playlist, or a pipeline run."
+                "Tree of Dataset → Group → Signal / pulse field, with search, property filters \
+                 and a sortable detail table. Hosts cross-group pulse search: a field predicate \
+                 returns matching pulses from every group."
             }
             Self::Import => {
-                "File picker → preview grid of the first blocks → column-mapping panel \
-                 (including bind-to-property) → profile save/load → progress with a live error \
-                 list."
+                "File picker → preview of the headers and first group → column-mapping panel \
+                 (which column is the time of arrival and in what unit, which columns bind to \
+                 property definitions) → profile save/load → progress with a live error list."
             }
             Self::Generate => {
                 "Node tree editor, parameter form, live preview, sweep configuration, preset \
@@ -146,8 +147,8 @@ impl Screen {
                  a run is loaded."
             }
             Self::Inspector => {
-                "Single-signal detail: full metadata, property editor, tags, statistics, \
-                 histogram, FFT magnitude, virtualised raw sample table."
+                "Detail for one signal, pulse field or pulse: full metadata, property editor, \
+                 tags, statistics, histogram, and a virtualised value table."
             }
             Self::Properties => "Manage property definitions and property sets.",
             Self::Settings => {

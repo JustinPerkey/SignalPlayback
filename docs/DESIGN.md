@@ -1326,14 +1326,14 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 
 | Screen | Purpose |
 |--------|---------|
-| **Library** | Tree of Dataset → Group → Signal with search, property filters, and a sortable detail table. Multi-select feeds the scope, a playlist, or a pipeline run. |
-| **Import** | File picker → preview grid of the first blocks → column-mapping panel (including bind-to-property) → profile save/load → progress with a live error list. |
+| **Library** | Tree of Dataset → Group → Signal / pulse field, with search, property filters, and a sortable detail table. Hosts cross-group pulse search (§6.6): a field predicate returns matching pulses across every group, each row jumping to its group and playhead position. Multi-select feeds the scope, a playlist, or a pipeline run. |
+| **Import** | File picker → preview grid of the headers and first group → column-mapping panel (which column is the time of arrival and in what unit, which columns bind to property definitions) → profile save/load → progress with a live error list. |
 | **Generate** | Node tree editor, parameter form, live preview, sweep configuration, preset browser. |
 | **Pipeline** | Stage palette on the left, ordered stage list in the middle, generated parameter form on the right. Port validation inline. Run controls with group selection. |
 | **Results** | Group list + stage rail + scope + artifact panes (§10.3). The main working surface for algorithm development. |
 | **Runs** | History of runs with pipeline hash, status, timing, assertion results; promote to baseline; diff two runs. |
 | **Scope** | Playback-focused view of stored signals, with the same stage rail available when a run is loaded. |
-| **Inspector** | Single-signal detail: full metadata, property editor, tags, statistics, histogram, FFT magnitude, virtualised raw sample table. |
+| **Inspector** | Detail for one signal, pulse field or pulse: full metadata, property editor, tags, statistics, histogram, and a virtualised value table — for a pulse group, the table is the pulse records themselves, one row per pulse across every field. |
 | **Properties** | Manage property definitions and property sets (§6.3). |
 | **Settings** | Library location, theme, default sample rate, strict/tolerant import, retention defaults, decimation quality, keyboard map. |
 
@@ -1343,7 +1343,15 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 enum Screen {
     Library, Import(ImportState), Generate(GenState),
     Pipeline(PipelineState), Results(ResultsState), Runs,
-    Scope(ScopeState), Inspector(SignalId), Properties, Settings,
+    Scope(ScopeState), Inspector(InspectTarget), Properties, Settings,
+}
+
+/// What the Inspector is looking at. A pulse group has no per-pulse row until
+/// one is annotated (§6.6), so the target is a reference, not an id.
+enum InspectTarget {
+    Signal(SignalId),
+    PulseField { group: GroupId, ordinal: u32 },
+    Pulse(PulseRef),
 }
 
 struct App {

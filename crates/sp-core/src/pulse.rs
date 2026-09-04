@@ -6,11 +6,12 @@
 //! stages), and addressed as records by [`PulseRef`].
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::group::GroupId;
-use crate::signal::DType;
+use crate::signal::{DType, ParseTokenError};
 use crate::stats::SignalStats;
 
 /// Identifies one pulse: its group, and its row position within that group.
@@ -97,6 +98,20 @@ impl TimeUnit {
 impl fmt::Display for TimeUnit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TimeUnit {
+    type Err = ParseTokenError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|unit| unit.as_str() == s)
+            .ok_or_else(|| ParseTokenError {
+                kind: "time unit",
+                token: s.to_owned(),
+            })
     }
 }
 
@@ -268,6 +283,16 @@ mod tests {
         let seconds = unit.to_seconds(10.0);
         assert!((seconds - 1e-5).abs() < 1e-18);
         assert!((unit.from_seconds(seconds) - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn time_unit_tokens_round_trip_through_the_database() {
+        for unit in TimeUnit::ALL {
+            assert_eq!(unit.as_str().parse::<TimeUnit>().unwrap(), unit);
+        }
+        assert_eq!("us".parse::<TimeUnit>().unwrap(), TimeUnit::Microseconds);
+        // The header may say "µs"; the stored token is always ASCII.
+        assert!("µs".parse::<TimeUnit>().is_err());
     }
 
     #[test]

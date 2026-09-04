@@ -88,6 +88,39 @@ impl SignalStats {
         }
     }
 
+    /// Rebuilds a summary from the columns the database stores.
+    ///
+    /// `signal` and `pulse_field` persist min/max/mean/rms rather than the
+    /// running sums, because those are what the library table sorts on. The
+    /// sums are recoverable from `mean`, `rms` and `count`, which is what keeps
+    /// a reloaded summary mergeable with a freshly computed one — a stage that
+    /// appends to a column must not have to rescan it to update the statistics.
+    #[must_use]
+    pub fn from_stored(
+        min: f64,
+        max: f64,
+        mean: f64,
+        rms: f64,
+        count: u64,
+        non_finite: u64,
+    ) -> Self {
+        if count == 0 {
+            return Self {
+                non_finite,
+                ..Self::new()
+            };
+        }
+        let n = count as f64;
+        Self {
+            min,
+            max,
+            count,
+            non_finite,
+            sum: mean * n,
+            sum_sq: rms * rms * n,
+        }
+    }
+
     /// Accumulates one value. Sums are kept in `f64` regardless of the source
     /// dtype so a 100 M-sample `f32` signal does not lose precision.
     pub fn push(&mut self, value: f64) {
@@ -249,6 +282,45 @@ mod tests {
         assert_eq!(folded.max(), serial.max());
         assert!((folded.mean().unwrap() - serial.mean().unwrap()).abs() < 1e-9);
         assert!((folded.rms().unwrap() - serial.rms().unwrap()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_summary_survives_a_round_trip_through_the_database_columns() {
+        let values: Vec<f64> = (0..500).map(|i| f64::from(i) * 0.25 - 40.0).collect();
+        let original: SignalStats = values.iter().copied().chain([f64::NAN, f64::NAN]).collect();
+
+        // Exactly the columns `signal` and `pulse_field` persist.
+        let reloaded = SignalStats::from_stored(
+            original.min().unwrap(),
+            original.max().unwrap(),
+            original.mean().unwrap(),
+            original.rms().unwrap(),
+            original.count(),
+            original.non_finite(),
+        );
+        assert_eq!(reloaded.count(), original.count());
+        assert_eq!(reloaded.non_finite(), original.non_finite());
+        assert_eq!(reloaded.min(), original.min());
+
+        // And it is still mergeable, which is the point of restoring the sums.
+        let extra: SignalStats = [1_000.0].into_iter().collect();
+        let grown = reloaded.merge(extra);
+        let from_scratch: SignalStats = values
+            .iter()
+            .copied()
+            .chain([f64::NAN, f64::NAN, 1_000.0])
+            .collect();
+        assert_eq!(grown.count(), from_scratch.count());
+        assert!((grown.mean().unwrap() - from_scratch.mean().unwrap()).abs() < 1e-9);
+        assert!((grown.rms().unwrap() - from_scratch.rms().unwrap()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_empty_stored_summary_reloads_as_empty() {
+        let reloaded = SignalStats::from_stored(0.0, 0.0, 0.0, 0.0, 0, 7);
+        assert!(reloaded.is_empty());
+        assert_eq!(reloaded.non_finite(), 7);
+        assert_eq!(reloaded.mean(), None);
     }
 
     #[test]
