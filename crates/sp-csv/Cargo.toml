@@ -10,6 +10,15 @@ authors.workspace = true
 
 [dependencies]
 sp-core.workspace = true
+sp-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

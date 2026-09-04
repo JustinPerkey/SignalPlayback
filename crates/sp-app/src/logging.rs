@@ -24,8 +24,9 @@ pub struct LogHandle {
 /// target is its `[[bin]]` name, `signalplayback`, not the package name.
 #[must_use]
 pub fn init() -> LogHandle {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,signalplayback=info,sp_core=info,sp_store=info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("warn,signalplayback=info,sp_core=info,sp_store=info,sp_csv=info")
+    });
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)

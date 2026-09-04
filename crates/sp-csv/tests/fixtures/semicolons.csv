@@ -1,0 +1,9 @@
+# instrument export
+# revision 4
+gid; nrec; label
+toa; width; amplitude
+7; 2; alpha
+1000; 3.5; 12
+2000; 3.5; 13
+8; 1; beta
+3000; 4; 14

@@ -1,0 +1,6 @@
+# The CSV fixtures encode their line endings on purpose: `sample.csv` and
+# `bom_crlf.csv` are CRLF, `lone_cr.csv` uses a bare CR, and the parser tests
+# assert that each is read correctly. Normalising them would silently delete
+# what they test, so they are stored byte for byte.
+crates/sp-csv/tests/fixtures/*.csv -text
+sample/*.csv -text

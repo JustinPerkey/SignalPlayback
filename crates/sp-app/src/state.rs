@@ -6,7 +6,7 @@ use iced::widget::{button, column, container, horizontal_rule, row, scrollable, 
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
 use sp_store::Store;
 
-use crate::screens::{self, library, properties, Screen, Section};
+use crate::screens::{self, import, library, properties, Screen, Section};
 
 /// Everything the UI reads.
 ///
@@ -22,6 +22,7 @@ pub struct App {
     /// Why the library is not open, for the status bar.
     store_error: Option<String>,
     library: library::State,
+    import: import::State,
     properties: properties::State,
     log_dir: Option<PathBuf>,
 }
@@ -33,6 +34,7 @@ pub enum Message {
     Nav(Screen),
     ToggleTheme,
     Library(library::Message),
+    Import(import::Message),
     Properties(properties::Message),
 }
 
@@ -72,6 +74,7 @@ impl App {
             store,
             store_error,
             library: library::State::default(),
+            import: import::State::default(),
             properties: properties::State::default(),
             log_dir,
         };
@@ -79,6 +82,7 @@ impl App {
         let task = match app.store.clone() {
             Some(store) => Task::batch([
                 app.library.load(&store).map(Message::Library),
+                app.import.load(&store).map(Message::Import),
                 app.properties.load(&store).map(Message::Properties),
             ]),
             None => Task::none(),
@@ -117,6 +121,19 @@ impl App {
                 .library
                 .update(self.store.as_ref(), message)
                 .map(Message::Library),
+            Message::Import(message) => {
+                let task = self
+                    .import
+                    .update(self.store.as_ref(), message)
+                    .map(Message::Import);
+                // An import that committed changes what the library holds.
+                match (self.import.take_completed(), self.store.clone()) {
+                    (true, Some(store)) => {
+                        Task::batch([task, self.library.load(&store).map(Message::Library)])
+                    }
+                    _ => task,
+                }
+            }
             Message::Properties(message) => self
                 .properties
                 .update(self.store.as_ref(), message)
@@ -125,6 +142,13 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch([
+            self.import.subscription().map(Message::Import),
+            Self::shortcuts(),
+        ])
+    }
+
+    fn shortcuts() -> Subscription<Message> {
         keyboard::on_key_press(|key, modifiers| {
             if !modifiers.command() {
                 return None;
@@ -147,6 +171,7 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let body: Element<'_, Message> = match self.screen {
             Screen::Library => self.library.view().map(Message::Library),
+            Screen::Import => self.import.view().map(Message::Import),
             Screen::Properties => self.properties.view().map(Message::Properties),
             other => screens::placeholder(other),
         };
