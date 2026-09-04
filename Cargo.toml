@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/jperkey/SignalPlayback"
+authors = ["Justin Perkey"]
+
+[workspace.dependencies]
+# Internal crates. Dependencies point left-to-right only (see docs/DESIGN.md §4.1).
+sp-core = { path = "crates/sp-core" }
+sp-store = { path = "crates/sp-store" }
+sp-csv = { path = "crates/sp-csv" }
+sp-gen = { path = "crates/sp-gen" }
+sp-proc = { path = "crates/sp-proc" }
+sp-dsp = { path = "crates/sp-dsp" }
+sp-engine = { path = "crates/sp-engine" }
+
+# GUI. Pinned to a minor version: Iced churns between releases (§18) and all
+# usage is confined to sp-app.
+iced = { version = "0.13.1", features = ["canvas", "tokio", "advanced"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+directories = "6.0"
+
+[workspace.lints.rust]
+unused_qualifications = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+uninlined_format_args = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Sample-crunching is unusably slow in an unoptimised debug build; the app code
+# itself stays at opt-level 0 so debugging the UI still works.
+[profile.dev.package."*"]
+opt-level = 2

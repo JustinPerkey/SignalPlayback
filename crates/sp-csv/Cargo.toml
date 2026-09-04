@@ -1,0 +1,15 @@
+[package]
+name = "sp-csv"
+description = "Grouped-block CSV parser, writer and import profiles."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+sp-core.workspace = true
+
+[lints]
+workspace = true

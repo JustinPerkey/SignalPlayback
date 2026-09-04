@@ -1,0 +1,24 @@
+[package]
+name = "sp-app"
+description = "SignalPlayback desktop application."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "signalplayback"
+path = "src/main.rs"
+
+[dependencies]
+sp-core.workspace = true
+iced.workspace = true
+directories.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[lints]
+workspace = true
