@@ -1,10 +1,20 @@
 # SignalPlayback — Design Document
 
-**Status:** Draft v0.2
+**Status:** Draft v0.3
 **Date:** 2026-09-04
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v0.4** — The library is now a **single SQLite file**: column data is stored
+> as chunked BLOBs inside `library.db` rather than as `.sigbin` files beside it. §5.1, §5.3
+> and §5.4 rewritten, §3 and §3.1 updated, and the blob/SQLite desync risk is gone.
+>
+> **Changes in v0.3** — `sample/sample.csv` settled the input format, which carries **pulse
+> records** rather than sampled waveforms. §7 rewritten to the real grammar (fixed preamble,
+> file-level headers, count-driven framing, TOA in µs), §6.6 added for the pulse record
+> model and cross-group search, §5.2 extended with `pulse_field` / `pulse`, and §17.1–17.4
+> closed.
+>
 > **Changes in v0.2** — Added the processing pipeline (§9), the artifact/result model and
 > stage inspection (§10), and customizable signal properties (§6). Sections renumbered.
 
@@ -15,8 +25,8 @@
 SignalPlayback is a desktop workbench for building a library of time-domain signals and
 running signal-processing algorithms over them. It gives an engineer one place to:
 
-1. **Import** recorded signals from a structured CSV format (grouped, with per-group and
-   per-signal metadata).
+1. **Import** recorded data from the project's CSV format — groups of pulse records, each
+   with a time of arrival and numeric fields, plus per-group metadata (§7).
 2. **Generate** synthetic signals from parameters (waveform type, frequency, amplitude,
    noise, modulation, composition).
 3. **Persist** everything in a durable, queryable local signal database with a
@@ -42,14 +52,15 @@ reproducible, comparable against a baseline, and can assert pass/fail on metrics
 | # | Goal |
 |---|------|
 | G1 | Round-trip the project's CSV format losslessly: import → database → export produces an equivalent file. |
-| G2 | Handle libraries of at least 10 000 signals and individual signals of at least 100 M samples without the UI dropping below 60 fps. |
+| G2 | Handle libraries of at least 10 000 signals and individual signals of at least 100 M samples without the UI dropping below 60 fps. The same budget covers a group of 10 M pulse records. |
 | G3 | Generated signals are **reproducible**: the parameter spec plus a stored seed regenerates bit-identical samples. |
-| G4 | Single-file distribution — one executable plus a self-contained library directory. No server, no external database process. |
+| G4 | Single-file everything — one executable, and one `library.db` holding metadata *and* sample data. No server, no external database process, no companion directory to keep in step. |
 | G5 | Every long-running operation (import, generation, processing, export) is cancellable and reports progress without blocking the UI. |
-| G6 | The database is inspectable and repairable with standard tooling (`sqlite3`, a hex editor). |
+| G6 | The whole library is inspectable and repairable with standard tooling: `sqlite3` reaches every table and every byte of column data. |
 | G7 | **Every stage's output is inspectable.** After a run, the user can select any (group, stage) pair and see exactly what that stage produced, with the stage before it available for comparison. |
 | G8 | **Runs are reproducible and comparable.** A run records the pipeline, stage versions, parameters and input hashes; re-running the same inputs produces identical results, and any two runs can be diffed. |
 | G9 | **A new algorithm is cheap to add.** Implementing one trait plus a parameter descriptor is enough to make a stage appear in the pipeline editor with a generated parameter form. |
+| G10 | **Pulses are findable across the library.** A numeric predicate over pulse fields returns matching `(group, index)` records from every group in under a second at library scale, without materialising a row per pulse. |
 
 ### 2.2 Non-Goals (v1)
 
@@ -71,7 +82,7 @@ reproducible, comparable against a baseline, and can assert pass/fail on metrics
 | Language | Rust (2021 edition, stable toolchain) | Repo is already Cargo-configured. Memory safety plus the throughput needed for large sample arrays. |
 | GUI | **Iced** (`iced` 0.13.x, `wgpu` backend) | Retained-mode Elm architecture: a single `Message` enum and pure `update` make the transport and pipeline state machines easy to reason about and test. Pure Rust, no JS toolchain. Custom `canvas::Program` gives full control of the scope renderer. |
 | Metadata store | **SQLite** via `rusqlite` (bundled feature, WAL mode) | Ad-hoc SQL over groups/signals/properties/runs, transactional integrity, single-file backup, universally inspectable. |
-| Sample store | **File-backed binary blobs** (`.sigbin`) with mmap reads | Keeps multi-GB sample arrays out of the SQLite page cache. Zero-copy slice reads for the renderer. Content addressing makes pipeline passthrough free. |
+| Sample store | **Chunked SQLite BLOBs** read with incremental blob I/O (`sqlite3_blob_open`) | Keeps the library a single file (G4) and every byte reachable from `sqlite3` (G6). Chunking sidesteps SQLite's 1 GB blob ceiling and bounds WAL churn; incremental I/O reads a slice without materialising the whole column. Content addressing still makes pipeline passthrough free. |
 | CSV | `csv` crate over a custom block framer | Handles quoting/escaping correctly; the framer above it enforces the group/signal block grammar. |
 | Serialization | `serde` + `serde_json` | Generator specs, stage parameters, artifact payloads and property values. |
 | Hashing | `blake3` | Content addressing, integrity checks, and pipeline cache keys. |
@@ -89,9 +100,12 @@ reproducible, comparable against a baseline, and can assert pass/fail on metrics
   traces is harder to cache than Iced's explicit `canvas::Cache`.
 - **Tauri** — richest charting ecosystem, but the IPC boundary would force sample data
   through serialization on every viewport change and every stage inspection.
-- **Pure-SQLite BLOB storage** — simplest, but chunked BLOB reads add a copy per access,
-  bloat the WAL during import, and lose the content-addressed dedup that makes storing
-  every stage's intermediate signals affordable.
+- **External blob files with mmap** (`.sigbin` beside `library.db`) — the fastest option:
+  zero-copy slice reads, no write amplification through the WAL. Rejected because it makes
+  the library a directory rather than a file, and puts the sample bytes outside anything
+  `sqlite3` can see. It also introduces the one failure mode a single file cannot have —
+  a blob and its row disagreeing after a crash. The cost of the choice is one memcpy per
+  chunk read and a heavier import; both are bounded and measured in §13.
 - **DuckDB/Parquet-first** — excellent for cross-signal analytics, but heavier and awkward
   as live application state.
 - **A dataflow graph engine (petgraph-based DAG with arbitrary topology)** — considered for
@@ -118,18 +132,20 @@ SignalPlayback/
     │   ├── group.rs           #   SignalGroup, Dataset, GroupFrame
     │   ├── time.rs            #   TimeRange, SampleIndex, Timebase
     │   ├── props.rs           #   PropertyDef, PropertyValue, PropertySet
+    │   ├── pulse.rs           #   PulseRef, PulseField, pulse-record vocabulary
     │   ├── artifact.rs        #   Artifact trait, ArtifactSchema, ViewHint
     │   └── stats.rs           #   min/max/mean/rms summarisation
     ├── sp-store/              # Persistence: SQLite schema, migrations, blob store.
     │   ├── schema/            #   NNNN_name.sql migration files (embedded)
     │   ├── db.rs              #   Connection management, writer actor
-    │   ├── blob.rs            #   .sigbin read/write, mmap, checksums
+    │   ├── blob.rs            #   Chunked BLOB read/write, incremental I/O, checksums
     │   ├── runs.rs            #   Run/stage/artifact recording and retrieval
+    │   ├── pulses.rs          #   Column read/scan, zone-map prefilter, pulse search
     │   └── query.rs           #   Typed query API (no SQL escapes this crate)
     ├── sp-csv/                # Block-grammar parser/writer + import profiles.
-    │   ├── framer.rs          #   Blank-line block detection
+    │   ├── framer.rs          #   Count-driven block framing
     │   ├── parse.rs           #   Header/row decoding, error positions
-    │   ├── profile.rs         #   Column mapping rules → property defs
+    │   ├── profile.rs         #   Preamble/delimiter/count/time settings, column mapping
     │   └── export.rs          #   Database → CSV
     ├── sp-gen/                # Parametric synthesis.
     │   ├── spec.rs            #   GenSpec DAG (serde)
@@ -214,28 +230,40 @@ plugin interface would later slot into.
 
 ### 5.1 Library Layout on Disk
 
+A library is **one file**. Metadata, sample and pulse-field columns, render pyramids and
+artifact payloads all live in it; the `-wal` and `-shm` files are SQLite's own and exist
+only while the library is open or after an unclean shutdown.
+
 ```
-<library-root>/
-├── library.db            # SQLite: all metadata, runs, artifacts
-├── library.db-wal
-├── samples/
-│   └── a3/a3f9c1…e2.sigbin   # content-addressed by blake3, 2-char fanout
-├── pyramids/
-│   └── a3/a3f9c1…e2.sigmip   # derived, safe to delete and rebuild
-├── artifacts/
-│   └── 7c/7c11ab…04.artbin   # large artifact payloads (spectrogram matrices, etc.)
-└── imports/
-    └── 2026-09-04T12-00-00_capture.csv   # optional archived original
+my-library.db             # everything: metadata, columns, pyramids, artifacts
+my-library.db-wal         # SQLite write-ahead log (transient)
+my-library.db-shm         # SQLite shared-memory index (transient)
 ```
 
-Default root: `%LOCALAPPDATA%\SignalPlayback\library` on Windows, via `directories`.
-The root is user-selectable; multiple libraries are supported (one open at a time in v1).
+Default: `%LOCALAPPDATA%\SignalPlayback\library\library.db` on Windows, via `directories`.
+The path is user-selectable; multiple libraries are supported (one open at a time in v1).
+Backing a library up, or handing one to a colleague, is copying a single file — the point
+of the choice.
+
+**Pragmas.**
+
+```sql
+PRAGMA journal_mode = WAL;      -- one writer, many readers, no SQLITE_BUSY dance
+PRAGMA synchronous  = NORMAL;   -- WAL makes this safe against process crashes
+PRAGMA foreign_keys = ON;
+PRAGMA page_size    = 8192;     -- fewer pages per MB of column data
+PRAGMA wal_autocheckpoint = 4000;  -- ~32 MB, so bulk import checkpoints steadily
+PRAGMA temp_store   = MEMORY;
+```
+
+The original CSV is **not** archived by default — re-importing costs one pass, and copying
+a multi-GB file into the library to sit unread is a poor trade. A per-import "keep a copy
+of the source" option stores it as a compressed blob when the provenance matters.
 
 ### 5.2 Core Schema
 
 ```sql
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+-- Connection pragmas are in §5.1.
 
 CREATE TABLE app_meta (
     key    TEXT PRIMARY KEY,
@@ -262,7 +290,10 @@ CREATE TABLE signal_group (
     ordinal         INTEGER NOT NULL,
     name            TEXT,
     declared_count  INTEGER NOT NULL,      -- the 'count' field from the group header
-    actual_count    INTEGER NOT NULL,
+    actual_count    INTEGER NOT NULL,      -- pulse rows actually read
+    -- Pulse groups (§6.6): the TOA column, shared by every pulse_field.
+    toa_blob_id     INTEGER REFERENCES sample_blob(id),
+    toa_unit        TEXT,                  -- source unit, e.g. 'us'; NULL for sampled groups
     attributes      TEXT    NOT NULL DEFAULT '{}',   -- JSON property values
     UNIQUE (dataset_id, ordinal)
 );
@@ -291,13 +322,27 @@ CREATE TABLE signal (
     UNIQUE (group_id, ordinal)
 );
 
+-- An immutable, content-addressed byte array: a signal's samples, a pulse
+-- field's column, a TOA column, a render pyramid, or a large artifact payload.
+-- The bytes live in sample_chunk (§5.3), never on the filesystem.
 CREATE TABLE sample_blob (
-    id        INTEGER PRIMARY KEY,
-    relpath   TEXT    NOT NULL UNIQUE,
-    byte_len  INTEGER NOT NULL,
-    checksum  TEXT    NOT NULL,            -- blake3 hex
-    refcount  INTEGER NOT NULL DEFAULT 0   -- identical signals share one blob
+    id         INTEGER PRIMARY KEY,
+    checksum   TEXT    NOT NULL UNIQUE,     -- blake3 hex; this is the address
+    byte_len   INTEGER NOT NULL,            -- total payload length across chunks
+    chunk_size INTEGER NOT NULL,            -- bytes per chunk, last one may be short
+    kind       TEXT    NOT NULL             -- what the bytes are, for Verify/maintenance
+               CHECK (kind IN ('samples','pyramid','artifact')),
+    refcount   INTEGER NOT NULL DEFAULT 0   -- identical columns share one blob
 );
+
+-- Blob payload, split so no single BLOB approaches SQLite's 1 GB ceiling and
+-- so a bulk import checkpoints the WAL at a predictable rate.
+CREATE TABLE sample_chunk (
+    blob_id INTEGER NOT NULL REFERENCES sample_blob(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,               -- 0-based chunk index
+    data    BLOB    NOT NULL,
+    PRIMARY KEY (blob_id, ordinal)
+) WITHOUT ROWID;
 
 CREATE TABLE tag (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
 CREATE TABLE signal_tag (
@@ -331,6 +376,39 @@ CREATE INDEX ix_signal_name   ON signal(name);
 CREATE VIRTUAL TABLE signal_fts USING fts5(
     name, units, attributes, content='signal', content_rowid='id'
 );
+
+-- One numeric field of a group's pulse records, stored as a column (§6.6).
+CREATE TABLE pulse_field (
+    id          INTEGER PRIMARY KEY,
+    group_id    INTEGER NOT NULL REFERENCES signal_group(id) ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL,          -- column order in the source file
+    name        TEXT    NOT NULL,          -- 'pulse width', as written in the header
+    key         TEXT    NOT NULL,          -- 'pulse_width'; matches property_def.key when bound
+    unit        TEXT,
+    dtype       TEXT    NOT NULL,
+    blob_id     INTEGER REFERENCES sample_blob(id),
+    -- Zone map plus cached statistics: the prefilter for cross-group search.
+    min_value   REAL, max_value REAL, mean_value REAL, rms_value REAL,
+    nan_count   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (group_id, ordinal)
+);
+CREATE INDEX ix_pulse_field_zone ON pulse_field(key, min_value, max_value);
+
+-- Annotation for an individual pulse. Rows exist only for pulses the user
+-- named or tagged; an unannotated pulse is addressed as (group_id, idx) alone.
+CREATE TABLE pulse (
+    id         INTEGER PRIMARY KEY,
+    group_id   INTEGER NOT NULL REFERENCES signal_group(id) ON DELETE CASCADE,
+    idx        INTEGER NOT NULL,           -- row position within the group
+    name       TEXT,
+    attributes TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (group_id, idx)
+);
+CREATE TABLE pulse_tag (
+    pulse_id INTEGER NOT NULL REFERENCES pulse(id) ON DELETE CASCADE,
+    tag_id   INTEGER NOT NULL REFERENCES tag(id)   ON DELETE CASCADE,
+    PRIMARY KEY (pulse_id, tag_id)
+);
 ```
 
 Processing-related tables are in §9.6.
@@ -339,9 +417,11 @@ Processing-related tables are in §9.6.
 applied in order inside a transaction, gated on `app_meta.schema_version`. Downgrades are
 refused with a clear message rather than attempted.
 
-### 5.3 Sample Blob Format (`.sigbin`)
+### 5.3 Column Blob Format
 
-Fixed 64-byte header, then packed little-endian samples:
+A blob's logical payload is a fixed 64-byte header followed by packed little-endian
+values. It is the same layout whether the bytes hold a signal's samples, a pulse field's
+column, or a group's TOA column.
 
 | Offset | Size | Field |
 |--------|------|-------|
@@ -351,35 +431,57 @@ Fixed 64-byte header, then packed little-endian samples:
 | 7  | 1 | Channel count (u8), 1 for v1 |
 | 8  | 8 | Sample rate Hz (f64, 0.0 ⇒ irregular) |
 | 16 | 8 | t0 seconds (f64) |
-| 24 | 8 | Sample count (u64) |
+| 24 | 8 | Value count (u64) |
 | 32 | 8 | Scale factor (f64, for integer dtypes) |
 | 40 | 8 | Offset (f64, for integer dtypes) |
 | 48 | 16 | Reserved (zeroed) |
-| 64 | … | Sample payload |
+| 64 | … | Value payload |
 
-Blobs are immutable and content-addressed. Editing a signal writes a new blob and
-decrements the old blob's `refcount`; a vacuum pass removes blobs at refcount 0.
+**Stored as chunks.** That byte array is split across `sample_chunk` rows of a fixed
+`chunk_size` (**4 MiB** by default, the last chunk short). Chunking buys three things:
+SQLite's 1 GB per-BLOB ceiling never applies, a bulk import checkpoints the WAL at a
+steady rate instead of growing it by the size of the whole column, and a random slice read
+touches one chunk rather than deserialising the column.
+
+**Reading.** `sqlite3_blob_open` (rusqlite's `Connection::blob_open`) gives `Read + Seek`
+over one chunk's BLOB without loading it, so reading samples `[i, j)` costs one `memcpy`
+of exactly that span out of the chunks it falls in. This is the concrete price of a
+single-file library: one copy per read where an mmap'd file would have had none.
+
+**Writing.** Chunks are appended inside the import transaction with a zero-blob-then-fill
+pattern (`INSERT … zeroblob(n)`, then `blob_open` and write), which keeps a 4 MiB chunk
+from ever being materialised twice in memory.
+
+Blobs are immutable and content-addressed by blake3 over the payload. Editing a signal
+writes a new blob and decrements the old blob's `refcount`; a maintenance pass deletes
+blobs at refcount 0, and `VACUUM` returns the pages.
 
 **This is what makes storing every intermediate stage affordable.** A stage that passes a
 signal through unchanged produces the same content hash and therefore the same blob — the
 run records a reference, not a copy. Only signals a stage actually altered cost storage.
 
-### 5.4 Render Pyramid (`.sigmip`)
+### 5.4 Render Pyramid
 
 Rendering 100 M points per frame is not feasible, so each blob gets a derived
-multi-resolution min/max pyramid:
+multi-resolution min/max pyramid, itself stored as a blob (`kind = 'pyramid'`) keyed by
+the source blob's checksum:
 
-- Level *k* stores one `(min, max)` `f32` pair per `2^(k+6)` source samples — level 0 is a
-  64:1 reduction, each level halves again.
+- Level *k* stores one `(min, max)` `f32` pair per `2^(k+6)` source values — level 0 is a
+  64:1 reduction, each level halves again. Every level together adds ~3% to the source
+  size.
 - Levels are built once, lazily, on the worker pool (~200 ms per 100 M samples, a single
-  linear pass) and cached to disk.
-- The renderer picks the level where **samples-per-pixel lands in [1, 2]**, reads that
-  slice via mmap, and draws vertical min/max bars.
-- Below one sample per pixel the renderer reads the raw blob and draws a polyline with
+  linear pass) and cached in the library.
+- The renderer picks the level where **samples-per-pixel lands in [1, 2]** and reads that
+  slice — a few KB, one chunk — then draws vertical min/max bars.
+- Below one sample per pixel the renderer reads the raw span and draws a polyline with
   point markers.
 
 Draw cost is proportional to viewport width in pixels, not to signal length — the key to
-G2, and the reason flipping between stage outputs stays instant.
+G2, and the reason flipping between stage outputs stays instant. Because a pyramid read is
+kilobytes, the extra copy imposed by BLOB storage never lands on the frame path.
+
+Pyramids are derived data: deleting every `kind = 'pyramid'` blob is always safe and is
+what the *Rebuild pyramids* maintenance action does.
 
 ---
 
@@ -514,92 +616,154 @@ An attribute with no matching definition is retained verbatim in `attributes` an
 the Inspector under "Unrecognised", with a one-click "promote to property" action. This is
 what keeps G1 true across schema evolution.
 
+### 6.6 Pulse Records
+
+The project's CSV format (§7) carries **pulse records** rather than sampled waveforms: a
+group is a collection of pulses, and a pulse is one record — a time of arrival plus a fixed
+set of numeric fields (`pulse width`, `power`, `angle`, …). Groups routinely hold millions
+of them. Pulses are never processed across groups, but *searching* for pulses across groups
+is a first-class operation.
+
+Two views of the same bytes serve those two needs.
+
+**Stored as columns.** Each field of a group becomes one array — a `pulse_field` backed by
+an ordinary content-addressed blob inside `library.db` — and the group's TOA column becomes the shared
+irregular timebase every field is indexed against. A field array is a signal in every way
+that matters: it has statistics, a render pyramid, a scope trace, and it flows into a
+`GroupFrame` exactly like a sampled signal, so no stage, viewer or storage path needs a
+second code path. Ingest costs one sequential write per field.
+
+**Addressed as records.** A pulse is `PulseRef { group: GroupId, index: u32 }`, where
+`index` is its row position in the source file. The identity is free — no row, no id
+allocation — and it is stable across re-import because it is the file's own ordering. The
+pulse table view reads across the field arrays at one index; the scope draws the same data
+along the timebase.
+
+```
+group 7   toa[]  = [10 µs, 20 µs, 30 µs, …]      ← shared irregular timebase
+          pulse_field "pulse width"  [100, 100, …]
+          pulse_field "power"        [100, 100, …]
+          pulse_field "angle"        [100, 100, …]
+             ▲
+             └── pulse (7, 1) is the vertical slice: toa=20 µs, pw=100, power=100, angle=100
+```
+
+**Naming and annotation.** A `pulse` row is created lazily, only for a pulse the user names
+or tags, keyed by `(group_id, index)`. A file with 10 M pulses of which 40 are interesting
+costs 40 rows, not 10 M.
+
+**Cross-group search.** Each `pulse_field` records min/max — a zone map — so a predicate
+such as `pulse_width < 2 AND angle BETWEEN 30 AND 40` first eliminates whole groups in
+SQL, then reads only the surviving groups' columns chunk by chunk, in parallel, returning
+`PulseRef` hits. A 4-byte-per-value scan runs at roughly memory bandwidth even with the
+chunk copy in the way, so a selective query over a 10 000-group library touches a few
+hundred MB at most.
+
+**Why not one `signal` row per pulse.** It is the obvious model and it does not scale here:
+10 M pulses would mean 10 M `signal` rows plus ~40 M `signal_property` rows — hundreds of
+times the storage of the 160 MB of numbers involved, and minutes of insert time per file.
+The column-plus-zone-map arrangement answers the same queries with the storage the data
+actually warrants. Should per-pulse SQL identity later prove necessary, a stage can promote
+a selected result set into `pulse` rows without changing how anything is stored.
+
 ---
 
 ## 7. CSV Import Format
 
 ### 7.1 Structure
 
-The file is a sequence of **group blocks**. Each block is:
+Confirmed against `sample/sample.csv`. The file carries **pulse records**, not sampled
+waveforms: a fixed preamble, then two header rows *once*, then group rows each followed by
+that group's pulse rows. There is no blank-line separator — framing is driven entirely by
+the group row's count column.
 
 ```
-<blank line>
+<preamble>              ← fixed number of lines to skip (default 1)
 <group header row>      ← column names for group metadata; must include a count column
-<signal header row>     ← column names for the per-signal rows
-<group data row>        ← one row of values matching the group header
-<signal row> × count    ← 'count' rows, each matching the signal header
+<pulse header row>      ← column names for the per-pulse rows; must include a time column
+[ <group row>           ← one row of values matching the group header
+  <pulse row> × count ] ← 'count' rows, each matching the pulse header
+  × groups
 ```
 
-…repeated for every group in the file.
-
 ```
-                                         ┌─ blank line
-                                         │  group_id,name,count,fs_hz,capture_utc
-   group N ────────────────────────────► │  sig_id,name,units,gain,s0,s1,s2,…
-                                         │  7,ANTENNA_A,3,10000,2026-09-04T11:02:00Z
-                                         │  1,IF_I,V,1.0,0.013,0.041,0.062,…
-                                         │  2,IF_Q,V,1.0,-0.004,0.019,0.055,…
-                                         │  3,AGC,dB,1.0,12.0,12.0,11.8,…
-                                         └─
-                                         ┌─ blank line
-   group N+1 ──────────────────────────► │  …
+   preamble ───────────► Skip Row
+   headers (once) ─────► groupID, total time,  count,  info
+                         time,  pulse width,  power,  angle
+                       ┌─
+   group 1 ──────────► │ 1,  1000,  2,  info
+                       │ 10,  100,  100,  100
+                       │ 20,  100,  100,  100
+                       └─
+                       ┌─  ← no separator; count said the group ended
+   group 2 ──────────► │ 2,  1000,  2,  info
+                       │ 30,  100,  100,  100
+                       │ 40,  100,  100,  100
+                       └─
 ```
 
 ### 7.2 Grammar
 
 ```ebnf
-file          = block { block } [ trailing_ws ] ;
-block         = blank_line , group_header , signal_header , group_row , signal_row * N ;
-blank_line    = { WS } , EOL ;                (* a line with no non-delimiter content *)
+file          = preamble , group_header , pulse_header , group_block { group_block } ;
+preamble      = line * P ;                        (* P from the profile, default 1 *)
+group_block   = group_row , pulse_row * N ;       (* N = the group row's count field *)
 group_header  = field , { SEP , field } , EOL ;   (* must contain a count column *)
-signal_header = field , { SEP , field } , EOL ;
+pulse_header  = field , { SEP , field } , EOL ;   (* must contain a time column *)
 group_row     = field , { SEP , field } , EOL ;   (* arity = |group_header| *)
-signal_row    = field , { SEP , field } , EOL ;   (* arity ≥ |signal_header| *)
+pulse_row     = field , { SEP , field } , EOL ;   (* arity = |pulse_header| *)
 field         = quoted | bare ;
 quoted        = '"' , { CHAR | '""' } , '"' ;
 ```
 
-Where `N` is the integer in the group row's count column.
+The framer is therefore a two-state machine — *expect group row* / *consume N pulse rows*
+— and never has to look ahead. That is what keeps ingest streaming at full IO speed over a
+file with millions of rows per group.
 
 ### 7.3 Parser Behaviour
 
 | Concern | Rule |
 |---------|------|
-| **Leading blank line** | The blank line is the block *separator*. A file that starts directly with a group header is accepted (an implicit separator is assumed at BOF). |
-| **Count column** | Located by case-insensitive name match against a candidate list: `count`, `signal_count`, `num_signals`, `n_signals`, `nsig`. Overridable per import profile. |
-| **Count mismatch** | *Strict* mode: error, abort the import. *Tolerant* mode (default): consume rows until the next blank line, record `actual_count` alongside `declared_count`, and raise a warning. |
-| **Samples in signal rows** | Columns named in the signal header are metadata; every column **beyond** the header's declared arity is a sample. If the header itself carries sample columns (e.g. `s0,s1,…`), the profile marks where metadata ends and samples begin. |
-| **Alternate layout** | A profile flag selects *column-per-signal* layout instead, where the signal header names signals and each following row is one time step across the group. Both layouts share the block framer. |
-| **Domain inference** | A signal whose values are all in {0,1} (or a small level set) is proposed as `digital_logic`; a metadata column naming a paired signal proposes `baseband_iq`. Always a proposal in the mapping UI, never silent. |
-| **Delimiter** | Auto-detected from the first group header (`,` `;` `\t` `\|`), overridable. |
+| **Preamble** | A fixed line count skipped before the headers, from the profile (default 1). Skipped lines are retained verbatim so export reproduces them (G1). |
+| **Headers** | Both header rows appear once, at file level, and apply to every group. A row matching the group header's text mid-file is data, not a header — the framer never re-reads headers. |
+| **Count column** | Located by case-insensitive name match against a candidate list: `count`, `pulse_count`, `num_pulses`, `n`, `nrec`. Overridable per import profile. |
+| **Count semantics** | The number of pulse rows following the group row. This is the sole block-termination rule. |
+| **Count mismatch** | *Strict* mode: error, abort the import. Detected when a consumed row's arity or numeric shape does not match the pulse header, or when EOF arrives early. *Tolerant* mode (default): record `actual_count` alongside `declared_count`, resynchronise on the next row that parses as a group row, and raise a warning naming the line. |
+| **Field whitespace** | Leading and trailing whitespace is trimmed from every field before parsing — the format writes `, ` as its delimiter run. |
+| **Time column** | Located by name (`time`, `toa`, `time_of_arrival`). Its unit comes from the profile, defaulting to **microseconds**, and is scaled to seconds for the absolute timeline on ingest. The original unit is recorded so export restores it exactly. |
+| **Pulse fields** | Every non-time column of the pulse header becomes one field array per group (§6.6). Files are numeric throughout; a non-numeric column is reported as a diagnostic and kept as a text field array rather than aborting the import. |
+| **Group fields** | Every group-header column other than the count becomes a group property. Text is expected here (`info` in the sample) and is stored as a group attribute. |
+| **Delimiter** | Auto-detected from the group header (`,` `;` `\t` `\|`), overridable. |
 | **Encoding** | UTF-8, with UTF-8/UTF-16 BOM stripped. Invalid sequences are reported with byte offsets, not silently replaced. |
 | **Line endings** | `LF` and `CRLF` both accepted; a lone `CR` is treated as a line ending with a warning. |
 | **Comments** | Lines starting with `#` are skipped everywhere except inside quoted fields. Configurable. |
-| **Missing values** | Empty, `NaN`, `nan`, `NA`, `null` → `f64::NAN`, drawn as a gap in the trace. |
+| **Missing values** | Empty, `NaN`, `nan`, `NA`, `null` → `f64::NAN`, drawn as a gap and excluded from statistics. |
 | **Numeric parsing** | Decimal and scientific notation. Thousands separators rejected. Locale-independent (always `.` as decimal point). |
-| **Errors** | Every diagnostic carries `(block_index, line_number, byte_offset, column_index, message)` and surfaces in a scrollable error panel with a jump-to-line action. |
+| **Errors** | Every diagnostic carries `(group_index, line_number, byte_offset, column_index, message)` and surfaces in a scrollable error panel with a jump-to-line action. |
 
 ### 7.4 Import Pipeline
 
 ```
- pick file → sniff (read first 2 blocks) → preview & column mapping UI
-     → confirm → streaming ingest → per-signal blob write → stats + FTS index
-     → pyramid build (background) → dataset appears in library
+ pick file → sniff (preamble + headers + first group) → preview & column mapping UI
+     → confirm → streaming ingest → per-field column blob write → zone map + stats
+     → dataset appears in library
 ```
 
-The **sniff** pass reads only enough to show a preview table and suggest a profile, so a
-4 GB file feels instant to open. The **ingest** pass streams the whole file once, writing
-sample blobs incrementally, holding at most one group in memory.
+The **sniff** pass reads only the preamble, the two headers and the first group, so a
+multi-GB file previews instantly. The **ingest** pass streams the file once, appending to
+one column buffer per pulse field and flushing each group's columns to a blob at the group
+boundary, so peak memory is one group rather than one file.
 
 Import is transactional at the dataset level: a failure rolls back the SQLite rows and
 deletes any orphaned blobs.
 
 ### 7.5 Export
 
-The writer reverses the grammar exactly, preserving original column order and unmapped
-attributes, satisfying G1. Derived signals and stage outputs export through the same
-writer, so a processed group can leave the app in the format it arrived in. A round-trip
-test fixture set lives in `crates/sp-csv/tests/fixtures/`.
+The writer reverses the grammar exactly — same preamble, same header rows, same column
+order, same delimiter, TOA rescaled back to its source unit — satisfying G1. Group
+properties and pulse fields that were never mapped to a definition are written back from
+`attributes` verbatim. A round-trip test fixture set lives in
+`crates/sp-csv/tests/fixtures/`, seeded from `sample/sample.csv`.
 
 ---
 
@@ -777,7 +941,7 @@ upstream produces is flagged in place, with the missing port named, before the r
 ```rust
 pub struct GroupFrame {
     pub group:    GroupMeta,        // name, properties, ordinal
-    pub signals:  Vec<SignalRef>,   // lazily mmap-backed; never eagerly copied
+    pub signals:  Vec<SignalRef>,   // lazy column handles; read by span, never copied whole
     pub inbound:  PortMap,          // artifacts published by upstream stages
     pub run:      RunId,
 }
@@ -1016,8 +1180,8 @@ Built-in kinds: `Spectrum`, `Spectrogram`, `Detections`, `Symbols`, `Bits`, `Met
 `Constellation`, `Histogram`, `FilterResponse`, `Table`, `Text`.
 
 **Storage.** Payloads under 64 KB are stored as JSON in `artifact.payload_json`; larger
-ones (a spectrogram matrix) go to a content-addressed `.artbin` blob with the JSON holding
-only the header. The viewer sees no difference.
+ones (a spectrogram matrix) go to a content-addressed blob (`kind = 'artifact'`) with the
+JSON holding only the header. The viewer sees no difference.
 
 **Overlay artifacts are the payoff.** A `Detections` artifact draws as shaded spans
 directly on the scope, on the same time axis as the signal it came from, moving with the
@@ -1162,14 +1326,14 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 
 | Screen | Purpose |
 |--------|---------|
-| **Library** | Tree of Dataset → Group → Signal with search, property filters, and a sortable detail table. Multi-select feeds the scope, a playlist, or a pipeline run. |
-| **Import** | File picker → preview grid of the first blocks → column-mapping panel (including bind-to-property) → profile save/load → progress with a live error list. |
+| **Library** | Tree of Dataset → Group → Signal / pulse field, with search, property filters, and a sortable detail table. Hosts cross-group pulse search (§6.6): a field predicate returns matching pulses across every group, each row jumping to its group and playhead position. Multi-select feeds the scope, a playlist, or a pipeline run. |
+| **Import** | File picker → preview grid of the headers and first group → column-mapping panel (which column is the time of arrival and in what unit, which columns bind to property definitions) → profile save/load → progress with a live error list. |
 | **Generate** | Node tree editor, parameter form, live preview, sweep configuration, preset browser. |
 | **Pipeline** | Stage palette on the left, ordered stage list in the middle, generated parameter form on the right. Port validation inline. Run controls with group selection. |
 | **Results** | Group list + stage rail + scope + artifact panes (§10.3). The main working surface for algorithm development. |
 | **Runs** | History of runs with pipeline hash, status, timing, assertion results; promote to baseline; diff two runs. |
 | **Scope** | Playback-focused view of stored signals, with the same stage rail available when a run is loaded. |
-| **Inspector** | Single-signal detail: full metadata, property editor, tags, statistics, histogram, FFT magnitude, virtualised raw sample table. |
+| **Inspector** | Detail for one signal, pulse field or pulse: full metadata, property editor, tags, statistics, histogram, and a virtualised value table — for a pulse group, the table is the pulse records themselves, one row per pulse across every field. |
 | **Properties** | Manage property definitions and property sets (§6.3). |
 | **Settings** | Library location, theme, default sample rate, strict/tolerant import, retention defaults, decimation quality, keyboard map. |
 
@@ -1179,7 +1343,15 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 enum Screen {
     Library, Import(ImportState), Generate(GenState),
     Pipeline(PipelineState), Results(ResultsState), Runs,
-    Scope(ScopeState), Inspector(SignalId), Properties, Settings,
+    Scope(ScopeState), Inspector(InspectTarget), Properties, Settings,
+}
+
+/// What the Inspector is looking at. A pulse group has no per-pulse row until
+/// one is annotated (§6.6), so the target is a reference, not an id.
+enum InspectTarget {
+    Signal(SignalId),
+    PulseField { group: GroupId, ordinal: u32 },
+    Pulse(PulseRef),
 }
 
 struct App {
@@ -1239,9 +1411,12 @@ run proceeds — the user can inspect stage 1's output while stage 4 is still co
 | Playhead tick | < 0.5 ms | Overlay-layer redraw only |
 | Stage switch in results | < 30 ms | Metadata-only load; pyramids already built; viewport preserved |
 | CSV sniff (first 2 blocks) | < 100 ms on a 4 GB file | Bounded read, never a full scan |
-| CSV ingest | ≥ 50 MB/s single-threaded | Streaming reader, no intermediate `String` per field, direct write into a blob buffer |
+| CSV ingest | ≥ 50 MB/s single-threaded | Streaming reader, no intermediate `String` per field, direct write into a column buffer |
+| Pulse ingest | ≥ 1 M records/s | One append per field per row; group flushed to chunked blobs at the block boundary |
+| Cross-group pulse search | < 1 s over 10 000 groups | Zone-map prefilter in SQL, then parallel chunked scan of surviving columns (§6.6) |
 | Generation | ≥ 100 M samples/s (sine, 8 cores) | Rayon chunking, no per-sample allocation |
-| Pyramid build | ≤ 1 linear pass over the blob | Build all levels in one traversal |
+| Pyramid build | ≤ 1 linear pass over the blob | Build all levels in one traversal, streaming chunk by chunk |
+| Column slice read | ≤ 1 copy of the requested span | Incremental blob I/O into the caller's buffer; no whole-column materialisation |
 | Pipeline throughput | ≥ 0.8 × cores on group-parallel work | Groups fan out across rayon; bounded in-flight frames |
 | Re-run after a param edit | Only stages ≥ the edited one | Content-hash cache (§9.5) |
 | Library query | < 50 ms at 10 000 signals | Indexed SQLite + FTS5 + `signal_property` index, metadata only |
@@ -1260,8 +1435,10 @@ caught at the task boundary (`catch_unwind`) and reported as a stage failure wit
 group named, so one bad algorithm cannot take down a run.
 
 **Integrity.** Blob checksums are verified on first read after app start and after any
-crash-recovery. A `Verify Library` action rehashes everything and reports mismatches in
-both directions, including artifact blobs.
+crash-recovery. A `Verify Library` action rehashes every blob and reports mismatches, plus
+any blob at refcount 0 and any row referencing a missing blob. Because the bytes and the
+rows describing them commit in one SQLite transaction, the two cannot disagree after a
+crash — the failure mode a split file/database store has, and this one does not.
 
 **Testing.**
 - Unit tests per crate; property tests (`proptest`) for the CSV round-trip (G1) and for
@@ -1294,9 +1471,10 @@ Grouped by area and tiered: **[MVP]** ships in v1 · **[V1.x]** near-term · **[
 larger effort · **[Stretch]** speculative.
 
 ### 15.1 Import & Data Ingest
-- **[MVP]** Grouped-block CSV import with preview and column mapping.
+- **[MVP]** Pulse-record CSV import (§7) with preview and column mapping.
 - **[MVP]** Saved import profiles for recurring file shapes.
 - **[MVP]** Strict vs. tolerant count handling with a diagnostics list.
+- **[MVP]** Time-of-arrival column with a configurable source unit (default µs).
 - **[MVP]** Map CSV columns onto typed property definitions.
 - **[V1.x]** Drag-and-drop import; import multiple files in one action.
 - **[V1.x]** Watch-folder auto-import.
@@ -1380,10 +1558,12 @@ larger effort · **[Stretch]** speculative.
 ### 15.6 Database & Library Management
 - **[MVP]** Dataset/group/signal hierarchy, search, sortable detail table.
 - **[MVP]** Tags with filter-by-tag.
+- **[MVP]** Cross-group pulse search: numeric predicates over pulse fields, zone-map prefiltered (§6.6).
+- **[V1.x]** Name and tag an individual pulse; saved pulse selections.
 - **[V1.x]** Bulk edit: rename, retag, set properties across a selection.
 - **[V1.x]** Duplicate detection via blob checksum; deduplicate on ingest.
 - **[V1.x]** Library statistics dashboard (count, total size, rate distribution, run storage).
-- **[V1.x]** Vacuum / verify / rebuild-pyramids / prune-old-runs maintenance actions.
+- **[V1.x]** Vacuum / verify / rebuild-pyramids / prune-old-runs maintenance actions (a library that has shed data needs `VACUUM` to return the pages).
 - **[V2]** Multiple libraries open simultaneously with cross-library compare.
 - **[V2]** Versioning: keep prior revisions of an edited signal.
 - **[V2]** Archive/restore a dataset or a run to a single portable `.splib` bundle.
@@ -1418,7 +1598,7 @@ larger effort · **[Stretch]** speculative.
 - **[Stretch]** Anomaly flagging across a whole dataset.
 
 ### 15.9 Export & Interop
-- **[MVP]** Export to the native grouped CSV format (round-trip fidelity).
+- **[MVP]** Export to the native pulse-record CSV format (round-trip fidelity, TOA restored to its source unit).
 - **[V1.x]** Export a selection, a time range, or a stage's output.
 - **[V1.x]** Export the scope view as PNG/SVG.
 - **[V1.x]** Export a run's metrics table as CSV.
@@ -1452,7 +1632,7 @@ larger effort · **[Stretch]** speculative.
 | Phase | Deliverable | Exit criteria |
 |-------|-------------|---------------|
 | **M0 — Skeleton** | Workspace, `sp-core` types, Iced window with screen nav, logging | App launches, screens switch, CI builds and clippy is clean |
-| **M1 — Store** | SQLite schema + migrations, blob store, store actor, property definitions, library screen | Signals insert and list; property queries work; `Verify Library` passes |
+| **M1 — Store** | SQLite schema + migrations, chunked blob store, store actor, property definitions, library screen | Signals insert and list; property queries work; a column round-trips through chunked BLOB storage byte-for-byte; `Verify Library` passes |
 | **M2 — Import** | Block framer, parser, mapping UI (incl. property binding), streaming ingest, error list | Fixture corpus imports; round-trip property test passes (G1) |
 | **M3 — Generate** | `GenSpec`, primitives, combinators, generator UI, sweeps | Determinism property test passes (G3); presets load |
 | **M4 — Playback** | Pyramid builder, viewport, scope canvas, transport, clock, domain renderers | 100 M-sample signal plays at 60 fps (G2) |
@@ -1471,56 +1651,59 @@ and benefits from M3 (test inputs) but not from M4; M6 depends on both M4 and M5
 Items marked ⚠ change the design materially and should be confirmed before the milestone
 noted.
 
-### CSV format (before M2)
+### CSV format — resolved by `sample/sample.csv` (2026-09-04)
 
-1. ⚠ **Block row order.** This document takes the stated order literally: *group header →
-   signal header → group data row → signal rows*. The more conventional layout would put
-   the group data row immediately after the group header. The framer will **auto-detect**
-   both (by testing which row's arity matches which header), but a sample file would
-   settle it.
-2. ⚠ **Where samples live in a signal row.** Assumed: each signal row is one complete
-   signal, with metadata columns first and sample values trailing. The alternative — the
-   signal header names the signals and each subsequent row is one time step — is supported
-   via a profile flag, but only one should be the default.
-3. **Timebase source.** Assumed the sample rate comes from a group-level column and the
-   time axis is implicit. If files instead carry an explicit time column per signal,
-   `time_blob_id` covers it, but the mapping UI needs a "this column is time" affordance.
-4. **Group `count` semantics.** Assumed to be the number of signal rows in the block. If it
-   instead means samples per signal, the framer's block-termination rule changes.
+1. **Block row order.** ✅ *Group header → pulse header → group row → pulse rows*, as
+   originally stated — but the two header rows appear **once at file level**, not per
+   group, and there is **no blank-line separator**. Framing is driven solely by the count
+   column (§7.2). The auto-detecting framer is unnecessary and has been dropped.
+2. **What a row contains.** ✅ Each row is one **pulse record**: a time of arrival plus a
+   fixed set of numeric fields, with no trailing sample array. Groups hold up to millions
+   of rows. Stored as one column per field with a shared TOA timebase, addressed as
+   `(group, index)` — see §6.6 for why, and for what was rejected.
+3. **Timebase source.** ✅ An explicit `time` column in every pulse row, in **microseconds**,
+   scaled to seconds on ingest and restored on export. The mapping UI needs the "this
+   column is time" affordance after all; the unit is a profile setting.
+4. **Group `count` semantics.** ✅ The number of pulse rows following the group row, and the
+   sole block-termination rule.
+5. **Still open — per-pulse SQL identity.** §6.6 creates a `pulse` row only for an annotated
+   pulse. If workflows turn out to need every pulse individually joinable, taggable or
+   referenceable from a `SignalRef` property, that becomes a bulk-materialisation step with
+   the storage cost set out there. Worth revisiting once cross-group search is in use.
 
 ### Processing (before M5)
 
-5. ⚠ **Linear vs. branching pipelines.** v1 is a linear stage list with typed side-channel
+6. ⚠ **Linear vs. branching pipelines.** v1 is a linear stage list with typed side-channel
    ports (§9.3). If real algorithms need genuine branching — two parallel chains reconciled
    at the end — that is a v2 graph editor, and knowing now would change the pipeline model
    rather than extend it later.
-6. ⚠ **Cross-group state.** The design assumes stages are independent per group, with
+7. ⚠ **Cross-group state.** The design assumes stages are independent per group, with
    `begin_run`/`end_run` as the only cross-group hooks. If an algorithm needs to carry
    adaptive state *between* groups in order (a tracker, an adaptive equaliser), group
    parallelism must become opt-out per stage. A `sequential` flag in `StageDescriptor`
    covers it cheaply, but only if it goes in before the scheduler is written.
-7. **Stage output signal count.** Assumed a stage may add and drop signals freely within a
+8. **Stage output signal count.** Assumed a stage may add and drop signals freely within a
    group. If downstream stages must see a fixed signal count matching the group's declared
    `count`, that is a validation rule worth stating now.
-8. **Retention default.** `Always` is assumed, since content addressing makes passthrough
+9. **Retention default.** `Always` is assumed, since content addressing makes passthrough
    free. A pipeline whose every stage rewrites every sample of a 100 M-sample signal will
    still cost ~400 MB per stage per group. Confirm whether the default should be
    `Always` with a size cap, or `OnFailure` with opt-in.
-9. **Artifact size ceiling.** 64 KB inline / blob beyond that is a guess. A per-group
+10. **Artifact size ceiling.** 64 KB inline / blob beyond that is a guess. A per-group
    spectrogram at fine resolution can reach hundreds of MB; if that is routine, the
    spectrogram artifact should store a decimated pyramid the way signals do.
 
 ### Data model
 
-10. **Numeric precision.** Default storage is `f32` (halves memory, ample for most captured
+11. **Numeric precision.** Default storage is `f32` (halves memory, ample for most captured
     signals); `f64` is available per signal. Processing is always done in `f64` internally
     and narrowed on write — confirm that narrowing on every stage boundary is acceptable,
     or whether intermediate stages should stay `f64` end-to-end.
-11. **Complex signals.** `c64` is in the dtype enum and `BasebandIq` is a domain, but full
+12. **Complex signals.** `c64` is in the dtype enum and `BasebandIq` is a domain, but full
     complex support (complex-aware pyramids, constellation rendering) is scheduled for
     V1.x. Confirm whether I/Q pairs arrive as two real signals or as one complex one — this
     affects M2, not just the renderer.
-12. **Library scale.** Design targets 10 000 signals / ~100 GB of samples, plus run
+13. **Library scale.** Design targets 10 000 signals / ~100 GB of samples, plus run
     storage. An order of magnitude beyond that would argue for a columnar store.
 
 ---
@@ -1529,12 +1712,14 @@ noted.
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| CSV format assumptions wrong (§17.1–17.4) | Rework of `sp-csv` | Auto-detecting framer plus profile overrides; confirm with a real file before M2 |
+| A later file shape differs from `sample/sample.csv` (§17.1–17.4) | Rework of `sp-csv` | Grammar confirmed against a real file; every framing constant (preamble length, count column, time column and unit, delimiter) is an import-profile setting rather than a literal |
+| Per-pulse annotation demand outgrows the lazy `pulse` table (§17.5) | Model rework at M2+ | Identity is `(group, index)` either way, so materialising rows later is an additive migration, not a re-import |
 | Intermediate-result storage grows unbounded | Library bloats, disk fills | Content-addressed dedup makes passthrough free; per-stage retention policy; run-level size cap; prune-old-runs maintenance action |
-| Linear pipeline too restrictive for real algorithms | Model rework at M5+ | Typed ports cover the common "needs an earlier artifact" case; `Stage` trait is already graph-ready; settle §17.5 before M5 |
+| Linear pipeline too restrictive for real algorithms | Model rework at M5+ | Typed ports cover the common "needs an earlier artifact" case; `Stage` trait is already graph-ready; settle §17.6 before M5 |
 | Stage authors write non-deterministic stages | G8 silently false | Conformance harness runs every stage twice and compares output hashes; impure stages must opt out explicitly and are excluded from caching |
 | A user algorithm panics or hangs | Run lost, app unstable | `catch_unwind` per stage invocation; per-stage timeout; failure isolated to one group |
 | Iced canvas performance at 8+ dense traces plus overlays | Misses G2 | Pyramid decimation caps draw cost at viewport width; layered caches; `wgpu` backend; fall back to instanced GPU line rendering if needed |
 | Iced API churn between releases | Build breakage | Pin the minor version; isolate all Iced usage in `sp-app` |
-| Blob store and SQLite drifting out of sync after a crash | Orphaned or missing samples | Write blob first, then commit the row; `Verify Library` reconciles both directions |
+| WAL growth and write amplification during a large import | Slow import, transient disk use several times the payload | 4 MiB chunks with `wal_autocheckpoint` tuned to match; import commits per group, not per file; measured against the §13 ingest budget |
+| Library file stays large after data is deleted | Disk not reclaimed | Blob refcounting frees pages on delete; `VACUUM` in the maintenance actions reclaims the file itself |
 | Scope creep from §15 | M1–M8 slip | Tiers are contractual: nothing beyond **[MVP]** enters v1 without cutting something else |

@@ -1,0 +1,18 @@
+[package]
+name = "sp-core"
+description = "SignalPlayback domain vocabulary: signals, groups, time, properties, artifacts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true
