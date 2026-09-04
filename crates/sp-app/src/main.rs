@@ -8,6 +8,7 @@
 // builds keep the console so `tracing` output is visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod jobs;
 mod logging;
 mod paths;
 mod screens;
@@ -32,7 +33,7 @@ fn main() -> iced::Result {
         })
         .antialiasing(true)
         .run_with(move || {
-            let (app, task) = App::new(log_dir);
+            let (app, task) = App::new(log_dir, paths::default_library_file());
             (app, Task::batch([task]))
         });
 

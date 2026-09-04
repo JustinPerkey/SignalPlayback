@@ -24,6 +24,10 @@ sp-engine = { path = "crates/sp-engine" }
 # usage is confined to sp-app.
 iced = { version = "0.13.1", features = ["canvas", "tokio", "advanced"] }
 
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "blob", "cache"] }
+blake3 = "1.8"
+tokio = { version = "1.53", features = ["rt-multi-thread", "sync"] }
+tempfile = "3.27"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

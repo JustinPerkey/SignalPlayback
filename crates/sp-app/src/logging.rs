@@ -20,11 +20,12 @@ pub struct LogHandle {
 }
 
 /// Installs the global subscriber. Verbosity comes from `RUST_LOG`, defaulting
-/// to `info` for our crates and `warn` for dependencies.
+/// to `info` for our crates and `warn` for dependencies. The binary's own
+/// target is its `[[bin]]` name, `signalplayback`, not the package name.
 #[must_use]
 pub fn init() -> LogHandle {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,sp_app=info,sp_core=info"));
+        .unwrap_or_else(|_| EnvFilter::new("warn,signalplayback=info,sp_core=info,sp_store=info"));
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)

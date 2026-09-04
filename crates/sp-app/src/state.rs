@@ -4,52 +4,86 @@ use std::path::PathBuf;
 
 use iced::widget::{button, column, container, horizontal_rule, row, scrollable, text, Space};
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
+use sp_store::Store;
 
-use crate::paths;
-use crate::screens::{self, Screen, Section};
+use crate::screens::{self, library, properties, Screen, Section};
 
 /// Everything the UI reads.
 ///
-/// Later milestones add the store handle, the stage registry, the library
-/// index and the scope state alongside these; the screen state itself moves
-/// into the [`Screen`] variants.
+/// Screen state lives here rather than inside [`Screen`] so it survives
+/// navigation (§12.3). Later milestones add the stage registry and the scope
+/// state alongside.
 #[derive(Debug)]
 pub struct App {
     screen: Screen,
     theme: Theme,
-    library_root: Option<PathBuf>,
+    /// The open library, or `None` when opening it failed.
+    store: Option<Store>,
+    /// Why the library is not open, for the status bar.
+    store_error: Option<String>,
+    library: library::State,
+    properties: properties::State,
     log_dir: Option<PathBuf>,
 }
 
-/// Root message. Screen modules will own nested message types that this
-/// delegates to as they land.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Root message. Each built screen owns a nested message type this
+/// delegates to.
+#[derive(Debug, Clone)]
 pub enum Message {
     Nav(Screen),
     ToggleTheme,
+    Library(library::Message),
+    Properties(properties::Message),
 }
 
 impl App {
-    /// Boots the application. Nothing is read from disk yet — the library is
-    /// opened at M1.
-    pub fn new(log_dir: Option<PathBuf>) -> (Self, Task<Message>) {
-        let library_root = paths::default_library_root();
+    /// Boots the application and opens the library at `library_file`. A
+    /// library that will not open is reported in the status bar rather than
+    /// aborting: the app is still useful for looking at the design of the
+    /// other screens, and the Settings screen (M8) is where the path changes.
+    pub fn new(log_dir: Option<PathBuf>, library_file: Option<PathBuf>) -> (Self, Task<Message>) {
         tracing::info!(
-            library_root = ?library_root,
+            library = ?library_file,
             log_dir = ?log_dir,
             "SignalPlayback {} starting",
             env!("CARGO_PKG_VERSION"),
         );
 
-        (
-            Self {
-                screen: Screen::default(),
-                theme: Theme::Dark,
-                library_root,
-                log_dir,
+        let (store, store_error) = match library_file {
+            Some(path) => match Store::open(&path) {
+                Ok(store) => {
+                    tracing::info!(path = %path.display(), "library open");
+                    (Some(store), None)
+                }
+                Err(error) => {
+                    tracing::error!(%error, path = %path.display(), "could not open the library");
+                    (None, Some(error.to_string()))
+                }
             },
-            Task::none(),
-        )
+            None => (
+                None,
+                Some("no writable application data directory was found".to_owned()),
+            ),
+        };
+
+        let mut app = Self {
+            screen: Screen::default(),
+            theme: Theme::Dark,
+            store,
+            store_error,
+            library: library::State::default(),
+            properties: properties::State::default(),
+            log_dir,
+        };
+
+        let task = match app.store.clone() {
+            Some(store) => Task::batch([
+                app.library.load(&store).map(Message::Library),
+                app.properties.load(&store).map(Message::Properties),
+            ]),
+            None => Task::none(),
+        };
+        (app, task)
     }
 
     #[must_use]
@@ -69,6 +103,7 @@ impl App {
                     tracing::debug!(from = ?self.screen, to = ?screen, "navigate");
                     self.screen = screen;
                 }
+                Task::none()
             }
             Message::ToggleTheme => {
                 self.theme = if matches!(self.theme, Theme::Dark) {
@@ -76,9 +111,17 @@ impl App {
                 } else {
                     Theme::Dark
                 };
+                Task::none()
             }
+            Message::Library(message) => self
+                .library
+                .update(self.store.as_ref(), message)
+                .map(Message::Library),
+            Message::Properties(message) => self
+                .properties
+                .update(self.store.as_ref(), message)
+                .map(Message::Properties),
         }
-        Task::none()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -102,10 +145,16 @@ impl App {
 
     #[must_use]
     pub fn view(&self) -> Element<'_, Message> {
+        let body: Element<'_, Message> = match self.screen {
+            Screen::Library => self.library.view().map(Message::Library),
+            Screen::Properties => self.properties.view().map(Message::Properties),
+            other => screens::placeholder(other),
+        };
+
         let content = column![
             self.header(),
             horizontal_rule(1),
-            screens::placeholder(self.screen),
+            container(body).height(Length::Fill),
             horizontal_rule(1),
             self.status_bar(),
         ];
@@ -198,18 +247,46 @@ impl App {
     }
 
     fn status_bar(&self) -> Element<'_, Message> {
-        let describe = |label: &str, path: Option<&PathBuf>| {
-            let value = path.map_or_else(|| "unavailable".to_owned(), |p| p.display().to_string());
-            text(format!("{label}: {value}"))
+        let library: Element<'_, Message> = match (&self.store, &self.store_error) {
+            (Some(store), _) => {
+                let counts = self.library.summary().map_or_else(String::new, |s| {
+                    format!(
+                        " · {} dataset{} · {} group{} · {} signal{} · {} pulse field{} · {}",
+                        s.datasets,
+                        plural(s.datasets),
+                        s.groups,
+                        plural(s.groups),
+                        s.signals,
+                        plural(s.signals),
+                        s.pulse_fields,
+                        plural(s.pulse_fields),
+                        fmt_bytes(s.blob_bytes),
+                    )
+                });
+                text(format!("Library: {}{counts}", store.path().display()))
+                    .size(11)
+                    .style(text::secondary)
+                    .into()
+            }
+            (None, Some(error)) => text(format!("Library not open: {error}"))
                 .size(11)
-                .style(text::secondary)
+                .style(text::danger)
+                .into(),
+            (None, None) => text("Library: none").size(11).style(text::secondary).into(),
         };
+
+        let logs = self
+            .log_dir
+            .as_ref()
+            .map_or_else(|| "unavailable".to_owned(), |p| p.display().to_string());
 
         container(
             row![
-                describe("Library", self.library_root.as_ref()),
+                library,
                 Space::with_width(Length::Fixed(24.0)),
-                describe("Logs", self.log_dir.as_ref()),
+                text(format!("Logs: {logs}"))
+                    .size(11)
+                    .style(text::secondary),
             ]
             .align_y(Alignment::Center),
         )
@@ -219,12 +296,36 @@ impl App {
     }
 }
 
+fn plural(n: u64) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// Bytes with a binary prefix, one decimal.
+fn fmt_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new(None).0
+        App::new(None, None).0
     }
 
     #[test]
@@ -251,5 +352,41 @@ mod tests {
         assert!(matches!(app.theme(), Theme::Light));
         let _ = app.update(Message::ToggleTheme);
         assert!(matches!(app.theme(), Theme::Dark));
+    }
+
+    #[test]
+    fn without_a_library_path_the_app_still_boots() {
+        let app = app();
+        assert!(app.store.is_none());
+        assert!(app.store_error.is_some());
+    }
+
+    #[test]
+    fn a_library_path_opens_and_creates_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib").join("library.db");
+        let (app, _task) = App::new(None, Some(path.clone()));
+        assert!(app.store.is_some(), "{:?}", app.store_error);
+        assert!(path.exists());
+        drop(app);
+    }
+
+    #[test]
+    fn an_unopenable_library_is_reported_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be.
+        let path = dir.path().join("library.db");
+        std::fs::create_dir_all(&path).unwrap();
+        let (app, _task) = App::new(None, Some(path));
+        assert!(app.store.is_none());
+        assert!(app.store_error.is_some());
+    }
+
+    #[test]
+    fn bytes_format_with_binary_prefixes() {
+        assert_eq!(fmt_bytes(0), "0 B");
+        assert_eq!(fmt_bytes(1023), "1023 B");
+        assert_eq!(fmt_bytes(1536), "1.5 KiB");
+        assert_eq!(fmt_bytes(5 * 1024 * 1024), "5.0 MiB");
     }
 }

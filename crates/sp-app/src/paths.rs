@@ -21,6 +21,12 @@ pub fn default_library_root() -> Option<PathBuf> {
     app_data_dir().map(|dir| dir.join("library"))
 }
 
+/// The library file a first run opens: one SQLite file holding everything.
+#[must_use]
+pub fn default_library_file() -> Option<PathBuf> {
+    default_library_root().map(|dir| dir.join("library.db"))
+}
+
 /// Directory for the rolling application log.
 #[must_use]
 pub fn log_dir() -> Option<PathBuf> {

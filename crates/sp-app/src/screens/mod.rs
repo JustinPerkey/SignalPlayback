@@ -1,9 +1,13 @@
 //! The application's screens (`docs/DESIGN.md` §12.1).
 //!
-//! At M0 a screen is just an identity plus its description: navigation works,
-//! the surfaces are empty. Each variant gains its own `State`/`Message`/
-//! `update`/`view` module as its milestone lands, at which point [`Screen`]
-//! starts carrying that state as a payload (§12.2).
+//! [`Screen`] is the identity used for navigation; a screen's own
+//! `State`/`Message`/`update`/`view` live in its module and are owned by the
+//! root [`crate::state::App`], so a screen's state survives switching away
+//! from it (§12.3). Screens whose milestone has not landed show
+//! [`placeholder`].
+
+pub mod library;
+pub mod properties;
 
 use iced::widget::{column, container, row, text, text::secondary, Space};
 use iced::{Element, Length};
@@ -220,7 +224,7 @@ pub fn placeholder(screen: Screen) -> Element<'static, Message> {
         Space::with_height(Length::Fixed(10.0)),
         text(screen.purpose()).size(15),
         Space::with_height(Length::Fixed(24.0)),
-        text("Not built yet — navigation, logging and the domain model are what M0 delivers.")
+        text("Not built yet — this screen arrives with its milestone.")
             .size(13)
             .style(secondary),
     ]
