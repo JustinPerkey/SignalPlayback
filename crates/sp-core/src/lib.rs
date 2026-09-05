@@ -14,7 +14,8 @@ pub mod stats;
 pub mod time;
 
 pub use artifact::{
-    Artifact, ArtifactSchema, ColumnSpec, FieldKind, FieldRef, FieldSpec, OverlayForm, ViewHint,
+    Artifact, ArtifactData, ArtifactRegistry, ArtifactSchema, ColumnSpec, FieldKind, FieldRef,
+    FieldSpec, OverlayForm, ViewHint,
 };
 pub use group::{
     Dataset, DatasetId, GroupId, GroupMeta, SignalGroup, SignalTrain, SourceKind, TrainId,

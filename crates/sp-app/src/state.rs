@@ -7,7 +7,7 @@ use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
 use sp_store::Store;
 
 use crate::screens::{
-    self, generate, import, library, pipeline, properties, scope, Screen, Section,
+    self, generate, import, library, pipeline, properties, results, scope, Screen, Section,
 };
 
 /// Everything the UI reads.
@@ -29,6 +29,9 @@ pub struct App {
     generate: generate::State,
     pipeline: pipeline::State,
     properties: properties::State,
+    /// The results screen keeps its run, group and stage selection — and its
+    /// playhead — across navigation, for the same reason the scope does.
+    results: results::State,
     /// Playback state survives navigation, so comparing two screens never
     /// costs the user their place (§12.3).
     scope: scope::State,
@@ -46,6 +49,7 @@ pub enum Message {
     Generate(generate::Message),
     Pipeline(pipeline::Message),
     Properties(properties::Message),
+    Results(results::Message),
     Scope(scope::Message),
 }
 
@@ -89,6 +93,7 @@ impl App {
             generate: generate::State::default(),
             pipeline: pipeline::State::default(),
             properties: properties::State::default(),
+            results: results::State::default(),
             scope: scope::State::default(),
             log_dir,
         };
@@ -100,6 +105,7 @@ impl App {
                 app.generate.load(&store).map(Message::Generate),
                 app.pipeline.load(&store).map(Message::Pipeline),
                 app.properties.load(&store).map(Message::Properties),
+                app.results.load(&store).map(Message::Results),
                 app.scope.load(&store).map(Message::Scope),
             ]),
             None => Task::none(),
@@ -179,6 +185,7 @@ impl App {
                     (true, Some(store)) => Task::batch([
                         task,
                         self.library.load(&store).map(Message::Library),
+                        self.results.load(&store).map(Message::Results),
                         self.scope.load(&store).map(Message::Scope),
                     ]),
                     _ => task,
@@ -188,6 +195,10 @@ impl App {
                 .properties
                 .update(self.store.as_ref(), message)
                 .map(Message::Properties),
+            Message::Results(message) => self
+                .results
+                .update(self.store.as_ref(), message)
+                .map(Message::Results),
             Message::Scope(message) => self
                 .scope
                 .update(self.store.as_ref(), message)
@@ -200,8 +211,10 @@ impl App {
             self.import.subscription().map(Message::Import),
             self.generate.subscription().map(Message::Generate),
             self.pipeline.subscription().map(Message::Pipeline),
+            self.results.subscription().map(Message::Results),
             self.scope.subscription().map(Message::Scope),
             self.transport_shortcuts(),
+            self.results_shortcuts(),
             Self::shortcuts(),
         ])
     }
@@ -234,6 +247,30 @@ impl App {
         })
     }
 
+    /// Keyboard on the Results screen (§10.2): left and right walk the stage
+    /// rail, so stepping through an algorithm is one key, and space plays.
+    fn results_shortcuts(&self) -> Subscription<Message> {
+        use keyboard::key::Named;
+
+        if self.screen != Screen::Results {
+            return Subscription::none();
+        }
+        keyboard::on_key_press(|key, modifiers| {
+            if modifiers.command() || modifiers.alt() {
+                return None;
+            }
+            let message = match key.as_ref() {
+                keyboard::Key::Named(Named::ArrowLeft) => results::Message::StepStage(-1),
+                keyboard::Key::Named(Named::ArrowRight) => results::Message::StepStage(1),
+                keyboard::Key::Named(Named::Space) => results::Message::Toggle,
+                keyboard::Key::Named(Named::Home) => results::Message::SeekFraction(0.0),
+                keyboard::Key::Named(Named::End) => results::Message::SeekFraction(1.0),
+                _ => return None,
+            };
+            Some(Message::Results(message))
+        })
+    }
+
     fn shortcuts() -> Subscription<Message> {
         keyboard::on_key_press(|key, modifiers| {
             if !modifiers.command() {
@@ -261,6 +298,7 @@ impl App {
             Screen::Generate => self.generate.view().map(Message::Generate),
             Screen::Pipeline => self.pipeline.view().map(Message::Pipeline),
             Screen::Properties => self.properties.view().map(Message::Properties),
+            Screen::Results => self.results.view().map(Message::Results),
             Screen::Scope => self.scope.view().map(Message::Scope),
             other => screens::placeholder(other),
         };

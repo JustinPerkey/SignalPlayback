@@ -5,8 +5,14 @@
 //! schema and a [`ViewHint`] telling the results screen how to draw it. Adding
 //! a new artifact kind costs one `impl` — no storage code, no viewer code.
 
+pub mod data;
+pub mod registry;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+pub use data::{diff, ArtifactData, Column, DataError, FieldDiff};
+pub use registry::{ArtifactRegistry, KindInfo, RegistryError};
 
 /// A typed, persistable stage output.
 pub trait Artifact: Serialize + DeserializeOwned + Send + Sync + 'static {
@@ -33,6 +39,16 @@ impl ArtifactSchema {
     #[must_use]
     pub fn new(fields: Vec<FieldSpec>, view: ViewHint) -> Self {
         Self { fields, view }
+    }
+
+    /// The schema an unregistered kind is read against: no declared fields,
+    /// so the viewer shows the payload as a JSON tree (§10.1).
+    #[must_use]
+    pub fn opaque() -> Self {
+        Self {
+            fields: Vec::new(),
+            view: ViewHint::Tree,
+        }
     }
 
     #[must_use]

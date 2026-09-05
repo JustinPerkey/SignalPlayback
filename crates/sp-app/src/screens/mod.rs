@@ -11,6 +11,7 @@ pub mod import;
 pub mod library;
 pub mod pipeline;
 pub mod properties;
+pub mod results;
 pub mod scope;
 
 use iced::widget::{column, container, row, text, text::secondary, Space};
