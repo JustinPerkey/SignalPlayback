@@ -476,7 +476,7 @@ pub(crate) fn stats_from_columns(
 
 const SIGNAL_COLUMNS: &str = "id, group_id, ordinal, name, units, dtype, domain, provenance,
      sample_rate_hz, t0_s, sample_count, min_value, max_value, mean_value, rms_value,
-     nan_count, attributes";
+     nan_count, attributes, derived_run_id, derived_stage_ordinal";
 
 fn signal_from_row(row: &Row<'_>) -> Result<Signal> {
     let dtype: DType = row.get::<_, String>(5)?.parse()?;
@@ -484,11 +484,9 @@ fn signal_from_row(row: &Row<'_>) -> Result<Signal> {
     let provenance = match row.get::<_, String>(7)?.as_str() {
         "imported" => Provenance::Imported,
         "generated" => Provenance::Generated,
-        // The run/stage detail arrives with the run tables (M5); until then a
-        // derived signal is recorded as derived from nothing in particular.
         "derived" => Provenance::Derived {
-            run_id: RunId::new(0),
-            stage_ordinal: 0,
+            run_id: RunId::new(row.get::<_, Option<i64>>(17)?.unwrap_or(0)),
+            stage_ordinal: row.get::<_, Option<i64>>(18)?.unwrap_or(0).max(0) as u16,
         },
         other => {
             return Err(StoreError::corrupt(format!("unknown provenance '{other}'")));

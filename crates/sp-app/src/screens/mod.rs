@@ -9,6 +9,7 @@
 pub mod generate;
 pub mod import;
 pub mod library;
+pub mod pipeline;
 pub mod properties;
 pub mod scope;
 

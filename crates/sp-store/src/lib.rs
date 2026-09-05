@@ -22,6 +22,7 @@ pub mod profiles;
 pub mod props;
 pub mod pulses;
 pub mod pyramid;
+pub mod runs;
 pub mod trains;
 pub mod verify;
 
@@ -33,6 +34,10 @@ pub use profiles::SavedProfile;
 pub use props::PropertyQuery;
 pub use pulses::{NewPulseField, NewPulseGroup, PulsePredicate};
 pub use pyramid::PyramidRef;
+pub use runs::{
+    ArtifactRow, CacheHit, NewArtifact, NewPipeline, NewRun, NewRunSignal, PipelineRow,
+    PipelineStageRow, RunGroupRow, RunRow, RunSignalRow, RunStageRow, SOURCE_STAGE,
+};
 pub use trains::NewTrain;
 pub use verify::VerifyReport;
 
