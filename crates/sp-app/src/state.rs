@@ -6,7 +6,9 @@ use iced::widget::{button, column, container, horizontal_rule, row, scrollable, 
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
 use sp_store::Store;
 
-use crate::screens::{self, generate, import, library, properties, scope, Screen, Section};
+use crate::screens::{
+    self, generate, import, library, pipeline, properties, scope, Screen, Section,
+};
 
 /// Everything the UI reads.
 ///
@@ -25,6 +27,7 @@ pub struct App {
     library: library::State,
     import: import::State,
     generate: generate::State,
+    pipeline: pipeline::State,
     properties: properties::State,
     /// Playback state survives navigation, so comparing two screens never
     /// costs the user their place (§12.3).
@@ -41,6 +44,7 @@ pub enum Message {
     Library(library::Message),
     Import(import::Message),
     Generate(generate::Message),
+    Pipeline(pipeline::Message),
     Properties(properties::Message),
     Scope(scope::Message),
 }
@@ -83,6 +87,7 @@ impl App {
             library: library::State::default(),
             import: import::State::default(),
             generate: generate::State::default(),
+            pipeline: pipeline::State::default(),
             properties: properties::State::default(),
             scope: scope::State::default(),
             log_dir,
@@ -93,6 +98,7 @@ impl App {
                 app.library.load(&store).map(Message::Library),
                 app.import.load(&store).map(Message::Import),
                 app.generate.load(&store).map(Message::Generate),
+                app.pipeline.load(&store).map(Message::Pipeline),
                 app.properties.load(&store).map(Message::Properties),
                 app.scope.load(&store).map(Message::Scope),
             ]),
@@ -162,6 +168,22 @@ impl App {
                     _ => task,
                 }
             }
+            Message::Pipeline(message) => {
+                let task = self
+                    .pipeline
+                    .update(self.store.as_ref(), message)
+                    .map(Message::Pipeline);
+                // A finished run leaves derived signals and artifacts behind,
+                // which the library's counts and the scope both read.
+                match (self.pipeline.take_completed(), self.store.clone()) {
+                    (true, Some(store)) => Task::batch([
+                        task,
+                        self.library.load(&store).map(Message::Library),
+                        self.scope.load(&store).map(Message::Scope),
+                    ]),
+                    _ => task,
+                }
+            }
             Message::Properties(message) => self
                 .properties
                 .update(self.store.as_ref(), message)
@@ -177,6 +199,7 @@ impl App {
         Subscription::batch([
             self.import.subscription().map(Message::Import),
             self.generate.subscription().map(Message::Generate),
+            self.pipeline.subscription().map(Message::Pipeline),
             self.scope.subscription().map(Message::Scope),
             self.transport_shortcuts(),
             Self::shortcuts(),
@@ -236,6 +259,7 @@ impl App {
             Screen::Library => self.library.view().map(Message::Library),
             Screen::Import => self.import.view().map(Message::Import),
             Screen::Generate => self.generate.view().map(Message::Generate),
+            Screen::Pipeline => self.pipeline.view().map(Message::Pipeline),
             Screen::Properties => self.properties.view().map(Message::Properties),
             Screen::Scope => self.scope.view().map(Message::Scope),
             other => screens::placeholder(other),

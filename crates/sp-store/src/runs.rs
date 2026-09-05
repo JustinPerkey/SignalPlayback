@@ -201,6 +201,19 @@ pub fn pipeline_stages(conn: &Connection, id: PipelineId) -> Result<Vec<Pipeline
     rows.collect()
 }
 
+/// Renames a saved pipeline. What a pipeline is called changes no result, so
+/// this leaves its runs and their hashes alone.
+pub fn rename_pipeline(conn: &Connection, id: PipelineId, name: &str) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE pipeline SET name = ?1 WHERE id = ?2",
+        params![name, id.get()],
+    )?;
+    if changed == 0 {
+        return Err(StoreError::not_found("pipeline", id.get()));
+    }
+    Ok(())
+}
+
 /// Deletes a pipeline and every run of it, releasing the runs' blobs.
 pub fn delete_pipeline(conn: &Connection, id: PipelineId) -> Result<()> {
     for run in list_runs(conn, Some(id))? {
