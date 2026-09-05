@@ -1237,6 +1237,28 @@ CREATE TABLE baseline (
     created_utc TEXT NOT NULL,
     tolerance_json TEXT NOT NULL DEFAULT '{}'
 );
+
+-- Assertions belong to the pipeline as source text (§9.7) and are evaluated
+-- per group; each outcome records the text it was evaluated from, so a run
+-- says what it actually tested after the pipeline has been edited.
+CREATE TABLE pipeline_assertion (
+    pipeline_id INTEGER NOT NULL REFERENCES pipeline(id) ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL,
+    expression  TEXT    NOT NULL,      -- 'metrics.snr_db > 12.0'
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (pipeline_id, ordinal)
+);
+CREATE TABLE run_assertion (
+    run_id     INTEGER NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+    group_id   INTEGER NOT NULL,
+    ordinal    INTEGER NOT NULL,
+    expression TEXT    NOT NULL,
+    status     TEXT    NOT NULL
+               CHECK (status IN ('pass','fail','not_applicable','error')),
+    actual     REAL, expected REAL,
+    message    TEXT,
+    PRIMARY KEY (run_id, group_id, ordinal)
+);
 ```
 
 `stage_ordinal = -1` records the source signals as they entered the pipeline, so "before"
@@ -1256,6 +1278,13 @@ stage[3].wall_ms < 250
 
 Each assertion resolves to pass / fail / not-applicable, and the run's status aggregates
 them. Failures name the group, the assertion, and the actual value.
+
+Not-applicable is a first-class outcome rather than a quiet pass: an assertion about an
+artifact a group never produced, or one comparing against a baseline when no baseline was
+given, has nothing to say — and a suite whose subjects have stopped existing must not go
+green. An assertion that *cannot* be evaluated — a baseline with no such value, a text
+value under `<` — fails, for the same reason. An assertion judges a finished group, so a
+group whose stages did not all run is not asked: it has already failed.
 
 ### 9.8 Built-in Stages (`sp-dsp`)
 
