@@ -5,7 +5,7 @@
 //! The crate is organised in two layers:
 //!
 //! - **Row-level functions** in [`blob`], [`library`], [`profiles`], [`props`],
-//!   [`pulses`] and [`verify`] take a `&rusqlite::Connection` (a `Transaction` derefs to
+//!   [`pulses`], [`regress`] and [`verify`] take a `&rusqlite::Connection` (a `Transaction` derefs to
 //!   one) and do exactly one thing. They are what tests exercise, and what a
 //!   job composes inside a transaction.
 //! - **[`Store`]** owns the connections: a single writer connection on its own
@@ -22,6 +22,7 @@ pub mod profiles;
 pub mod props;
 pub mod pulses;
 pub mod pyramid;
+pub mod regress;
 pub mod runs;
 pub mod trains;
 pub mod verify;
@@ -34,6 +35,7 @@ pub use profiles::SavedProfile;
 pub use props::PropertyQuery;
 pub use pulses::{NewPulseField, NewPulseGroup, PulsePredicate};
 pub use pyramid::PyramidRef;
+pub use regress::{AssertionResultRow, AssertionRow, BaselineRow};
 pub use runs::{
     ArtifactRow, CacheHit, NewArtifact, NewPipeline, NewRun, NewRunSignal, PipelineRow,
     PipelineStageRow, RunGroupRow, RunRow, RunSignalRow, RunStageRow, SOURCE_STAGE,

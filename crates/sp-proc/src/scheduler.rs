@@ -8,6 +8,7 @@
 //!         output ← cache.get(key)  or  stage.process(ctx, frame)
 //!         record(run, group, stage, output)
 //!         frame ← frame.apply(output)
+//!     evaluate(assertions, over what the group recorded)      # §9.7
 //! ```
 //!
 //! Groups are independent, which is what makes them both the unit of
@@ -23,13 +24,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use sp_core::run::{Disposition, RunStatus, StageStatus};
+use sp_core::run::{AssertStatus, Disposition, RunStatus, StageStatus};
 use sp_core::{DatasetId, GroupId, PipelineId, RunId};
+use sp_store::regress::{self, AssertionResultRow};
 use sp_store::runs::{
     self, CacheHit, NewArtifact, NewRun, NewRunSignal, RunGroupRow, RunStageRow, SOURCE_STAGE,
 };
 use sp_store::{library, Store};
 
+use crate::assert::GroupFacts;
 use crate::cache;
 use crate::error::{ProcError, Result, StageError};
 use crate::frame::{GroupFrame, SignalRef};
@@ -133,6 +136,10 @@ pub struct RunOptions {
     pub use_cache: bool,
     /// Recorded on the run, for the dataset the groups came from.
     pub dataset_id: Option<DatasetId>,
+    /// The run a `baseline` reference in an assertion resolves against
+    /// (§9.7). Without one, such assertions are not applicable rather than
+    /// failed — they had nothing to compare to.
+    pub baseline_run: Option<RunId>,
     pub notes: Option<String>,
 }
 
@@ -145,6 +152,7 @@ impl Default for RunOptions {
                 .clamp(1, 8),
             use_cache: true,
             dataset_id: None,
+            baseline_run: None,
             notes: None,
         }
     }
@@ -170,6 +178,13 @@ impl RunOptions {
         self.in_flight_cap = cap.max(1);
         self
     }
+
+    /// Resolves `baseline` in assertions against this run (§9.7).
+    #[must_use]
+    pub fn against_baseline(mut self, run: RunId) -> Self {
+        self.baseline_run = Some(run);
+        self
+    }
 }
 
 /// How a finished run turned out.
@@ -183,6 +198,11 @@ pub struct RunSummary {
     pub stages_run: usize,
     /// Stages whose output was reused (§9.5).
     pub stages_cached: usize,
+    /// Assertions that passed, across every group (§9.7).
+    pub assertions_passed: usize,
+    /// Assertions that failed or could not be evaluated. Non-zero means the
+    /// run failed even if every stage ran.
+    pub assertions_failed: usize,
     pub wall_ms: u64,
 }
 
@@ -190,7 +210,7 @@ impl RunSummary {
     /// One line for the status bar.
     #[must_use]
     pub fn describe(&self) -> String {
-        format!(
+        let mut line = format!(
             "{}: {} group(s) ok, {} failed, {} stage(s) run, {} cached, {} ms",
             self.status.label(),
             self.groups_ok,
@@ -198,7 +218,14 @@ impl RunSummary {
             self.stages_run,
             self.stages_cached,
             self.wall_ms
-        )
+        );
+        if self.assertions_passed + self.assertions_failed > 0 {
+            line.push_str(&format!(
+                "; {} assertion(s) passed, {} failed",
+                self.assertions_passed, self.assertions_failed
+            ));
+        }
+        line
     }
 }
 
@@ -254,6 +281,8 @@ pub fn run_pipeline(
         groups_failed: 0,
         stages_run: 0,
         stages_cached: 0,
+        assertions_passed: 0,
+        assertions_failed: 0,
         wall_ms: 0,
     };
     let mut store_error = None;
@@ -262,6 +291,8 @@ pub fn run_pipeline(
             Ok(group) => {
                 summary.stages_run += group.stages_run;
                 summary.stages_cached += group.stages_cached;
+                summary.assertions_passed += group.assertions_passed;
+                summary.assertions_failed += group.assertions_failed;
                 if group.status == RunStatus::Ok {
                     summary.groups_ok += 1;
                 } else {
@@ -324,6 +355,8 @@ struct GroupOutcome {
     status: RunStatus,
     stages_run: usize,
     stages_cached: usize,
+    assertions_passed: usize,
+    assertions_failed: usize,
 }
 
 /// Fans out over groups, bounded by `in_flight_cap`. Stage order within a
@@ -401,6 +434,8 @@ fn run_group(ctx: &RunEnv<'_>, group_id: GroupId) -> Result<GroupOutcome> {
         status: RunStatus::Ok,
         stages_run: 0,
         stages_cached: 0,
+        assertions_passed: 0,
+        assertions_failed: 0,
     };
 
     for (position, (ordinal, stage)) in ctx.pipeline.enabled().enumerate() {
@@ -466,6 +501,21 @@ fn run_group(ctx: &RunEnv<'_>, group_id: GroupId) -> Result<GroupOutcome> {
         }
     }
 
+    // Assertions are a question asked of a finished group, so a group that
+    // did not finish is not asked: it has already failed, and evaluating over
+    // a half-run pipeline would report failures that are consequences rather
+    // than causes.
+    let mut message = None;
+    if outcome.status == RunStatus::Ok {
+        let report = evaluate_assertions(ctx, group_id)?;
+        outcome.assertions_passed = report.passed;
+        outcome.assertions_failed = report.failed;
+        if report.failed > 0 {
+            outcome.status = RunStatus::Failed;
+            message = Some(report.message);
+        }
+    }
+
     let wall_ms = started.elapsed().as_millis() as u64;
     let status = outcome.status;
     ctx.store.write(move |conn| {
@@ -476,11 +526,91 @@ fn run_group(ctx: &RunEnv<'_>, group_id: GroupId) -> Result<GroupOutcome> {
                 group_id,
                 status,
                 wall_ms: Some(wall_ms),
-                message: None,
+                message,
             },
         )
     })?;
     Ok(outcome)
+}
+
+/// How one group's assertions turned out.
+struct AssertionReport {
+    passed: usize,
+    failed: usize,
+    /// The first failure, which is what the group row shows.
+    message: String,
+}
+
+/// Evaluates the pipeline's assertions over what this group recorded (§9.7).
+///
+/// The facts come from the run tables rather than from the live frame, so an
+/// assertion sees exactly what a later reader of the run would — and so the
+/// same code can re-evaluate an old run against a baseline.
+fn evaluate_assertions(ctx: &RunEnv<'_>, group_id: GroupId) -> Result<AssertionReport> {
+    let mut report = AssertionReport {
+        passed: 0,
+        failed: 0,
+        message: String::new(),
+    };
+    if ctx.pipeline.enabled_assertions().next().is_none() {
+        return Ok(report);
+    }
+
+    let facts = GroupFacts::from_run(&ctx.store, ctx.run, group_id)?;
+    let baseline = match ctx.options.baseline_run {
+        Some(run) => match GroupFacts::from_run(&ctx.store, run, group_id) {
+            Ok(facts) => Some(facts),
+            // A group the baseline never covered is not a fault of this run;
+            // assertions against it come out not-applicable below.
+            Err(error) => {
+                tracing::warn!(%error, group = group_id.get(), "the baseline has no such group");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let mut rows = Vec::new();
+    for (ordinal, assertion) in ctx.pipeline.enabled_assertions() {
+        // Validation refused the run if any assertion did not parse, so this
+        // only skips one that was disabled mid-flight.
+        let Ok(parsed) = assertion.parsed() else {
+            continue;
+        };
+        let outcome = parsed.evaluate(&facts, baseline.as_ref());
+        if outcome.status.is_failure() {
+            report.failed += 1;
+            if report.message.is_empty() {
+                report.message = match &outcome.message {
+                    Some(why) => format!("{}: {why}", assertion.source),
+                    None => assertion.source.clone(),
+                };
+            }
+        } else if outcome.status == AssertStatus::Pass {
+            report.passed += 1;
+        }
+
+        let mut row = AssertionResultRow::new(
+            group_id,
+            ordinal as u32,
+            assertion.source.clone(),
+            outcome.status,
+        )
+        .with_values(outcome.actual, outcome.expected);
+        if let Some(why) = outcome.message {
+            row = row.with_message(why);
+        }
+        rows.push(row);
+    }
+
+    let run = ctx.run;
+    ctx.store.write(move |conn| {
+        for row in &rows {
+            regress::record_assertion(conn, run, row)?;
+        }
+        Ok(())
+    })?;
+    Ok(report)
 }
 
 /// Loads a group's metadata and lazy signal handles.

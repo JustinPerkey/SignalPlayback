@@ -13,7 +13,9 @@
 //!    └── run_pipeline ──► GroupFrame ──process──► StageOutput ──► run tables
 //! ```
 
+pub mod assert;
 pub mod cache;
+pub mod compare;
 pub mod error;
 pub mod frame;
 pub mod param;
@@ -22,10 +24,12 @@ pub mod registry;
 pub mod scheduler;
 pub mod stage;
 
+pub use assert::{AssertError, Assertion, GroupFacts, Outcome as AssertOutcome, Subject};
+pub use compare::{check_baseline, diff_runs, BaselineReport, DiffOptions, RunDiff};
 pub use error::{ConfigError, ProcError, Result, StageError};
 pub use frame::{GroupFrame, PortMap, PortValue, SignalRef};
 pub use param::{ParamDefault, ParamKind, ParamSet, ParamSpec};
-pub use pipeline::{Pipeline, PipelineIssue, PipelineStage};
+pub use pipeline::{Pipeline, PipelineAssertion, PipelineIssue, PipelineStage};
 pub use registry::{Registration, RegistryError, StageFactory, StageRegistry};
 pub use scheduler::{run_pipeline, RunControl, RunOptions, RunProgress, RunSummary};
 pub use stage::{

@@ -362,7 +362,20 @@ pub fn list_runs(conn: &Connection, pipeline: Option<PipelineId>) -> Result<Vec<
 /// Deletes a run and releases every blob it held a reference on. Cascades take
 /// the rows; the refcounts have to be walked by hand first, because a blob may
 /// be shared with a signal in the library or with another run.
+///
+/// A run a baseline names is refused: the baseline's golden data *is* the
+/// run's rows (§10.4), so deleting it would leave every later comparison with
+/// nothing to compare against. Drop the baseline first, or promote another run
+/// under the same name.
 pub fn delete_run(conn: &Connection, id: RunId) -> Result<()> {
+    let named = crate::regress::baselines_of_run(conn, id)?;
+    if let Some(baseline) = named.first() {
+        return Err(StoreError::invalid(format!(
+            "run {} is the baseline '{}'",
+            id.get(),
+            baseline.name
+        )));
+    }
     let mut blobs = Vec::new();
     {
         let mut stmt = conn.prepare(
@@ -905,6 +918,28 @@ pub fn stage_artifacts(
     ))?;
     let rows = stmt.query_and_then(
         params![run.get(), stage_ordinal, group.map(GroupId::get)],
+        artifact_from_row,
+    )?;
+    rows.collect()
+}
+
+/// Every artifact of one group of a run, in stage then insertion order — or,
+/// with `group` as `None`, the run-level ones.
+///
+/// Assertions and diffs read a whole group's artifacts at once rather than
+/// stage by stage: they are addressed by port, not by where they came from.
+pub fn run_artifacts(
+    conn: &Connection,
+    run: RunId,
+    group: Option<GroupId>,
+) -> Result<Vec<ArtifactRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ARTIFACT_COLUMNS} FROM artifact
+         WHERE run_id = ?1 AND group_id IS ?2
+         ORDER BY stage_ordinal, id"
+    ))?;
+    let rows = stmt.query_and_then(
+        params![run.get(), group.map(GroupId::get)],
         artifact_from_row,
     )?;
     rows.collect()

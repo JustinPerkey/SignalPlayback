@@ -8,6 +8,7 @@
 // builds keep the console so `tracing` output is visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cli;
 mod jobs;
 mod logging;
 mod paths;
@@ -23,6 +24,15 @@ fn main() -> iced::Result {
     // Held for the life of the process: dropping it stops the log writer.
     let log = logging::init();
     let log_dir = log.dir.clone();
+
+    // A subcommand runs headlessly and exits; the window opens only when
+    // there is none (§10.4). The log guard is dropped by `exit` unwinding
+    // nothing, so the CLI flushes through `drop(log)` first.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let cli::Invocation::Exited(code) = cli::dispatch(&args) {
+        drop(log);
+        std::process::exit(code);
+    }
 
     let result = iced::application(App::title, App::update, App::view)
         .subscription(App::subscription)

@@ -11,7 +11,7 @@ pub mod registry;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub use data::{diff, ArtifactData, Column, DataError, FieldDiff};
+pub use data::{diff, infer_schema, ArtifactData, Column, DataError, FieldDiff};
 pub use registry::{ArtifactRegistry, KindInfo, RegistryError};
 
 /// A typed, persistable stage output.
