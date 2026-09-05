@@ -17,6 +17,7 @@ pub mod filter;
 pub mod measure;
 pub mod util;
 
+use sp_core::artifact::{ArtifactRegistry, RegistryError as ArtifactRegistryError};
 use sp_core::{DType, SampleBuffer};
 use sp_proc::registry::{RegistryError, StageFactory, StageRegistry};
 use sp_proc::stage::{PortKind, PortSpec};
@@ -56,6 +57,18 @@ pub fn builtins() -> Vec<StageFactory> {
 pub fn registry() -> Result<StageRegistry, RegistryError> {
     let mut registry = StageRegistry::new();
     registry.register_all(builtins())?;
+    Ok(registry)
+}
+
+/// A registry holding every artifact kind the built-in stages emit.
+///
+/// The results screen decodes a stored payload through this: an artifact row
+/// carries a kind string, and the schema is what turns it back into something
+/// drawable (§10.1).
+pub fn artifact_registry() -> Result<ArtifactRegistry, ArtifactRegistryError> {
+    let mut registry = ArtifactRegistry::new();
+    registry.register::<Statistics>()?;
+    registry.register::<Detections>()?;
     Ok(registry)
 }
 
@@ -171,6 +184,21 @@ pub(crate) mod tests {
         for descriptor in registry().unwrap().descriptors() {
             assert!(descriptor.pure, "{}", descriptor.kind);
         }
+    }
+
+    #[test]
+    fn every_artifact_a_builtin_declares_is_registered() {
+        // A stage that writes an artifact kind nothing can decode would show
+        // as a JSON tree, which is the fallback rather than the intent.
+        let artifacts = artifact_registry().unwrap();
+        for descriptor in registry().unwrap().descriptors() {
+            for port in descriptor.outputs {
+                if let PortKind::Artifact(kind) = port.kind {
+                    assert!(artifacts.contains(kind), "{kind} is not registered");
+                }
+            }
+        }
+        assert_eq!(artifacts.len(), 2);
     }
 
     #[test]

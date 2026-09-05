@@ -650,6 +650,9 @@ impl State {
 
         let program = canvas_scope::Scope {
             traces: views,
+            // Overlay artifacts belong to a run; the Results screen is where
+            // one is loaded (§10.3).
+            overlays: Vec::new(),
             viewport: &self.viewport,
             playhead_s: self.transport.playhead_s(),
             loop_range: self.transport.range(),

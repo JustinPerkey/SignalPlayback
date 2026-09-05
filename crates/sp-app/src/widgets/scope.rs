@@ -8,10 +8,11 @@
 //! | Traces | Signal geometry from the pyramid | Viewport or signal set changes |
 //! | Overlay | Playhead, cursor, loop band, selection | Every frame (cheap) |
 //!
-//! The grid and trace layers are [`Cache`]s the screen clears when their
-//! inputs change; the overlay is drawn fresh each frame, which is what keeps a
-//! playhead tick inside its 0.5 ms budget (§13). M6 adds an artifacts layer
-//! between the traces and the overlay.
+//! | Artifacts | Overlay artifacts on the shared time axis | Viewport or artifact set changes |
+//!
+//! The grid, trace and artifact layers are [`Cache`]s the screen clears when
+//! their inputs change; the overlay is drawn fresh each frame, which is what
+//! keeps a playhead tick inside its 0.5 ms budget (§13).
 //!
 //! The canvas draws from [`TraceSnapshot`]s the engine already reduced — it
 //! never touches a sample.
@@ -21,7 +22,7 @@ use iced::mouse;
 use iced::widget::canvas::{self, Cache, Frame, Geometry, Path, Stroke, Text};
 use iced::{keyboard, Color, Point, Rectangle, Renderer, Size, Theme, Vector};
 use sp_core::stats::MinMax;
-use sp_core::TimeRange;
+use sp_core::{OverlayForm, TimeRange};
 use sp_engine::reduce::{LogicLevel, TraceForm, TraceGeometry, TraceSnapshot};
 use sp_engine::Viewport;
 
@@ -97,19 +98,43 @@ pub enum Action {
     Resized(f32),
 }
 
+/// One row of an overlay artifact, placed on the shared time axis (§10.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayItem {
+    pub span: TimeRange,
+    /// The row's magnitude, for the forms that have a height.
+    pub value: Option<f64>,
+    pub label: String,
+}
+
+/// One overlay artifact as the canvas sees it.
+#[derive(Debug, Clone)]
+pub struct OverlayView {
+    pub form: OverlayForm,
+    pub colour: Color,
+    /// Owned: a pane's rows are kilobytes, and the canvas is rebuilt per
+    /// frame anyway.
+    pub items: Vec<OverlayItem>,
+    /// The row under the playhead, drawn emphasised so the table and the
+    /// scope agree about which detection is current (§10.3).
+    pub current: Option<usize>,
+}
+
 /// The canvas layers that survive between frames.
 #[derive(Debug, Default)]
 pub struct Caches {
     pub grid: Cache,
     pub traces: Cache,
+    pub artifacts: Cache,
 }
 
 impl Caches {
-    /// Invalidates the geometry that depends on the viewport — which is both
-    /// layers, since the traces are reduced against it.
+    /// Invalidates the geometry that depends on the viewport — which is every
+    /// cached layer, since the traces are reduced against it.
     pub fn clear(&self) {
         self.grid.clear();
         self.traces.clear();
+        self.artifacts.clear();
     }
 }
 
@@ -147,6 +172,8 @@ const ZOOM_STEP: f64 = 1.25;
 #[derive(Debug)]
 pub struct Scope<'a> {
     pub traces: Vec<TraceView<'a>>,
+    /// Artifacts drawn on the signals' own time axis (§10.1).
+    pub overlays: Vec<OverlayView>,
     pub viewport: &'a Viewport,
     pub playhead_s: f64,
     pub loop_range: TimeRange,
@@ -329,6 +356,12 @@ impl canvas::Program<Action> for Scope<'_> {
             }
         });
 
+        let artifacts = self.caches.artifacts.draw(renderer, size, |frame| {
+            for overlay in &self.overlays {
+                draw_overlay(frame, self.viewport, overlay, size);
+            }
+        });
+
         let mut overlay = Frame::new(renderer, size);
         draw_loop_band(&mut overlay, self.viewport, self.loop_range, palette, size);
         if let Some((from, to)) = state.band() {
@@ -355,7 +388,7 @@ impl canvas::Program<Action> for Scope<'_> {
             draw_cursor(&mut overlay, self.viewport, point, palette, size);
         }
 
-        vec![grid, traces, overlay.into_geometry()]
+        vec![grid, traces, artifacts, overlay.into_geometry()]
     }
 
     fn mouse_interaction(
@@ -447,6 +480,105 @@ fn draw_grid(frame: &mut Frame, viewport: &Viewport, palette: Palette<'_>, size:
                 ..Text::default()
             });
             v += vstep;
+        }
+    }
+}
+
+/// Draws one overlay artifact in the form its schema declared (§10.1).
+///
+/// Overlays share the traces' time axis but not their amplitude window: a
+/// detection score is not volts, so spans, markers and bands are placed by
+/// time and by fraction of the canvas rather than by value. Stems are the
+/// exception — a symbol decision *is* an amplitude — and use the viewport.
+fn draw_overlay(frame: &mut Frame, viewport: &Viewport, overlay: &OverlayView, size: Size) {
+    let visible = viewport.time();
+    for (index, item) in overlay.items.iter().enumerate() {
+        if item.span.end_s < visible.start_s || item.span.start_s > visible.end_s {
+            continue;
+        }
+        let current = overlay.current == Some(index);
+        let alpha = if current { 0.55 } else { 0.28 };
+        let x0 = viewport.x_of(item.span.start_s);
+        let x1 = viewport.x_of(item.span.end_s);
+
+        match overlay.form {
+            OverlayForm::Spans => {
+                // A zero-width span would vanish; give it a pixel so a
+                // detection on one sample is still visible.
+                let width = (x1 - x0).max(1.0);
+                frame.fill_rectangle(
+                    Point::new(x0, 0.0),
+                    Size::new(width, size.height),
+                    Color {
+                        a: alpha,
+                        ..overlay.colour
+                    },
+                );
+                stroke_line(
+                    frame,
+                    Point::new(x0, 0.0),
+                    Point::new(x0, size.height),
+                    overlay.colour,
+                    if current { 2.0 } else { 1.0 },
+                );
+            }
+            OverlayForm::Markers => {
+                stroke_line(
+                    frame,
+                    Point::new(x0, 0.0),
+                    Point::new(x0, size.height),
+                    Color {
+                        a: if current { 1.0 } else { 0.7 },
+                        ..overlay.colour
+                    },
+                    if current { 2.0 } else { 1.0 },
+                );
+            }
+            OverlayForm::Stems => {
+                let base = viewport.y_of(0.0, size.height);
+                let y = match item.value {
+                    Some(value) => viewport.y_of(value, size.height),
+                    None => 0.0,
+                };
+                stroke_line(
+                    frame,
+                    Point::new(x0, base),
+                    Point::new(x0, y),
+                    overlay.colour,
+                    if current { 2.0 } else { 1.0 },
+                );
+                frame.fill_rectangle(
+                    Point::new(x0 - 2.0, y - 2.0),
+                    Size::new(4.0, 4.0),
+                    overlay.colour,
+                );
+            }
+            OverlayForm::Bands => {
+                // A band is an amplitude threshold: a horizontal rule across
+                // the span it applies to.
+                let y = match item.value {
+                    Some(value) => viewport.y_of(value, size.height),
+                    None => size.height / 2.0,
+                };
+                stroke_line(
+                    frame,
+                    Point::new(x0, y),
+                    Point::new(x1.max(x0 + 1.0), y),
+                    overlay.colour,
+                    if current { 2.0 } else { 1.0 },
+                );
+            }
+        }
+
+        if current && !item.label.is_empty() {
+            frame.fill_text(Text {
+                content: item.label.clone(),
+                position: Point::new(x0 + 4.0, 4.0),
+                color: overlay.colour,
+                size: 10.0.into(),
+                shaping: Shaping::Basic,
+                ..Text::default()
+            });
         }
     }
 }

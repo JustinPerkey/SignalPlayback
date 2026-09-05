@@ -9,6 +9,7 @@
 //! knows about pixels.
 
 pub mod clock;
+pub mod compare;
 pub mod error;
 pub mod pyramid;
 pub mod reduce;
@@ -17,6 +18,7 @@ pub mod transport;
 pub mod viewport;
 
 pub use clock::Clock;
+pub use compare::{compare, Residual};
 pub use error::{EngineError, Result};
 pub use pyramid::{Pyramid, PyramidBuilder, PyramidHeader, Reduction, BASE_SHIFT};
 pub use reduce::{
