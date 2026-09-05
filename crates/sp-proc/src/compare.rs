@@ -557,14 +557,20 @@ fn compare_signal(
         })?;
 
         for offset in 0..range.len() {
-            let index = offset as usize;
-            let (Some(a), Some(b)) = (left.value(index as u64), right.value(index as u64)) else {
-                continue;
+            // Both sides were read over the same range, so a sample the two
+            // chunks disagree about the existence of is itself a difference.
+            let error = match (left.value(offset), right.value(offset)) {
+                // A pair of NaNs is not a difference: an all-NaN signal that
+                // re-ran identically must not read as a regression. One NaN
+                // against a number is the largest difference there is —
+                // arithmetic would make it NaN, which compares false against
+                // every bound and would pass silently.
+                (Some(a), Some(b)) if a.is_nan() && b.is_nan() => 0.0,
+                (Some(a), Some(b)) if a.is_nan() || b.is_nan() => f64::INFINITY,
+                (Some(a), Some(b)) => (a - b).abs(),
+                (None, None) => continue,
+                _ => f64::INFINITY,
             };
-            let error = (a - b).abs();
-            // A pair of NaNs is not a difference: an all-NaN signal that
-            // re-ran identically must not read as a regression.
-            let error = if a.is_nan() && b.is_nan() { 0.0 } else { error };
             sum_sq += error * error;
             compared += 1;
             if error > diff.max_abs_error {
