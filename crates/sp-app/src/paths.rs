@@ -27,6 +27,12 @@ pub fn default_library_file() -> Option<PathBuf> {
     default_library_root().map(|dir| dir.join("library.db"))
 }
 
+/// The settings file, beside the default library and the logs.
+#[must_use]
+pub fn settings_file() -> Option<PathBuf> {
+    app_data_dir().map(|dir| crate::settings::Settings::path_in(&dir))
+}
+
 /// Directory for the rolling application log.
 #[must_use]
 pub fn log_dir() -> Option<PathBuf> {

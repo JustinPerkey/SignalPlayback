@@ -57,6 +57,7 @@ Usage:
   signalplayback run [options]         run a pipeline headlessly
   signalplayback baselines [options]   list the library's baselines
   signalplayback promote [options]     promote a run to a named baseline
+  signalplayback export [options]      write a dataset back out as CSV
   signalplayback help                  show this text
 
 Options for `run`:
@@ -80,6 +81,12 @@ Options for `baselines` and `promote`:
   --run <id>              the run to promote (promote only; required)
   --promote <name>        the baseline name to promote it to (promote only)
 
+Options for `export`:
+  --library <path>        library file
+  --dataset <name|#id>    the dataset to write out (required if there is more
+                          than one)
+  --out <path>            the CSV file to write (required)
+
 Exit codes: 0 passed, 1 the request was wrong, 2 the run failed.
 ";
 
@@ -99,6 +106,7 @@ pub fn dispatch(args: &[String]) -> Invocation {
         "run" => Invocation::Exited(run_command(&args[1..])),
         "baselines" => Invocation::Exited(baselines_command(&args[1..])),
         "promote" => Invocation::Exited(promote_command(&args[1..])),
+        "export" => Invocation::Exited(export_command(&args[1..])),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Invocation::Exited(OK)
@@ -169,6 +177,40 @@ fn promote_command(args: &[String]) -> i32 {
     match store.write(move |conn| regress::promote(conn, &name, RunId::new(run), &tolerances)) {
         Ok(_) => {
             println!("promoted run {run} to '{}'", options.promote.unwrap());
+            OK
+        }
+        Err(error) => usage(&error.to_string()),
+    }
+}
+
+/// `signalplayback export` — the writer of §7.5 on the command line, so a
+/// round trip (import, run, export) is scriptable without the window.
+fn export_command(args: &[String]) -> i32 {
+    let options = match Args::parse(args) {
+        Ok(options) => options,
+        Err(error) => return usage(&error),
+    };
+    let Some(out) = options.out.clone() else {
+        return usage("export needs --out <path>");
+    };
+    let store = match open(&options.library) {
+        Ok(store) => store,
+        Err(error) => return usage(&error),
+    };
+    let dataset = match resolve_dataset(&store, &options) {
+        Ok(dataset) => dataset,
+        Err(error) => return usage(&error),
+    };
+
+    let id = dataset.id;
+    let target = out.clone();
+    let written = store.read(move |conn| {
+        sp_csv::export_dataset_to_file(conn, id, &target)
+            .map_err(|error| sp_store::StoreError::Invalid(error.to_string()))
+    });
+    match written {
+        Ok(()) => {
+            println!("exported '{}' to {}", dataset.name, out.display());
             OK
         }
         Err(error) => usage(&error.to_string()),
@@ -315,9 +357,16 @@ fn describe_baseline(baseline: &BaselineRow) -> String {
 }
 
 fn open(path: &Option<PathBuf>) -> Result<Store, String> {
+    // With no `--library`, the CLI opens the same file the window would: the
+    // one the settings name, or the default location (§12.1).
     let path = path
         .clone()
-        .or_else(crate::paths::default_library_file)
+        .or_else(|| {
+            let settings = crate::paths::settings_file()
+                .map(|path| crate::settings::Settings::load(&path))
+                .unwrap_or_default();
+            settings.library_file(crate::paths::default_library_file())
+        })
         .ok_or("no library was given and there is no default location")?;
     if !path.exists() {
         return Err(format!("no library at {}", path.display()));
@@ -368,6 +417,45 @@ fn load_pipeline(store: &Store, wanted: &str) -> Result<(sp_core::PipelineId, Pi
     Ok((id, pipeline))
 }
 
+/// The dataset `--dataset` names, or the only one there is.
+fn resolve_dataset(store: &Store, options: &Args) -> Result<sp_core::Dataset, String> {
+    let datasets = store
+        .read(library::list_datasets)
+        .map_err(|error| error.to_string())?;
+    match &options.dataset {
+        Some(wanted) => {
+            let wanted = wanted.trim();
+            match wanted
+                .strip_prefix('#')
+                .and_then(|id| id.parse::<i64>().ok())
+            {
+                Some(id) => datasets.into_iter().find(|row| row.id.get() == id),
+                None => datasets.into_iter().find(|row| row.name == wanted),
+            }
+            .ok_or_else(|| format!("no dataset called '{wanted}'"))
+        }
+        // One dataset is unambiguous; more than one has to be chosen, because
+        // running the wrong corpus would look like a pass.
+        None => {
+            let mut datasets = datasets;
+            match datasets.len() {
+                1 => Ok(datasets.remove(0)),
+                0 => Err("the library has no datasets".to_owned()),
+                many => {
+                    let names = datasets
+                        .iter()
+                        .map(|row| format!("'{}'", row.name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Err(format!(
+                        "the library has {many} datasets ({names}); name one with --dataset"
+                    ))
+                }
+            }
+        }
+    }
+}
+
 /// The groups to run over: those named, else every group of the chosen
 /// dataset, else — when the library holds exactly one dataset — that one.
 fn resolve_groups(store: &Store, options: &Args) -> Result<Vec<GroupId>, String> {
@@ -375,41 +463,7 @@ fn resolve_groups(store: &Store, options: &Args) -> Result<Vec<GroupId>, String>
         return Ok(options.groups.iter().map(|id| GroupId::new(*id)).collect());
     }
 
-    let datasets = store
-        .read(library::list_datasets)
-        .map_err(|error| error.to_string())?;
-    let chosen = match &options.dataset {
-        Some(wanted) => {
-            let wanted = wanted.trim();
-            match wanted
-                .strip_prefix('#')
-                .and_then(|id| id.parse::<i64>().ok())
-            {
-                Some(id) => datasets.iter().find(|row| row.id.get() == id),
-                None => datasets.iter().find(|row| row.name == wanted),
-            }
-            .ok_or_else(|| format!("no dataset called '{wanted}'"))?
-        }
-        // One dataset is unambiguous; more than one has to be chosen, because
-        // running the wrong corpus would look like a pass.
-        None => match datasets.as_slice() {
-            [only] => only,
-            [] => return Err("the library has no datasets".to_owned()),
-            many => {
-                let names = many
-                    .iter()
-                    .map(|row| format!("'{}'", row.name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(format!(
-                    "the library has {} datasets ({names}); name one with --dataset",
-                    many.len()
-                ));
-            }
-        },
-    };
-
-    let id = chosen.id;
+    let id = resolve_dataset(store, options)?.id;
     let groups = store
         .read(move |conn| library::list_groups_in_dataset(conn, id))
         .map_err(|error| error.to_string())?;
@@ -431,6 +485,8 @@ pub struct Args {
     pub assert_baseline: Option<String>,
     pub promote: Option<String>,
     pub run: Option<i64>,
+    /// Where `export` writes.
+    pub out: Option<PathBuf>,
     pub tolerances: Tolerances,
     pub no_cache: bool,
     pub quiet: bool,
@@ -457,6 +513,7 @@ impl Args {
                 "--assert-baseline" => parsed.assert_baseline = Some(value()?),
                 "--promote" => parsed.promote = Some(value()?),
                 "--run" => parsed.run = Some(number(&value()?)?),
+                "--out" => parsed.out = Some(PathBuf::from(value()?)),
                 "--notes" => parsed.notes = Some(value()?),
                 "--tolerance-sample-abs" => parsed.tolerances.sample_abs = float(&value()?)?,
                 "--tolerance-sample-rel" => parsed.tolerances.sample_rel = float(&value()?)?,

@@ -719,6 +719,64 @@ pub fn signals_with_tag(conn: &Connection, tag: &str) -> Result<Vec<SignalId>> {
         .collect())
 }
 
+/// Every tag in use with how many signals carry it — what the library's tag
+/// filter offers, and what tells the user a tag has fallen out of use.
+pub fn tag_counts(conn: &Connection) -> Result<Vec<(String, u64)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.name, COUNT(st.signal_id) FROM tag t
+         LEFT JOIN signal_tag st ON st.tag_id = t.id
+         GROUP BY t.id ORDER BY t.name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?.max(0) as u64,
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Signals carrying *every* one of `tags`.
+///
+/// Filters narrow: selecting two tags asks for the signals that are both, not
+/// either. An empty list matches nothing, because "no filter" is the caller's
+/// decision not to call this at all.
+pub fn signals_with_all_tags(conn: &Connection, tags: &[String]) -> Result<Vec<SignalId>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", tags.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT st.signal_id FROM signal_tag st JOIN tag t ON t.id = st.tag_id
+         WHERE t.name IN ({placeholders})
+         GROUP BY st.signal_id HAVING COUNT(DISTINCT t.name) = ?{}
+         ORDER BY st.signal_id",
+        tags.len() + 1
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = tags
+        .iter()
+        .map(|tag| Box::new(tag.trim().to_owned()) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    params.push(Box::new(tags.len() as i64));
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(SignalId::new)
+        .collect())
+}
+
+/// Removes a tag from the library, and with it every signal's use of it.
+pub fn delete_tag(conn: &Connection, tag: &str) -> Result<bool> {
+    let removed = conn.execute("DELETE FROM tag WHERE name = ?1", [tag.trim()])?;
+    Ok(removed > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------

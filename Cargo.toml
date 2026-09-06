@@ -63,6 +63,10 @@ uninlined_format_args = "allow"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+# A shipped binary carries no debug symbols: it is a third of the size, and a
+# panic still names the function it came from through the backtrace the
+# runtime prints.
+strip = "debuginfo"
 
 # Sample-crunching is unusably slow in an unoptimised debug build; the app code
 # itself stays at opt-level 0 so debugging the UI still works.

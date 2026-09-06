@@ -6,9 +6,12 @@ use iced::widget::{button, column, container, horizontal_rule, row, scrollable, 
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
 use sp_store::Store;
 
+use crate::screens::settings::fmt_bytes;
 use crate::screens::{
-    self, generate, import, library, pipeline, properties, results, scope, Screen, Section,
+    self, generate, import, inspector, library, pipeline, properties, results, scope, settings,
+    Screen, Section,
 };
+use crate::settings::Settings;
 
 /// Everything the UI reads.
 ///
@@ -19,7 +22,12 @@ use crate::screens::{
 #[derive(Debug)]
 pub struct App {
     screen: Screen,
-    theme: Theme,
+    /// User settings, applied to the screens that care and written back to
+    /// `settings.json` whenever one changes (§12.1).
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    /// Where a library lives when the user has not chosen one.
+    default_library: Option<PathBuf>,
     /// The open library, or `None` when opening it failed.
     store: Option<Store>,
     /// Why the library is not open, for the status bar.
@@ -29,6 +37,8 @@ pub struct App {
     generate: generate::State,
     pipeline: pipeline::State,
     properties: properties::State,
+    inspector: inspector::State,
+    settings_screen: settings::State,
     /// The results screen keeps its run, group and stage selection — and its
     /// playhead — across navigation, for the same reason the scope does.
     results: results::State,
@@ -49,16 +59,31 @@ pub enum Message {
     Generate(generate::Message),
     Pipeline(pipeline::Message),
     Properties(properties::Message),
+    Inspector(inspector::Message),
+    Settings(settings::Message),
     Results(results::Message),
     Scope(scope::Message),
 }
 
 impl App {
-    /// Boots the application and opens the library at `library_file`. A
-    /// library that will not open is reported in the status bar rather than
-    /// aborting: the app is still useful for looking at the design of the
-    /// other screens, and the Settings screen (M8) is where the path changes.
-    pub fn new(log_dir: Option<PathBuf>, library_file: Option<PathBuf>) -> (Self, Task<Message>) {
+    /// Boots the application: reads the settings file, opens the library they
+    /// name — or the default one — and hands each screen the defaults it
+    /// works from.
+    ///
+    /// A library that will not open is reported in the status bar rather than
+    /// aborting: the app is still useful, and the Settings screen is where the
+    /// path is changed.
+    pub fn new(
+        log_dir: Option<PathBuf>,
+        settings_path: Option<PathBuf>,
+        default_library: Option<PathBuf>,
+    ) -> (Self, Task<Message>) {
+        let settings = settings_path
+            .as_deref()
+            .map(Settings::load)
+            .unwrap_or_default();
+        let library_file = settings.library_file(default_library.clone());
+
         tracing::info!(
             library = ?library_file,
             log_dir = ?log_dir,
@@ -66,26 +91,13 @@ impl App {
             env!("CARGO_PKG_VERSION"),
         );
 
-        let (store, store_error) = match library_file {
-            Some(path) => match Store::open(&path) {
-                Ok(store) => {
-                    tracing::info!(path = %path.display(), "library open");
-                    (Some(store), None)
-                }
-                Err(error) => {
-                    tracing::error!(%error, path = %path.display(), "could not open the library");
-                    (None, Some(error.to_string()))
-                }
-            },
-            None => (
-                None,
-                Some("no writable application data directory was found".to_owned()),
-            ),
-        };
+        let (store, store_error) = open_library(library_file);
 
         let mut app = Self {
             screen: Screen::default(),
-            theme: Theme::Dark,
+            settings: settings.clone(),
+            settings_path,
+            default_library: default_library.clone(),
             store,
             store_error,
             library: library::State::default(),
@@ -93,24 +105,73 @@ impl App {
             generate: generate::State::default(),
             pipeline: pipeline::State::default(),
             properties: properties::State::default(),
+            inspector: inspector::State::default(),
+            settings_screen: settings::State::default(),
             results: results::State::default(),
             scope: scope::State::default(),
             log_dir,
         };
+        app.settings_screen
+            .adopt(settings, app.settings_path.clone(), default_library);
+        let applied = app.apply_settings();
 
-        let task = match app.store.clone() {
-            Some(store) => Task::batch([
-                app.library.load(&store).map(Message::Library),
-                app.import.load(&store).map(Message::Import),
-                app.generate.load(&store).map(Message::Generate),
-                app.pipeline.load(&store).map(Message::Pipeline),
-                app.properties.load(&store).map(Message::Properties),
-                app.results.load(&store).map(Message::Results),
-                app.scope.load(&store).map(Message::Scope),
-            ]),
-            None => Task::none(),
-        };
+        let task = Task::batch([applied, app.reload_everything()]);
         (app, task)
+    }
+
+    /// Hands the current settings to the screens that work from them.
+    fn apply_settings(&mut self) -> Task<Message> {
+        let settings = self.settings.clone();
+        self.generate
+            .set_default_sample_rate(settings.default_sample_rate_hz);
+        self.import.set_default_mode(settings.import_mode);
+        self.scope.set_quality(settings.decimation);
+        self.results.set_quality(settings.decimation);
+        self.inspector
+            .set_bins(settings.histogram_bins, self.store.as_ref())
+            .map(Message::Inspector)
+    }
+
+    /// Writes the settings file, if there is anywhere to write it.
+    fn save_settings(&self) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+        if let Err(error) = self.settings.save(path) {
+            tracing::warn!(%error, path = %path.display(), "could not save the settings");
+        }
+    }
+
+    /// Loads every screen from the open library.
+    fn reload_everything(&mut self) -> Task<Message> {
+        let Some(store) = self.store.clone() else {
+            return Task::none();
+        };
+        Task::batch([
+            self.library.load(&store).map(Message::Library),
+            self.import.load(&store).map(Message::Import),
+            self.generate.load(&store).map(Message::Generate),
+            self.pipeline.load(&store).map(Message::Pipeline),
+            self.properties.load(&store).map(Message::Properties),
+            self.inspector.load(&store).map(Message::Inspector),
+            self.settings_screen.load(&store).map(Message::Settings),
+            self.results.load(&store).map(Message::Results),
+            self.scope.load(&store).map(Message::Scope),
+        ])
+    }
+
+    /// Opens another library in place — the Settings screen's doing. Screen
+    /// state that referred to the old library is dropped, because a signal id
+    /// means nothing in a different file.
+    fn open(&mut self, library_file: Option<PathBuf>) -> Task<Message> {
+        let (store, store_error) = open_library(library_file);
+        self.store = store;
+        self.store_error = store_error;
+        self.library = library::State::default();
+        self.inspector = inspector::State::default();
+        self.results = results::State::default();
+        self.scope = scope::State::default();
+        self.reload_everything()
     }
 
     #[must_use]
@@ -120,7 +181,7 @@ impl App {
 
     #[must_use]
     pub fn theme(&self) -> Theme {
-        self.theme.clone()
+        self.settings.theme.theme()
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -133,17 +194,35 @@ impl App {
                 Task::none()
             }
             Message::ToggleTheme => {
-                self.theme = if matches!(self.theme, Theme::Dark) {
-                    Theme::Light
-                } else {
-                    Theme::Dark
-                };
+                // The shortcut and the Settings screen change one setting, so
+                // the choice sticks whichever way it was made.
+                self.settings.theme = self.settings.theme.toggled();
+                self.settings_screen.adopt(
+                    self.settings.clone(),
+                    self.settings_path.clone(),
+                    self.default_library.clone(),
+                );
+                self.save_settings();
                 Task::none()
             }
-            Message::Library(message) => self
-                .library
-                .update(self.store.as_ref(), message)
-                .map(Message::Library),
+            Message::Library(message) => {
+                let task = self
+                    .library
+                    .update(self.store.as_ref(), message)
+                    .map(Message::Library);
+                // "Inspect" on a row is a navigation as well as a selection.
+                match self.library.take_inspect_request() {
+                    Some(target) => {
+                        self.screen = Screen::Inspector;
+                        let show = self
+                            .inspector
+                            .show(self.store.as_ref(), target)
+                            .map(Message::Inspector);
+                        Task::batch([task, show])
+                    }
+                    None => task,
+                }
+            }
             Message::Import(message) => {
                 let task = self
                     .import
@@ -184,6 +263,7 @@ impl App {
                 match (self.pipeline.take_completed(), self.store.clone()) {
                     (true, Some(store)) => Task::batch([
                         task,
+                        self.prune_runs(&store),
                         self.library.load(&store).map(Message::Library),
                         self.results.load(&store).map(Message::Results),
                         self.scope.load(&store).map(Message::Scope),
@@ -195,6 +275,29 @@ impl App {
                 .properties
                 .update(self.store.as_ref(), message)
                 .map(Message::Properties),
+            Message::Inspector(message) => self
+                .inspector
+                .update(self.store.as_ref(), message)
+                .map(Message::Inspector),
+            Message::Settings(message) => {
+                let task = self
+                    .settings_screen
+                    .update(self.store.as_ref(), message)
+                    .map(Message::Settings);
+                let mut tasks = vec![task];
+                if self.settings_screen.take_changed() {
+                    self.settings = self.settings_screen.settings().clone();
+                    self.save_settings();
+                    tasks.push(self.apply_settings());
+                }
+                // Opening another library is the one setting that cannot be
+                // applied in place: everything on screen refers to the old one.
+                if let Some(request) = self.settings_screen.take_library_request() {
+                    let path = request.or_else(|| self.default_library.clone());
+                    tasks.push(self.open(path));
+                }
+                Task::batch(tasks)
+            }
             Message::Results(message) => self
                 .results
                 .update(self.store.as_ref(), message)
@@ -298,6 +401,8 @@ impl App {
             Screen::Generate => self.generate.view().map(Message::Generate),
             Screen::Pipeline => self.pipeline.view().map(Message::Pipeline),
             Screen::Properties => self.properties.view().map(Message::Properties),
+            Screen::Inspector => self.inspector.view().map(Message::Inspector),
+            Screen::Settings => self.settings_screen.view().map(Message::Settings),
             Screen::Results => self.results.view().map(Message::Results),
             Screen::Scope => self.scope.view().map(Message::Scope),
             other => screens::placeholder(other),
@@ -376,11 +481,7 @@ impl App {
     }
 
     fn header(&self) -> Element<'_, Message> {
-        let theme_label = if matches!(self.theme, Theme::Dark) {
-            "Light theme"
-        } else {
-            "Dark theme"
-        };
+        let theme_label = format!("{} theme", self.settings.theme.toggled().label());
 
         container(
             row![
@@ -451,6 +552,54 @@ impl App {
     }
 }
 
+/// Applies the retention setting to the pipeline whose run just finished.
+///
+/// Retention is enforced here rather than in the scheduler because it is a
+/// preference, not part of what a run *is*: a headless run in CI keeps
+/// everything it records (§9.6).
+impl App {
+    fn prune_runs(&self, store: &Store) -> Task<Message> {
+        let (Some(keep), Some(pipeline)) =
+            (self.settings.retention.limit(), self.pipeline.saved_id())
+        else {
+            return Task::none();
+        };
+        let store = store.clone();
+        Task::future(async move {
+            let outcome = crate::jobs::write(store, move |conn| {
+                sp_store::runs::prune_runs(conn, pipeline, keep)
+            })
+            .await;
+            match outcome {
+                Ok(0) => {}
+                Ok(deleted) => tracing::info!(deleted, keep, "retention pruned old runs"),
+                Err(error) => tracing::warn!(%error, "retention could not prune old runs"),
+            }
+        })
+        .discard()
+    }
+}
+
+/// Opens a library file, turning a failure into the status bar's message.
+fn open_library(path: Option<PathBuf>) -> (Option<Store>, Option<String>) {
+    match path {
+        Some(path) => match Store::open(&path) {
+            Ok(store) => {
+                tracing::info!(path = %path.display(), "library open");
+                (Some(store), None)
+            }
+            Err(error) => {
+                tracing::error!(%error, path = %path.display(), "could not open the library");
+                (None, Some(error.to_string()))
+            }
+        },
+        None => (
+            None,
+            Some("no writable application data directory was found".to_owned()),
+        ),
+    }
+}
+
 fn plural(n: u64) -> &'static str {
     if n == 1 {
         ""
@@ -459,28 +608,24 @@ fn plural(n: u64) -> &'static str {
     }
 }
 
-/// Bytes with a binary prefix, one decimal.
-fn fmt_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::screens::settings::{self as settings_screen, RetentionEntry};
+    use crate::settings::{Retention, ThemeChoice};
 
     fn app() -> App {
-        App::new(None, None).0
+        App::new(None, None, None).0
+    }
+
+    /// An app with a settings file and a library of its own, in `dir`.
+    fn app_in(dir: &std::path::Path) -> App {
+        App::new(
+            None,
+            Some(Settings::path_in(dir)),
+            Some(dir.join("library").join("library.db")),
+        )
+        .0
     }
 
     #[test]
@@ -510,6 +655,71 @@ mod tests {
     }
 
     #[test]
+    fn the_theme_shortcut_and_the_settings_screen_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::ToggleTheme);
+        assert_eq!(app.settings.theme, ThemeChoice::Light);
+        // The Settings screen shows what the shortcut did …
+        assert_eq!(app.settings_screen.settings().theme, ThemeChoice::Light);
+        // … and it survives a restart.
+        drop(app);
+        let reopened = app_in(dir.path());
+        assert_eq!(reopened.settings.theme, ThemeChoice::Light);
+        assert!(matches!(reopened.theme(), Theme::Light));
+    }
+
+    #[test]
+    fn a_changed_setting_is_saved_and_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::Settings(
+            settings_screen::Message::RetentionPicked(RetentionEntry(Retention::Keep(5))),
+        ));
+        assert_eq!(app.settings.retention, Retention::Keep(5));
+        assert_eq!(
+            Settings::load(&Settings::path_in(dir.path())).retention,
+            Retention::Keep(5)
+        );
+    }
+
+    #[test]
+    fn the_settings_file_says_which_library_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let chosen = dir.path().join("chosen.db");
+        Settings {
+            library_file: Some(chosen.clone()),
+            ..Settings::default()
+        }
+        .save(&Settings::path_in(dir.path()))
+        .unwrap();
+
+        let app = app_in(dir.path());
+        assert!(app.store.is_some(), "{:?}", app.store_error);
+        assert!(chosen.exists(), "the chosen library is the one opened");
+        assert!(!dir.path().join("library").join("library.db").exists());
+    }
+
+    #[test]
+    fn opening_another_library_drops_what_the_old_one_showed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let first = app.store.as_ref().map(|store| store.path().to_path_buf());
+
+        let other = dir.path().join("other.db");
+        let _ = app.update(Message::Settings(settings_screen::Message::LibraryChosen(
+            Some(other.clone()),
+        )));
+        let now = app.store.as_ref().map(|store| store.path().to_path_buf());
+        assert_ne!(first, now);
+        assert_eq!(now, Some(other));
+        assert!(
+            app.library.summary().is_none(),
+            "the tree is reloaded, not kept"
+        );
+    }
+
+    #[test]
     fn without_a_library_path_the_app_still_boots() {
         let app = app();
         assert!(app.store.is_none());
@@ -520,7 +730,7 @@ mod tests {
     fn a_library_path_opens_and_creates_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lib").join("library.db");
-        let (app, _task) = App::new(None, Some(path.clone()));
+        let (app, _task) = App::new(None, None, Some(path.clone()));
         assert!(app.store.is_some(), "{:?}", app.store_error);
         assert!(path.exists());
         drop(app);
@@ -532,7 +742,7 @@ mod tests {
         // A directory where the file should be.
         let path = dir.path().join("library.db");
         std::fs::create_dir_all(&path).unwrap();
-        let (app, _task) = App::new(None, Some(path));
+        let (app, _task) = App::new(None, None, Some(path));
         assert!(app.store.is_none());
         assert!(app.store_error.is_some());
     }

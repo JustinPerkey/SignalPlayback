@@ -22,8 +22,8 @@ pub use compare::{compare, Residual};
 pub use error::{EngineError, Result};
 pub use pyramid::{Pyramid, PyramidBuilder, PyramidHeader, Reduction, BASE_SHIFT};
 pub use reduce::{
-    trace, ColumnReader, LogicLevel, TraceDescriptor, TraceForm, TraceGeometry, TraceSnapshot,
-    TraceStyle,
+    trace, ColumnReader, LogicLevel, Quality, TraceDescriptor, TraceForm, TraceGeometry,
+    TraceSnapshot, TraceStyle,
 };
 pub use source::{BuildControl, BuildProgress, ColumnSource};
 pub use transport::{LoopMode, Transport, TransportState};

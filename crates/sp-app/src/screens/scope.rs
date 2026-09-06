@@ -19,7 +19,7 @@ use iced::widget::{
 use iced::{Alignment, Element, Length, Subscription, Task, Theme};
 use sp_core::stats::MinMax;
 use sp_core::{GroupId, Signal, SignalId, TimeRange};
-use sp_engine::reduce::{TraceDescriptor, TraceSnapshot, TraceStyle};
+use sp_engine::reduce::{Quality, TraceDescriptor, TraceSnapshot, TraceStyle};
 use sp_engine::source::{self, ColumnSource};
 use sp_engine::viewport::Amplitude;
 use sp_engine::{
@@ -119,6 +119,8 @@ pub struct State {
     /// The user is typing in the filter, so the space bar is a space rather
     /// than the transport. Cleared by the next interaction with anything else.
     typing: bool,
+    /// How hard the reducer works per frame, from Settings.
+    quality: Quality,
 }
 
 impl Default for State {
@@ -141,6 +143,7 @@ impl Default for State {
             hover_s: None,
             status: None,
             typing: false,
+            quality: Quality::default(),
         }
     }
 }
@@ -182,6 +185,16 @@ pub enum Message {
 }
 
 impl State {
+    /// Sets how hard the reducer works per frame (Settings, §12.1). Existing
+    /// traces adopt it on their next reduction, which the caller triggers by
+    /// touching the viewport; a fresh trace picks it up when it is added.
+    pub fn set_quality(&mut self, quality: Quality) {
+        self.quality = quality;
+        for trace in &mut self.traces {
+            trace.style.quality = quality;
+        }
+    }
+
     /// Loads the signals the picker offers.
     pub fn load(&mut self, store: &Store) -> Task<Message> {
         self.loading = true;
@@ -295,7 +308,10 @@ impl State {
             }
             Message::ResetStyle(index) => {
                 if let Some(trace) = self.traces.get_mut(index) {
-                    trace.style = TraceStyle::default();
+                    trace.style = TraceStyle {
+                        quality: self.quality,
+                        ..TraceStyle::default()
+                    };
                 }
                 self.retime();
                 self.invalidate(store)
@@ -502,7 +518,10 @@ impl State {
             group: entry.group,
             visible: true,
             colour_index,
-            style: TraceStyle::default(),
+            style: TraceStyle {
+                quality: self.quality,
+                ..TraceStyle::default()
+            },
             pyramid_ready: false,
             snapshot: None,
         });

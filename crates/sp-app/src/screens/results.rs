@@ -36,7 +36,7 @@ use sp_core::{
     StageStatus, TimeRange, Tolerances,
 };
 use sp_engine::compare;
-use sp_engine::reduce::{TraceDescriptor, TraceSnapshot, TraceStyle};
+use sp_engine::reduce::{Quality, TraceDescriptor, TraceSnapshot, TraceStyle};
 use sp_engine::source::{self, ColumnSource};
 use sp_engine::viewport::Amplitude;
 use sp_engine::{reduce, Clock, Transport, TransportState, Viewport};
@@ -237,6 +237,8 @@ pub struct State {
     against: Option<RunId>,
     diff: Option<RunDiff>,
     diffing: bool,
+    /// How hard the reducer works per frame, from Settings.
+    quality: Quality,
 }
 
 impl Default for State {
@@ -277,6 +279,7 @@ impl Default for State {
             against: None,
             diff: None,
             diffing: false,
+            quality: Quality::default(),
         }
     }
 }
@@ -344,6 +347,12 @@ impl State {
             }),
             Message::Runs,
         )
+    }
+
+    /// Sets how hard the reducer works per frame (Settings, §12.1); the next
+    /// reduction uses it.
+    pub fn set_quality(&mut self, quality: Quality) {
+        self.quality = quality;
     }
 
     #[must_use]
@@ -922,13 +931,16 @@ impl State {
 
         self.reducing = true;
         let viewport = self.viewport;
+        let style = TraceStyle {
+            quality: self.quality,
+            ..TraceStyle::default()
+        };
         Task::perform(
             jobs::read(store, move |conn| {
                 let mut out = Vec::with_capacity(requests.len());
                 for (index, blob, descriptor) in requests {
-                    let reduced = ColumnSource::open(conn, blob).and_then(|source| {
-                        reduce::trace(&source, descriptor, &viewport, TraceStyle::default())
-                    });
+                    let reduced = ColumnSource::open(conn, blob)
+                        .and_then(|source| reduce::trace(&source, descriptor, &viewport, style));
                     match reduced {
                         Ok(snapshot) => out.push((index, snapshot)),
                         Err(error) => return Ok(Err(error.to_string())),

@@ -26,7 +26,7 @@ use iced::widget::{
 };
 use iced::{mouse, Alignment, Element, Length, Point, Rectangle, Subscription, Task, Theme};
 use serde_json::Value;
-use sp_core::{DType, Domain, SampleRange};
+use sp_core::{DType, Domain, SampleRange, Timebase};
 use sp_gen::generate::{GenReport, GenRequest, TrainRequest};
 use sp_gen::sweep::{ParamRef, ParamSweep, SweepValues};
 use sp_gen::train::{FieldSpec, FieldValue, TrainSpec};
@@ -408,6 +408,8 @@ pub struct State {
 
     presets: Vec<Preset>,
     loaded_preset: Option<String>,
+    /// The rate a new spec starts at, from Settings.
+    default_sample_rate_hz: f64,
 
     sweep_on: bool,
     sweep_target: Option<String>,
@@ -448,6 +450,7 @@ impl Default for State {
             signal_name: "Generated".to_owned(),
             presets: sp_gen::preset::built_in(),
             loaded_preset: None,
+            default_sample_rate_hz: crate::settings::DEFAULT_SAMPLE_RATE_HZ,
             sweep_on: false,
             sweep_target: None,
             sweep_mode: SweepMode::Range,
@@ -532,6 +535,20 @@ impl State {
     /// reloads the library tree exactly once.
     pub fn take_completed(&mut self) -> bool {
         std::mem::take(&mut self.completed)
+    }
+
+    /// The rate a new spec starts at (Settings, §12.1).
+    ///
+    /// The spec on screen follows the setting only while it is still on the
+    /// old default: a rate the user typed themselves is theirs, and a
+    /// preference must not overwrite it under their hands.
+    pub fn set_default_sample_rate(&mut self, hz: f64) {
+        let previous = std::mem::replace(&mut self.default_sample_rate_hz, hz);
+        if self.spec.sample_rate_hz() == previous {
+            self.spec.timebase = Timebase::regular(hz, self.spec.timebase.t0_s);
+            self.drafts.remove("/timebase/sample_rate_hz");
+            self.touch();
+        }
     }
 
     /// Nothing to load from the store: the preset library is embedded, and the

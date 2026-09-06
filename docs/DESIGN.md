@@ -825,6 +825,13 @@ properties and pulse fields that were never mapped to a definition are written b
 `attributes` verbatim. A round-trip test fixture set lives in
 `crates/sp-csv/tests/fixtures/`, seeded from `sample/sample.csv`.
 
+Export is reachable two ways, and both call the same writer: the Library screen's
+`Export` on a dataset, and `signalplayback export --dataset <name|#id> --out <path>` on
+the command line, so import → run → export is scriptable without the window. Only a
+dataset that was imported can be exported: the layout it was read with is stored on the
+dataset (`csv_layout`) and is what the writer reverses, so a generated or derived dataset
+has nothing to reverse and the action is refused rather than guessed at.
+
 ---
 
 ## 8. Signal Generation
@@ -1511,7 +1518,7 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 | **Results** | Group list + stage rail + scope + artifact panes (§10.3). The main working surface for algorithm development. |
 | **Runs** | History of runs with pipeline hash, status, timing, assertion results; promote to baseline; diff two runs. |
 | **Scope** | Playback-focused view of stored signals, with the same stage rail available when a run is loaded. |
-| **Inspector** | Detail for one signal, pulse field or pulse: full metadata, property editor, tags, statistics, histogram, and a virtualised value table — for a pulse group, the table is the pulse records themselves, one row per pulse across every field. |
+| **Inspector** | Detail for one signal, pulse field or pulse: full metadata, property editor, tags, statistics, histogram, and a virtualised value table — for a pulse group, the table is the pulse records themselves, one row per pulse across every field. Statistics are recomputed from the samples in one streaming pass (min, max, peak-to-peak, mean, RMS, standard deviation, zero crossings and the distribution), not read from the cached row, so they answer for what is actually stored; the table is a window on the column, paged, so a 100 M-sample signal costs a read rather than a copy. A pulse is addressed as a row of its group's table: an unannotated pulse has no row of its own (§6.6). |
 | **Properties** | Manage property definitions and property sets (§6.3). |
 | **Settings** | Library location, theme, default sample rate, strict/tolerant import, retention defaults, decimation quality, keyboard map. |
 
@@ -1578,6 +1585,32 @@ run proceeds — the user can inspect stage 1's output while stage 4 is still co
 - **Errors are data, not dialogs.** Import problems and stage diagnostics land in
   filterable lists the user can work through, not a popup per row.
 - **Keyboard first** for transport, stage stepping and navigation.
+
+### 12.4 Settings
+
+Settings are *not* in the library: one of them is which library to open, and the theme
+belongs to the user rather than to the file they happen to have open. They live in
+`settings.json` in the application data directory, beside the default library and the
+logs:
+
+| Setting | Effect |
+|---------|--------|
+| Library location | Which library file opens; changing it reopens in place, and everything showing the old library is dropped rather than left pointing at ids that mean nothing in another file |
+| Theme | Dark or light. The `Ctrl+T` shortcut and the Settings screen set the same value, so the choice survives a restart either way |
+| Default sample rate | The rate a new generator spec starts at. The spec on screen follows it only while it is still on the old default — a rate the user typed is theirs |
+| Strict / tolerant import | Whether an import refuses a file whose declared count does not match what was read (§7.3) |
+| Retention | Finished runs kept per pipeline; the oldest go first. A run a baseline names is never deleted, and neither is one still going. Enforced in the window only: a headless run keeps everything it records, because CI is not the place to lose evidence |
+| Decimation quality | Shifts the reducer's automatic level choice by one either way (§5.4). It never promotes a level to a raw read: that bound is what keeps a frame inside its budget, not a preference |
+| Histogram bins | Resolution of the Inspector's histogram |
+
+Every control writes the file as it changes — there is nothing here that is only
+half-decided, so there is no Save button. A settings file that will not parse, or a field
+an older build did not write, falls back to the default for that field: losing a
+preference must never cost the user their application. Out-of-range values are clamped
+rather than refused, for the same reason.
+
+The keyboard map is fixed in v1; the screen lists it so the shortcuts are discoverable
+(§15.11 tracks making it configurable).
 
 ---
 

@@ -11,6 +11,9 @@ authors.workspace = true
 [dependencies]
 sp-core.workspace = true
 sp-store.workspace = true
+# `Quality` is a persisted setting, so it serialises with everything else the
+# Settings screen writes.
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

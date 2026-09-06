@@ -8,8 +8,15 @@
 //!
 //! Everything shown is metadata read from the store; a pulse group's table
 //! previews the first rows of its columns and nothing more is materialised.
+//!
+//! Search and the tag filter narrow together: typing a query and selecting two
+//! tags asks for the signals that match the text *and* carry both tags. Either
+//! on its own works as you would expect, and clearing both puts the tree back.
+//! A row's `Inspect` button hands the Inspector its target (§12.1), and a
+//! dataset exports back to the format it was imported from (§7.5, G1).
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use iced::widget::{
     button, column, container, horizontal_rule, row, scrollable, text, text_input, Space,
@@ -17,11 +24,12 @@ use iced::widget::{
 use iced::{Alignment, Element, Length, Task, Theme};
 use sp_core::group::DatasetId;
 use sp_core::{
-    Dataset, GroupId, PulseField, SampleRange, Signal, SignalGroup, SignalTrain, TrainId,
+    Dataset, GroupId, PulseField, SampleRange, Signal, SignalGroup, SignalId, SignalTrain, TrainId,
 };
 use sp_store::{library, pulses, trains, LibrarySummary, Store};
 
 use crate::jobs;
+use crate::screens::inspector::Target;
 
 /// Pulse rows shown in the detail table before the user needs the Inspector.
 const PULSE_PREVIEW_ROWS: u64 = 200;
@@ -33,6 +41,8 @@ pub struct LibraryIndex {
     pub trains: HashMap<DatasetId, Vec<SignalTrain>>,
     pub groups: HashMap<TrainId, Vec<SignalGroup>>,
     pub summary: LibrarySummary,
+    /// Every tag in use, with how many signals carry it.
+    pub tags: Vec<(String, u64)>,
 }
 
 impl LibraryIndex {
@@ -83,6 +93,12 @@ pub struct State {
     detail_error: Option<String>,
     search: String,
     hits: Option<Vec<Signal>>,
+    /// Tags the list is narrowed to; a signal must carry all of them.
+    tag_filter: Vec<String>,
+    /// A target the user asked the Inspector for, waiting for the root to
+    /// navigate there.
+    inspect_request: Option<Target>,
+    notice: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +113,11 @@ pub enum Message {
     Search,
     SearchDone(Result<Vec<Signal>, String>),
     ClearSearch,
+    ToggleTag(String),
+    Inspect(Target),
+    ExportDataset(DatasetId),
+    ExportTo(DatasetId, Option<PathBuf>),
+    Exported(Result<String, String>),
 }
 
 impl State {
@@ -178,26 +199,12 @@ impl State {
             }
             Message::SearchChanged(query) => {
                 self.search = query;
-                if self.search.trim().is_empty() {
+                if self.search.trim().is_empty() && self.tag_filter.is_empty() {
                     self.hits = None;
                 }
                 Task::none()
             }
-            Message::Search => {
-                let query = self.search.trim().to_owned();
-                match store {
-                    Some(store) if !query.is_empty() => Task::perform(
-                        jobs::read(store.clone(), move |conn| {
-                            library::search_signals(conn, &query)?
-                                .into_iter()
-                                .map(|id| library::get_signal(conn, id))
-                                .collect()
-                        }),
-                        Message::SearchDone,
-                    ),
-                    _ => Task::none(),
-                }
-            }
+            Message::Search => self.query(store),
             Message::SearchDone(result) => {
                 match result {
                     Ok(hits) => self.hits = Some(hits),
@@ -207,10 +214,115 @@ impl State {
             }
             Message::ClearSearch => {
                 self.search.clear();
+                self.tag_filter.clear();
                 self.hits = None;
                 Task::none()
             }
+            Message::ToggleTag(tag) => {
+                if let Some(position) = self.tag_filter.iter().position(|t| *t == tag) {
+                    self.tag_filter.remove(position);
+                } else {
+                    self.tag_filter.push(tag);
+                }
+                self.query(store)
+            }
+            Message::Inspect(target) => {
+                self.inspect_request = Some(target);
+                Task::none()
+            }
+            Message::ExportDataset(id) => {
+                let name = self
+                    .index
+                    .as_ref()
+                    .and_then(|index| index.datasets.iter().find(|d| d.id == id))
+                    .map_or_else(|| "export".to_owned(), |dataset| dataset.name.clone());
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Export the dataset as CSV")
+                            .set_file_name(format!("{name}.csv"))
+                            .add_filter("CSV", &["csv"])
+                            .save_file()
+                            .await
+                            .map(|handle| handle.path().to_path_buf())
+                    },
+                    move |path| Message::ExportTo(id, path),
+                )
+            }
+            Message::ExportTo(id, path) => {
+                let (Some(store), Some(path)) = (store, path) else {
+                    return Task::none();
+                };
+                self.notice = Some(format!("Exporting to {}…", path.display()));
+                Task::perform(
+                    jobs::read(store.clone(), move |conn| {
+                        // The writer reverses the grammar the file was read
+                        // with, so an untouched dataset comes back byte for
+                        // byte (§7.5, G1).
+                        sp_csv::export_dataset_to_file(conn, id, &path)
+                            .map_err(|error| sp_store::StoreError::Invalid(error.to_string()))?;
+                        Ok(path.display().to_string())
+                    }),
+                    Message::Exported,
+                )
+            }
+            Message::Exported(result) => {
+                match result {
+                    Ok(path) => {
+                        self.notice = Some(format!("Exported to {path}."));
+                        self.error = None;
+                    }
+                    Err(error) => {
+                        self.notice = None;
+                        self.error = Some(error);
+                    }
+                }
+                Task::none()
+            }
         }
+    }
+
+    /// A target the user asked the Inspector for, taken once.
+    pub fn take_inspect_request(&mut self) -> Option<Target> {
+        self.inspect_request.take()
+    }
+
+    /// Runs the text query and the tag filter together. Both narrow: with a
+    /// query and two tags selected, a signal has to match all three.
+    fn query(&mut self, store: Option<&Store>) -> Task<Message> {
+        let query = self.search.trim().to_owned();
+        let tags = self.tag_filter.clone();
+        if query.is_empty() && tags.is_empty() {
+            self.hits = None;
+            return Task::none();
+        }
+        let Some(store) = store else {
+            return Task::none();
+        };
+        Task::perform(
+            jobs::read(store.clone(), move |conn| {
+                let by_text = match query.is_empty() {
+                    true => None,
+                    false => Some(library::search_signals(conn, &query)?),
+                };
+                let by_tag = match tags.is_empty() {
+                    true => None,
+                    false => Some(library::signals_with_all_tags(conn, &tags)?),
+                };
+                let ids: Vec<SignalId> = match (by_text, by_tag) {
+                    (Some(text), Some(tagged)) => {
+                        text.into_iter().filter(|id| tagged.contains(id)).collect()
+                    }
+                    (Some(text), None) => text,
+                    (None, Some(tagged)) => tagged,
+                    (None, None) => Vec::new(),
+                };
+                ids.into_iter()
+                    .map(|id| library::get_signal(conn, id))
+                    .collect()
+            }),
+            Message::SearchDone,
+        )
     }
 
     #[must_use]
@@ -257,13 +369,45 @@ impl State {
         if let Some(error) = &self.error {
             list = list.push(text(error).size(13).style(text::danger));
         }
+        if let Some(notice) = &self.notice {
+            list = list.push(text(notice).size(12).style(text::success));
+        }
+
+        if let Some(index) = &self.index {
+            if !index.tags.is_empty() {
+                let mut chips = row![].spacing(4);
+                for (tag, count) in &index.tags {
+                    let active = self.tag_filter.contains(tag);
+                    chips = chips.push(
+                        button(text(format!("{tag} {count}")).size(11))
+                            .padding([2, 8])
+                            .style(if active {
+                                button::primary
+                            } else {
+                                button::secondary
+                            })
+                            .on_press(Message::ToggleTag(tag.clone())),
+                    );
+                }
+                list = list.push(container(chips.wrap()).padding([2, 0]));
+            }
+        }
 
         if let Some(hits) = &self.hits {
+            let filter = if self.tag_filter.is_empty() {
+                String::new()
+            } else {
+                format!(" tagged {}", self.tag_filter.join(" + "))
+            };
             list = list.push(
                 row![
-                    text(format!("{} search result(s)", hits.len()))
-                        .size(12)
-                        .style(text::secondary),
+                    text(format!(
+                        "{} match{}{filter}",
+                        hits.len(),
+                        if hits.len() == 1 { "" } else { "es" }
+                    ))
+                    .size(12)
+                    .style(text::secondary),
                     Space::with_width(Length::Fill),
                     button(text("Clear").size(11))
                         .padding([2, 6])
@@ -274,24 +418,31 @@ impl State {
             );
             for hit in hits {
                 list = list.push(
-                    button(
-                        column![
-                            text(&hit.name).size(13),
-                            text(format!(
-                                "{} · {} samples · group {}",
-                                hit.domain.label(),
-                                hit.sample_count,
-                                hit.group_id.get()
-                            ))
-                            .size(11)
-                            .style(text::secondary),
-                        ]
-                        .spacing(1),
-                    )
-                    .width(Length::Fill)
-                    .padding([4, 10])
-                    .style(button::text)
-                    .on_press(Message::SelectGroup(hit.group_id)),
+                    row![
+                        button(
+                            column![
+                                text(&hit.name).size(13),
+                                text(format!(
+                                    "{} · {} samples · group {}",
+                                    hit.domain.label(),
+                                    hit.sample_count,
+                                    hit.group_id.get()
+                                ))
+                                .size(11)
+                                .style(text::secondary),
+                            ]
+                            .spacing(1),
+                        )
+                        .width(Length::Fill)
+                        .padding([4, 10])
+                        .style(button::text)
+                        .on_press(Message::SelectGroup(hit.group_id)),
+                        button(text("Inspect").size(11))
+                            .padding([2, 8])
+                            .style(button::text)
+                            .on_press(Message::Inspect(Target::Signal(hit.id))),
+                    ]
+                    .align_y(Alignment::Center),
                 );
             }
             list = list.push(horizontal_rule(1));
@@ -321,27 +472,41 @@ impl State {
                     let trains = index.trains.get(&dataset.id).map_or(&[][..], Vec::as_slice);
                     let collapsed = self.collapsed.contains(&dataset.id);
                     list = list.push(
-                        button(
-                            row![
-                                text(if collapsed { "▸" } else { "▾" }).size(13),
-                                text(&dataset.name).size(14),
-                                Space::with_width(Length::Fill),
-                                text(format!(
-                                    "{} · {} train{}",
-                                    dataset.source_kind.label(),
-                                    trains.len(),
-                                    if trains.len() == 1 { "" } else { "s" }
-                                ))
-                                .size(11)
-                                .style(text::secondary),
-                            ]
-                            .spacing(6)
-                            .align_y(Alignment::Center),
-                        )
-                        .width(Length::Fill)
-                        .padding([5, 8])
-                        .style(button::text)
-                        .on_press(Message::ToggleDataset(dataset.id)),
+                        row![
+                            button(
+                                row![
+                                    text(if collapsed { "▸" } else { "▾" }).size(13),
+                                    text(&dataset.name).size(14),
+                                    Space::with_width(Length::Fill),
+                                    text(format!(
+                                        "{} · {} train{}",
+                                        dataset.source_kind.label(),
+                                        trains.len(),
+                                        if trains.len() == 1 { "" } else { "s" }
+                                    ))
+                                    .size(11)
+                                    .style(text::secondary),
+                                ]
+                                .spacing(6)
+                                .align_y(Alignment::Center),
+                            )
+                            .width(Length::Fill)
+                            .padding([5, 8])
+                            .style(button::text)
+                            .on_press(Message::ToggleDataset(dataset.id)),
+                            // Only an imported dataset carries the layout the
+                            // writer reverses, so only one offers the export.
+                            button(text("Export").size(11))
+                                .padding([2, 6])
+                                .style(button::text)
+                                .on_press_maybe(
+                                    dataset
+                                        .attributes
+                                        .contains_key(sp_csv::profile::Layout::ATTRIBUTE)
+                                        .then_some(Message::ExportDataset(dataset.id)),
+                                ),
+                        ]
+                        .align_y(Alignment::Center),
                     );
                     if collapsed {
                         continue;
@@ -531,6 +696,7 @@ fn load_index(conn: &sp_store::Connection) -> sp_store::Result<LibraryIndex> {
         trains: index_trains,
         groups,
         summary: library::summary(conn)?,
+        tags: library::tag_counts(conn)?,
     })
 }
 
@@ -597,6 +763,7 @@ fn signal_table<'a>(signals: &'a [Signal]) -> Element<'a, Message> {
     for (label, width) in labels.iter().zip(COLUMN_WIDTHS) {
         head = head.push(heading(label, width));
     }
+    head = head.push(heading("", 80.0));
     table = table.push(head).push(horizontal_rule(1));
     for signal in signals {
         let stats = signal.stats;
@@ -615,10 +782,16 @@ fn signal_table<'a>(signals: &'a [Signal]) -> Element<'a, Message> {
             fmt_opt(stats.and_then(|s| s.mean())),
             fmt_opt(stats.and_then(|s| s.rms())),
         ];
-        let mut line = row![];
+        let mut line = row![].align_y(Alignment::Center);
         for (value, width) in cells.into_iter().zip(COLUMN_WIDTHS) {
             line = line.push(cell(value, width));
         }
+        line = line.push(
+            button(text("Inspect").size(11))
+                .padding([2, 8])
+                .style(button::text)
+                .on_press(Message::Inspect(Target::Signal(signal.id))),
+        );
         table = table.push(line);
     }
     table.into()
@@ -652,15 +825,25 @@ fn pulse_table<'a>(
             Some(unit) => format!("{} ({unit})", field.name),
             None => field.name.clone(),
         };
-        summary = summary.push(row![
-            cell(name, 180.0),
-            cell(field.dtype, 60.0),
-            cell(fmt_opt(stats.and_then(|s| s.min())), 100.0),
-            cell(fmt_opt(stats.and_then(|s| s.max())), 100.0),
-            cell(fmt_opt(stats.and_then(|s| s.mean())), 100.0),
-            cell(fmt_opt(stats.and_then(|s| s.rms())), 100.0),
-            cell(stats.map_or(0, |s| s.non_finite()), 80.0),
-        ]);
+        summary = summary.push(
+            row![
+                cell(name, 180.0),
+                cell(field.dtype, 60.0),
+                cell(fmt_opt(stats.and_then(|s| s.min())), 100.0),
+                cell(fmt_opt(stats.and_then(|s| s.max())), 100.0),
+                cell(fmt_opt(stats.and_then(|s| s.mean())), 100.0),
+                cell(fmt_opt(stats.and_then(|s| s.rms())), 100.0),
+                cell(stats.map_or(0, |s| s.non_finite()), 80.0),
+                button(text("Inspect").size(11))
+                    .padding([2, 8])
+                    .style(button::text)
+                    .on_press(Message::Inspect(Target::PulseField {
+                        group: group.id,
+                        ordinal: field.ordinal,
+                    })),
+            ]
+            .align_y(Alignment::Center),
+        );
     }
 
     let shown = rows.len();
@@ -770,6 +953,59 @@ mod tests {
             Message::DetailLoaded(GroupId::new(2), Ok(GroupDetail::Signals(Vec::new()))),
         );
         assert!(matches!(state.detail, Some((id, _)) if id == GroupId::new(2)));
+    }
+
+    #[test]
+    fn toggling_a_tag_narrows_and_widens_the_filter() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::ToggleTag("golden".into()));
+        let _ = state.update(None, Message::ToggleTag("noisy".into()));
+        assert_eq!(state.tag_filter, ["golden", "noisy"]);
+        let _ = state.update(None, Message::ToggleTag("golden".into()));
+        assert_eq!(state.tag_filter, ["noisy"]);
+    }
+
+    #[test]
+    fn clearing_drops_the_query_and_the_tag_filter_together() {
+        let mut state = State {
+            hits: Some(Vec::new()),
+            search: "rf".into(),
+            tag_filter: vec!["golden".into()],
+            ..State::default()
+        };
+        let _ = state.update(None, Message::ClearSearch);
+        assert!(state.hits.is_none());
+        assert!(state.search.is_empty());
+        assert!(state.tag_filter.is_empty());
+    }
+
+    #[test]
+    fn a_tag_filter_survives_an_emptied_query() {
+        let mut state = State {
+            hits: Some(Vec::new()),
+            tag_filter: vec!["golden".into()],
+            ..State::default()
+        };
+        // Deleting the text leaves the tag filter — and its hits — in place.
+        let _ = state.update(None, Message::SearchChanged(String::new()));
+        assert!(state.hits.is_some());
+    }
+
+    #[test]
+    fn inspect_is_handed_to_the_root_once() {
+        let mut state = State::default();
+        let target = Target::Signal(SignalId::new(7));
+        let _ = state.update(None, Message::Inspect(target));
+        assert_eq!(state.take_inspect_request(), Some(target));
+        assert_eq!(state.take_inspect_request(), None);
+    }
+
+    #[test]
+    fn a_cancelled_export_dialog_writes_nothing() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::ExportTo(DatasetId::new(1), None));
+        assert!(state.notice.is_none());
+        assert!(state.error.is_none());
     }
 
     #[test]

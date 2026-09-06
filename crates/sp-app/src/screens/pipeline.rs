@@ -261,6 +261,12 @@ impl State {
         std::mem::take(&mut self.completed)
     }
 
+    /// The saved pipeline the last run belonged to, for retention (§12.1).
+    #[must_use]
+    pub fn saved_id(&self) -> Option<PipelineId> {
+        self.saved_id
+    }
+
     pub fn update(&mut self, store: Option<&Store>, message: Message) -> Task<Message> {
         match message {
             Message::Loaded(Ok(loaded)) => {

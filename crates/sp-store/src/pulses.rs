@@ -248,7 +248,8 @@ pub fn list_fields(conn: &Connection, group_id: GroupId) -> Result<Vec<PulseFiel
     Ok(out)
 }
 
-fn field_blob(conn: &Connection, group_id: GroupId, ordinal: u32) -> Result<BlobId> {
+/// The blob holding one field's column.
+pub fn field_blob(conn: &Connection, group_id: GroupId, ordinal: u32) -> Result<BlobId> {
     let raw: Option<i64> = conn.query_row(
         "SELECT blob_id FROM pulse_field WHERE group_id = ?1 AND ordinal = ?2",
         params![group_id.get(), ordinal],

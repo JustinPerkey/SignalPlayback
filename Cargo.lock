@@ -3642,6 +3642,7 @@ dependencies = [
  "directories",
  "iced",
  "rfd",
+ "serde",
  "serde_json",
  "sp-core",
  "sp-csv",
@@ -3698,6 +3699,7 @@ name = "sp-engine"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "serde",
  "sp-core",
  "sp-store",
  "tempfile",

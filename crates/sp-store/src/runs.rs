@@ -398,6 +398,36 @@ pub fn delete_run(conn: &Connection, id: RunId) -> Result<()> {
     Ok(())
 }
 
+/// Deletes the oldest finished runs of `pipeline` until at most `keep`
+/// remain — the retention default the Settings screen sets (§12.1).
+///
+/// A run a baseline names is kept whatever its age, and does not count
+/// against `keep`: a baseline is the point of reference the newer runs are
+/// measured against, so ageing it out would quietly disarm the regression
+/// suite. So is a run still going. Returns how many were deleted.
+pub fn prune_runs(conn: &Connection, pipeline: PipelineId, keep: usize) -> Result<usize> {
+    let runs = list_runs(conn, Some(pipeline))?;
+    let mut deletable = Vec::new();
+    for run in runs {
+        if run.status == RunStatus::Running {
+            continue;
+        }
+        if !crate::regress::baselines_of_run(conn, run.id)?.is_empty() {
+            continue;
+        }
+        deletable.push(run.id);
+    }
+    // `list_runs` is newest first, so the tail past `keep` is the oldest.
+    if deletable.len() <= keep {
+        return Ok(0);
+    }
+    let doomed = deletable.split_off(keep);
+    for id in &doomed {
+        delete_run(conn, *id)?;
+    }
+    Ok(doomed.len())
+}
+
 // ---------------------------------------------------------------------------
 // Group and stage records
 // ---------------------------------------------------------------------------
@@ -1098,7 +1128,7 @@ fn not_found_as(error: StoreError, what: &'static str, id: i64) -> StoreError {
 mod tests {
     use super::*;
     use sp_core::run::Severity;
-    use sp_core::{DType, SampleBuffer, SourceKind};
+    use sp_core::{DType, SampleBuffer, SourceKind, Tolerances};
 
     use crate::library::{self, NewDataset, NewGroup};
     use crate::trains::{self, NewTrain};
@@ -1538,6 +1568,80 @@ mod tests {
             .read(|conn| cache_lookup(conn, "key-b"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn retention_prunes_the_oldest_runs_but_never_a_baseline() {
+        let fx = fixture(1);
+        let pipeline = saved_pipeline(&fx.store);
+        let group = fx.groups[0];
+
+        let ids = fx
+            .store
+            .write(move |conn| {
+                let mut ids = Vec::new();
+                for index in 0..5 {
+                    let run = begin_run(conn, &NewRun::new(pipeline, format!("hash-{index}")))?;
+                    record_stage(conn, run, &RunStageRow::new(group, 0, StageStatus::Ok))?;
+                    finish_run(conn, run, RunStatus::Ok)?;
+                    ids.push(run);
+                }
+                // The oldest run is a baseline, so retention must step over it.
+                crate::regress::promote(conn, "golden", ids[0], &Tolerances::EXACT)?;
+                Ok(ids)
+            })
+            .unwrap();
+
+        let pruned = fx
+            .store
+            .write(move |conn| prune_runs(conn, pipeline, 2))
+            .unwrap();
+        // Five runs, one of them a baseline: two newest kept, two deleted.
+        assert_eq!(pruned, 2);
+
+        let left = fx
+            .store
+            .read(move |conn| list_runs(conn, Some(pipeline)))
+            .unwrap();
+        let left: Vec<RunId> = left.into_iter().map(|run| run.id).collect();
+        assert_eq!(left, vec![ids[4], ids[3], ids[0]]);
+
+        // Nothing left to do the second time.
+        assert_eq!(
+            fx.store
+                .write(move |conn| prune_runs(conn, pipeline, 2))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn retention_leaves_a_running_run_alone() {
+        let fx = fixture(1);
+        let pipeline = saved_pipeline(&fx.store);
+        let live = fx
+            .store
+            .write(move |conn| {
+                let done = begin_run(conn, &NewRun::new(pipeline, "done"))?;
+                finish_run(conn, done, RunStatus::Ok)?;
+                begin_run(conn, &NewRun::new(pipeline, "live"))
+            })
+            .unwrap();
+
+        assert_eq!(
+            fx.store
+                .write(move |conn| prune_runs(conn, pipeline, 0))
+                .unwrap(),
+            1,
+            "the finished run goes, the running one stays"
+        );
+        assert_eq!(
+            fx.store
+                .read(move |conn| get_run(conn, live))
+                .unwrap()
+                .status,
+            RunStatus::Running
+        );
     }
 
     #[test]

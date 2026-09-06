@@ -8,11 +8,13 @@
 
 pub mod generate;
 pub mod import;
+pub mod inspector;
 pub mod library;
 pub mod pipeline;
 pub mod properties;
 pub mod results;
 pub mod scope;
+pub mod settings;
 
 use iced::widget::{column, container, row, text, text::secondary, Space};
 use iced::{Element, Length};

@@ -1,0 +1,93 @@
+name: Release
+
+# A tag is the release. `v0.1.0` builds the binary on each supported platform
+# and attaches it to a GitHub release; the workflow can also be run by hand to
+# check that the release build still works without cutting one.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: signalplayback-windows-x86_64
+            binary: signalplayback.exe
+          - os: ubuntu-latest
+            artifact: signalplayback-linux-x86_64
+            binary: signalplayback
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Iced's winit backend needs the X11/Wayland and font development
+      # headers to build on Linux.
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxkbcommon-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libwayland-dev libfontconfig1-dev
+
+      - name: Build
+        run: cargo build --release -p sp-app --locked
+
+      # The same binary is the window and the test runner (§10.4), so the
+      # smoke test is that it answers on the terminal.
+      - name: Smoke test
+        run: |
+          ./target/release/${{ matrix.binary }} --version
+          ./target/release/${{ matrix.binary }} help
+        shell: bash
+
+      - name: Stage the artifact
+        run: |
+          mkdir -p dist
+          cp target/release/${{ matrix.binary }} dist/
+          cp README.md LICENSE dist/
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+
+  release:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package each platform
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            (cd "$name" && zip -r "../$name.zip" .)
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
