@@ -20,12 +20,13 @@ releasable.
   standard deviation, zero crossings — the distribution behind them, and a
   paged value table. A pulse group's table is the pulse records themselves,
   one row per pulse across every field.
-- **Tags and search** — a tag filter beside full-text search on the Library
-  screen. Both narrow: a query plus two tags asks for the signals that match
-  the text *and* carry both.
-- **Export** — a dataset writes back out in the format it was imported from,
-  from the Library screen or from `signalplayback export`, so import → run →
-  export is scriptable (G1).
+- **Import and export on the terminal** — `signalplayback import` reads a CSV
+  file into the library and `signalplayback export` writes a dataset back out
+  in the format it came from, so the whole loop — import, run, export — is
+  scriptable (G1).
+- **Library filters** — a tag filter and a property filter (`prf_hz` with
+  `>= 1000`, `coding` with `nrz`) beside full-text search, and a group's
+  signal table sorts on any column.
 - **Settings** — library location (it reopens in place), theme, default sample
   rate, strict/tolerant import, run retention, decimation quality and
   histogram bins, saved to `settings.json` as they change, plus what the open
@@ -85,6 +86,7 @@ signalplayback run --library lib.db --pipeline "detector" \
                    --dataset "impairment ladder" --assert-baseline golden
 signalplayback run --library lib.db --pipeline "detector" --promote golden
 signalplayback baselines --library lib.db
+signalplayback import --library lib.db --file capture.csv --name "capture 1"
 signalplayback export --library lib.db --dataset "capture 1" --out out.csv
 signalplayback help
 ```

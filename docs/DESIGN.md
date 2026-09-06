@@ -1,10 +1,15 @@
 # SignalPlayback — Design Document
 
-**Status:** Draft v0.5
-**Date:** 2026-09-04
+**Status:** Draft v0.6
+**Date:** 2026-09-06
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v0.6** — Written while building M8. §12.4 added for the settings file and
+> what each setting does; §12.1 says what the Inspector computes and how the Runs screen
+> hands a run to Results; §7.5 covers the command-line export and why only an imported
+> dataset can be exported.
+>
 > **Changes in v0.5** — Schema corrections found while building M1: `sample_chunk` keeps
 > its rowid because `sqlite3_blob_open` cannot address a `WITHOUT ROWID` table; `signal`
 > gains `nan_count` so cached statistics reload with their sums intact; `dataset` gains
@@ -827,7 +832,9 @@ properties and pulse fields that were never mapped to a definition are written b
 
 Export is reachable two ways, and both call the same writer: the Library screen's
 `Export` on a dataset, and `signalplayback export --dataset <name|#id> --out <path>` on
-the command line, so import → run → export is scriptable without the window. Only a
+the command line. `signalplayback import --file <path>` is the other half, reading a file
+with the profile the sniff pass proposes — no mapping is invented on the terminal, since a
+mapping is a decision — so import → run → export is scriptable without the window. Only a
 dataset that was imported can be exported: the layout it was read with is stored on the
 dataset (`csv_layout`) and is what the writer reverses, so a generated or derived dataset
 has nothing to reverse and the action is refused rather than guessed at.
@@ -1511,7 +1518,7 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 
 | Screen | Purpose |
 |--------|---------|
-| **Library** | Tree of Dataset → Group → Signal / pulse field, with search, property filters, and a sortable detail table. Hosts cross-group pulse search (§6.6): a field predicate returns matching pulses across every group, each row jumping to its group and playhead position. Multi-select feeds the scope, a playlist, or a pipeline run. |
+| **Library** | Tree of Dataset → Group → Signal / pulse field, with search, tag and property filters (every filter narrows: a query, two tags and `prf_hz >= 1000` asks for the signals that satisfy all of them), and a detail table sortable on any column — numeric columns as numbers, and a signal with no cached statistics last either way. Hosts cross-group pulse search (§6.6): a field predicate returns matching pulses across every group, each row jumping to its group and playhead position. Multi-select feeds the scope, a playlist, or a pipeline run. |
 | **Import** | File picker → preview grid of the headers and first group → column-mapping panel (which column is the time of arrival and in what unit, which columns bind to property definitions) → profile save/load → progress with a live error list. |
 | **Generate** | Node tree editor, parameter form, live preview, sweep configuration, preset browser. |
 | **Pipeline** | Stage palette on the left, ordered stage list in the middle, generated parameter form on the right. Port validation inline. Run controls with group selection. |

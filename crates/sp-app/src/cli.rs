@@ -57,6 +57,7 @@ Usage:
   signalplayback run [options]         run a pipeline headlessly
   signalplayback baselines [options]   list the library's baselines
   signalplayback promote [options]     promote a run to a named baseline
+  signalplayback import [options]      read a CSV file into the library
   signalplayback export [options]      write a dataset back out as CSV
   signalplayback help                  show this text
 
@@ -80,6 +81,12 @@ Options for `baselines` and `promote`:
   --library <path>        library file
   --run <id>              the run to promote (promote only; required)
   --promote <name>        the baseline name to promote it to (promote only)
+
+Options for `import`:
+  --library <path>        library file
+  --file <path>           the CSV file to read (required)
+  --name <text>           dataset name (default: the file's stem)
+  --strict                refuse a file whose declared counts do not match
 
 Options for `export`:
   --library <path>        library file
@@ -106,6 +113,7 @@ pub fn dispatch(args: &[String]) -> Invocation {
         "run" => Invocation::Exited(run_command(&args[1..])),
         "baselines" => Invocation::Exited(baselines_command(&args[1..])),
         "promote" => Invocation::Exited(promote_command(&args[1..])),
+        "import" => Invocation::Exited(import_command(&args[1..])),
         "export" => Invocation::Exited(export_command(&args[1..])),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
@@ -177,6 +185,71 @@ fn promote_command(args: &[String]) -> i32 {
     match store.write(move |conn| regress::promote(conn, &name, RunId::new(run), &tolerances)) {
         Ok(_) => {
             println!("promoted run {run} to '{}'", options.promote.unwrap());
+            OK
+        }
+        Err(error) => usage(&error.to_string()),
+    }
+}
+
+/// `signalplayback import` — the framer and ingest of §7 on the command line,
+/// so the whole loop (import, run, export) is scriptable.
+///
+/// The profile is the one the sniff pass proposes, which is what the Import
+/// screen offers as its starting point: no column mapping is invented here,
+/// because a mapping is a decision and this is not the place to make it
+/// silently. `--strict` is the only knob, and it fails the import rather than
+/// warning (§7.3).
+fn import_command(args: &[String]) -> i32 {
+    let options = match Args::parse(args) {
+        Ok(options) => options,
+        Err(error) => return usage(&error),
+    };
+    let Some(file) = options.file.clone() else {
+        return usage("import needs --file <path>");
+    };
+    // Unlike the other commands, import creates the library if it is not
+    // there: a first import into a fresh file is the normal way to start.
+    let path = match options
+        .library
+        .clone()
+        .or_else(crate::paths::default_library_file)
+    {
+        Some(path) => path,
+        None => return usage("no library was given and there is no default location"),
+    };
+    let store = match Store::open(&path) {
+        Ok(store) => store,
+        Err(error) => return usage(&format!("{}: {error}", path.display())),
+    };
+
+    let mut profile = sp_csv::ImportProfile::default();
+    profile.mode = if options.strict {
+        sp_csv::profile::CountMode::Strict
+    } else {
+        sp_csv::profile::CountMode::Tolerant
+    };
+    let preview = match sp_csv::sniff_file(&file, &profile) {
+        Ok(preview) => preview,
+        Err(error) => return usage(&error.to_string()),
+    };
+    let mut request = sp_csv::ImportRequest::new(preview.proposed(&profile));
+    if let Some(name) = options.name.clone() {
+        request = request.named(name);
+    }
+
+    let source = file.clone();
+    let imported = store.write(move |conn| {
+        sp_csv::import_file(conn, &source, &request, &sp_csv::ImportControl::new())
+            .map_err(|error| sp_store::StoreError::Invalid(error.to_string()))
+    });
+    match imported {
+        Ok(report) => {
+            println!("imported {}", report.summary());
+            if !options.quiet {
+                for diagnostic in report.diagnostics.items().iter().take(20) {
+                    println!("  {diagnostic}");
+                }
+            }
             OK
         }
         Err(error) => usage(&error.to_string()),
@@ -487,6 +560,12 @@ pub struct Args {
     pub run: Option<i64>,
     /// Where `export` writes.
     pub out: Option<PathBuf>,
+    /// The file `import` reads.
+    pub file: Option<PathBuf>,
+    /// Whether `import` refuses a file whose counts do not add up (§7.3).
+    pub strict: bool,
+    /// Dataset name for `import`.
+    pub name: Option<String>,
     pub tolerances: Tolerances,
     pub no_cache: bool,
     pub quiet: bool,
@@ -514,6 +593,9 @@ impl Args {
                 "--promote" => parsed.promote = Some(value()?),
                 "--run" => parsed.run = Some(number(&value()?)?),
                 "--out" => parsed.out = Some(PathBuf::from(value()?)),
+                "--file" => parsed.file = Some(PathBuf::from(value()?)),
+                "--name" => parsed.name = Some(value()?),
+                "--strict" => parsed.strict = true,
                 "--notes" => parsed.notes = Some(value()?),
                 "--tolerance-sample-abs" => parsed.tolerances.sample_abs = float(&value()?)?,
                 "--tolerance-sample-rel" => parsed.tolerances.sample_rel = float(&value()?)?,

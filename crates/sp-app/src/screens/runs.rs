@@ -202,7 +202,6 @@ impl State {
                     return Task::none();
                 }
                 self.error = None;
-                let label = name.clone();
                 Task::perform(
                     jobs::write(store.clone(), move |conn| {
                         // Promoting is exact unless the baseline already
@@ -215,11 +214,6 @@ impl State {
                     }),
                     Message::Done,
                 )
-                .chain(Task::done(Message::Refresh))
-                .map(move |message| match message {
-                    Message::Done(Ok(_)) => Message::Done(Ok(format!("Promoted to '{label}'."))),
-                    other => other,
-                })
             }
             Message::Delete(run) => {
                 let Some(store) = store else {

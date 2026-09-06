@@ -10,7 +10,6 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use sp_core::{DType, PipelineId, SampleBuffer, SourceKind, Timebase};
-use sp_csv::{ingest, ImportControl, ImportProfile, ImportRequest};
 use sp_proc::pipeline::{Pipeline, PipelineStage};
 use sp_store::library::{NewDataset, NewGroup, NewSignal};
 use sp_store::runs::NewPipeline;
@@ -229,21 +228,23 @@ fn a_dataset_exports_back_to_the_file_it_came_from() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample/sample.csv");
     let original = std::fs::read_to_string(&source).unwrap();
 
-    // Import the sample the design was written against, through the same
-    // code the Import screen uses.
-    {
-        let store = Store::open(&path).unwrap();
-        let profile = ImportProfile::default();
-        let preview = sp_csv::sniff_file(&source, &profile).unwrap();
-        let request = ImportRequest::new(preview.proposed(&profile)).named("sample");
-        let file = source.clone();
-        store
-            .write(move |conn| {
-                ingest::import_file(conn, &file, &request, &ImportControl::new()).unwrap();
-                Ok(())
-            })
-            .unwrap();
-    }
+    // The whole loop on the terminal: the sample the design was written
+    // against goes in, and comes back out (G1).
+    let imported = cli(&[
+        "import",
+        "--library",
+        &path.to_string_lossy(),
+        "--file",
+        &source.to_string_lossy(),
+        "--name",
+        "sample",
+    ]);
+    assert_eq!(imported.status.code(), Some(0), "{}", stdout(&imported));
+    assert!(
+        stdout(&imported).contains("imported sample"),
+        "{}",
+        stdout(&imported)
+    );
 
     let out = dir.path().join("out.csv");
     let exported = cli(&[

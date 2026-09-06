@@ -9,9 +9,10 @@
 //! Everything shown is metadata read from the store; a pulse group's table
 //! previews the first rows of its columns and nothing more is materialised.
 //!
-//! Search and the tag filter narrow together: typing a query and selecting two
-//! tags asks for the signals that match the text *and* carry both tags. Either
-//! on its own works as you would expect, and clearing both puts the tree back.
+//! Search, the tag filter and the property filter narrow together: a query
+//! plus two tags plus `prf_hz >= 1000` asks for the signals that satisfy all
+//! of them. Any one on its own works as you would expect, and clearing them
+//! puts the tree back.
 //! A row's `Inspect` button hands the Inspector its target (§12.1), and a
 //! dataset exports back to the format it was imported from (§7.5, G1).
 
@@ -26,7 +27,7 @@ use sp_core::group::DatasetId;
 use sp_core::{
     Dataset, GroupId, PulseField, SampleRange, Signal, SignalGroup, SignalId, SignalTrain, TrainId,
 };
-use sp_store::{library, pulses, trains, LibrarySummary, Store};
+use sp_store::{library, props, pulses, trains, LibrarySummary, PropertyQuery, Store};
 
 use crate::jobs;
 use crate::screens::inspector::Target;
@@ -95,6 +96,12 @@ pub struct State {
     hits: Option<Vec<Signal>>,
     /// Tags the list is narrowed to; a signal must carry all of them.
     tag_filter: Vec<String>,
+    /// Property key the list is narrowed on, and the test its value must
+    /// pass, as typed (§6.3).
+    prop_key: String,
+    prop_value: String,
+    /// How the group's signal table is ordered: column index and direction.
+    sort: Option<(usize, bool)>,
     /// A target the user asked the Inspector for, waiting for the root to
     /// navigate there.
     inspect_request: Option<Target>,
@@ -114,6 +121,9 @@ pub enum Message {
     SearchDone(Result<Vec<Signal>, String>),
     ClearSearch,
     ToggleTag(String),
+    PropKeyChanged(String),
+    PropValueChanged(String),
+    SortBy(usize),
     Inspect(Target),
     ExportDataset(DatasetId),
     ExportTo(DatasetId, Option<PathBuf>),
@@ -226,6 +236,25 @@ impl State {
                 }
                 self.query(store)
             }
+            Message::PropKeyChanged(key) => {
+                self.prop_key = key;
+                if self.prop_key.trim().is_empty() && self.is_unfiltered() {
+                    self.hits = None;
+                }
+                Task::none()
+            }
+            Message::PropValueChanged(value) => {
+                self.prop_value = value;
+                Task::none()
+            }
+            Message::SortBy(column) => {
+                // Clicking the column that is already sorted turns it over.
+                self.sort = match self.sort {
+                    Some((current, ascending)) if current == column => Some((column, !ascending)),
+                    _ => Some((column, true)),
+                };
+                Task::none()
+            }
             Message::Inspect(target) => {
                 self.inspect_request = Some(target);
                 Task::none()
@@ -287,37 +316,57 @@ impl State {
         self.inspect_request.take()
     }
 
-    /// Runs the text query and the tag filter together. Both narrow: with a
-    /// query and two tags selected, a signal has to match all three.
+    /// Whether nothing is narrowing the list.
+    fn is_unfiltered(&self) -> bool {
+        self.search.trim().is_empty()
+            && self.tag_filter.is_empty()
+            && self.prop_key.trim().is_empty()
+    }
+
+    /// Runs the text query, the tag filter and the property filter together.
+    /// Every one of them narrows: with a query, two tags and a property test,
+    /// a signal has to satisfy all of them.
     fn query(&mut self, store: Option<&Store>) -> Task<Message> {
-        let query = self.search.trim().to_owned();
-        let tags = self.tag_filter.clone();
-        if query.is_empty() && tags.is_empty() {
+        if self.is_unfiltered() {
             self.hits = None;
             return Task::none();
         }
         let Some(store) = store else {
             return Task::none();
         };
+        let query = self.search.trim().to_owned();
+        let tags = self.tag_filter.clone();
+        let property = match self.prop_key.trim().is_empty() {
+            true => None,
+            false => Some((
+                self.prop_key.trim().to_owned(),
+                parse_property_query(&self.prop_value),
+            )),
+        };
+
         Task::perform(
             jobs::read(store.clone(), move |conn| {
-                let by_text = match query.is_empty() {
-                    true => None,
-                    false => Some(library::search_signals(conn, &query)?),
+                // Each filter is an intersection with what the ones before it
+                // left, so they narrow rather than compete.
+                let mut narrowed: Option<Vec<SignalId>> = None;
+                let mut narrow = |ids: Vec<SignalId>| {
+                    narrowed = Some(match narrowed.take() {
+                        Some(kept) => ids.into_iter().filter(|id| kept.contains(id)).collect(),
+                        None => ids,
+                    });
                 };
-                let by_tag = match tags.is_empty() {
-                    true => None,
-                    false => Some(library::signals_with_all_tags(conn, &tags)?),
-                };
-                let ids: Vec<SignalId> = match (by_text, by_tag) {
-                    (Some(text), Some(tagged)) => {
-                        text.into_iter().filter(|id| tagged.contains(id)).collect()
-                    }
-                    (Some(text), None) => text,
-                    (None, Some(tagged)) => tagged,
-                    (None, None) => Vec::new(),
-                };
-                ids.into_iter()
+                if !query.is_empty() {
+                    narrow(library::search_signals(conn, &query)?);
+                }
+                if !tags.is_empty() {
+                    narrow(library::signals_with_all_tags(conn, &tags)?);
+                }
+                if let Some((key, test)) = &property {
+                    narrow(props::find_signals(conn, key, test)?);
+                }
+                narrowed
+                    .unwrap_or_default()
+                    .into_iter()
                     .map(|id| library::get_signal(conn, id))
                     .collect()
             }),
@@ -360,6 +409,23 @@ impl State {
                 .padding([5, 9])
                 .style(button::text)
                 .on_press(Message::Refresh),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        // A property filter is a key and a test over its value: `prf_hz` with
+        // `>= 1000`, or `coding` with `nrz` (§6.3).
+        let property_row = row![
+            text_input("property", &self.prop_key)
+                .on_input(Message::PropKeyChanged)
+                .on_submit(Message::Search)
+                .size(12)
+                .width(Length::FillPortion(2)),
+            text_input("any value", &self.prop_value)
+                .on_input(Message::PropValueChanged)
+                .on_submit(Message::Search)
+                .size(12)
+                .width(Length::FillPortion(3)),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -586,7 +652,7 @@ impl State {
         }
 
         column![
-            container(search_row).padding([10, 10]),
+            container(column![search_row, property_row].spacing(6)).padding([10, 10]),
             scrollable(container(list).padding([0, 6])).height(Length::Fill),
         ]
         .into()
@@ -657,7 +723,7 @@ impl State {
         } else {
             match &self.detail {
                 Some((id, detail)) if *id == selected => match detail {
-                    GroupDetail::Signals(signals) => signal_table(signals),
+                    GroupDetail::Signals(signals) => signal_table(signals, self.sort),
                     GroupDetail::Pulses {
                         fields,
                         toa_s,
@@ -748,7 +814,55 @@ fn heading<'a>(content: impl ToString, width: f32) -> Element<'a, Message> {
         .into()
 }
 
-fn signal_table<'a>(signals: &'a [Signal]) -> Element<'a, Message> {
+/// Orders a group's signals by the column the user clicked.
+///
+/// The sort is over the metadata already loaded — nine columns of one group —
+/// so it never goes back to the store. A column of numbers sorts as numbers,
+/// which is the whole point of sorting on `Samples` or `RMS`; the rest sort as
+/// text. A signal with no cached statistics sorts last either way, because
+/// "unknown" is not "zero".
+fn sorted_signals(signals: &[Signal], sort: Option<(usize, bool)>) -> Vec<&Signal> {
+    let mut ordered: Vec<&Signal> = signals.iter().collect();
+    let Some((column, ascending)) = sort else {
+        return ordered;
+    };
+    let number = |signal: &Signal| -> Option<f64> {
+        let stats = signal.stats;
+        match column {
+            3 => signal.timebase.sample_rate_hz,
+            4 => Some(signal.sample_count as f64),
+            5 => stats.and_then(|s| s.min()),
+            6 => stats.and_then(|s| s.max()),
+            7 => stats.and_then(|s| s.mean()),
+            8 => stats.and_then(|s| s.rms()),
+            _ => None,
+        }
+    };
+    let text_of = |signal: &Signal| -> String {
+        match column {
+            1 => signal.domain.label().to_lowercase(),
+            2 => signal.dtype.to_string(),
+            _ => signal.name.to_lowercase(),
+        }
+    };
+
+    if (3..=8).contains(&column) {
+        ordered.sort_by(|a, b| match (number(a), number(b)) {
+            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+    } else {
+        ordered.sort_by_key(|signal| text_of(signal));
+    }
+    if !ascending {
+        ordered.reverse();
+    }
+    ordered
+}
+
+fn signal_table(signals: &[Signal], sort: Option<(usize, bool)>) -> Element<'_, Message> {
     if signals.is_empty() {
         return text("This group has no signals.")
             .size(13)
@@ -760,12 +874,29 @@ fn signal_table<'a>(signals: &'a [Signal]) -> Element<'a, Message> {
     ];
     let mut table = column![].spacing(0);
     let mut head = row![];
-    for (label, width) in labels.iter().zip(COLUMN_WIDTHS) {
-        head = head.push(heading(label, width));
+    for (index, (label, width)) in labels.iter().zip(COLUMN_WIDTHS).enumerate() {
+        // The heading is the control: clicking it sorts, clicking it again
+        // turns the order over.
+        let marker = match sort {
+            Some((column, true)) if column == index => " ▲",
+            Some((column, false)) if column == index => " ▼",
+            _ => "",
+        };
+        head = head.push(
+            button(
+                text(format!("{label}{marker}"))
+                    .size(11)
+                    .style(text::secondary),
+            )
+            .width(Length::Fixed(width))
+            .padding([3, 6])
+            .style(button::text)
+            .on_press(Message::SortBy(index)),
+        );
     }
     head = head.push(heading("", 80.0));
     table = table.push(head).push(horizontal_rule(1));
-    for signal in signals {
+    for signal in sorted_signals(signals, sort) {
         let stats = signal.stats;
         let rate = signal
             .timebase
@@ -865,6 +996,68 @@ fn pulse_table<'a>(
     column![summary, Space::with_height(Length::Fixed(18.0)), records].into()
 }
 
+/// Turns what the user typed into a property test (§6.3).
+///
+/// The forms are the ones people write in a filter box, and anything else is
+/// taken as text to match exactly, because a property's value is as often a
+/// word as a number:
+///
+/// | Typed | Means |
+/// |-------|-------|
+/// | (empty) | the property is present, whatever its value |
+/// | `1000` | exactly that number |
+/// | `>= 1000`, `> 1000` | at least that |
+/// | `<= 1000`, `< 1000` | at most that |
+/// | `100..2000` | between the two, inclusive |
+/// | `nrz` | that text |
+///
+/// The strict forms `>` and `<` are read as their inclusive counterparts: the
+/// index is a range index, and a filter box is not the place to lose a row to
+/// a boundary the user did not think about.
+pub fn parse_property_query(raw: &str) -> PropertyQuery {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return PropertyQuery::Exists;
+    }
+    let number = |text: &str| text.trim().parse::<f64>().ok();
+
+    if let Some((low, high)) = raw.split_once("..") {
+        let min = number(low);
+        let max = number(high);
+        if min.is_some() || max.is_some() {
+            return PropertyQuery::Between { min, max };
+        }
+    }
+    for prefix in [">=", ">"] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            if let Some(min) = number(rest) {
+                return PropertyQuery::Between {
+                    min: Some(min),
+                    max: None,
+                };
+            }
+        }
+    }
+    for prefix in ["<=", "<"] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            if let Some(max) = number(rest) {
+                return PropertyQuery::Between {
+                    min: None,
+                    max: Some(max),
+                };
+            }
+        }
+    }
+    let exact = raw.strip_prefix('=').unwrap_or(raw);
+    match number(exact) {
+        Some(value) => PropertyQuery::Between {
+            min: Some(value),
+            max: Some(value),
+        },
+        None => PropertyQuery::Equals(exact.trim().to_owned()),
+    }
+}
+
 fn value_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
@@ -953,6 +1146,136 @@ mod tests {
             Message::DetailLoaded(GroupId::new(2), Ok(GroupDetail::Signals(Vec::new()))),
         );
         assert!(matches!(state.detail, Some((id, _)) if id == GroupId::new(2)));
+    }
+
+    #[test]
+    fn a_property_filter_reads_the_forms_people_type() {
+        assert_eq!(parse_property_query(""), PropertyQuery::Exists);
+        assert_eq!(parse_property_query("   "), PropertyQuery::Exists);
+        assert_eq!(
+            parse_property_query("1000"),
+            PropertyQuery::Between {
+                min: Some(1000.0),
+                max: Some(1000.0)
+            }
+        );
+        assert_eq!(
+            parse_property_query(">= 1000"),
+            PropertyQuery::Between {
+                min: Some(1000.0),
+                max: None
+            }
+        );
+        // A strict bound is read as its inclusive counterpart, on purpose.
+        assert_eq!(
+            parse_property_query("> 1000"),
+            parse_property_query(">=1000")
+        );
+        assert_eq!(
+            parse_property_query("<= 1e6"),
+            PropertyQuery::Between {
+                min: None,
+                max: Some(1e6)
+            }
+        );
+        assert_eq!(
+            parse_property_query("100..2000"),
+            PropertyQuery::Between {
+                min: Some(100.0),
+                max: Some(2000.0)
+            }
+        );
+        assert_eq!(
+            parse_property_query("..2000"),
+            PropertyQuery::Between {
+                min: None,
+                max: Some(2000.0)
+            }
+        );
+        // Anything that is not a number is text to match.
+        assert_eq!(
+            parse_property_query("nrz"),
+            PropertyQuery::Equals("nrz".into())
+        );
+        assert_eq!(
+            parse_property_query("= nrz"),
+            PropertyQuery::Equals("nrz".into())
+        );
+    }
+
+    #[test]
+    fn a_property_key_alone_is_a_filter() {
+        let mut state = State::default();
+        assert!(state.is_unfiltered());
+        let _ = state.update(None, Message::PropKeyChanged("prf_hz".into()));
+        assert!(!state.is_unfiltered());
+        let _ = state.update(None, Message::PropKeyChanged(String::new()));
+        assert!(state.is_unfiltered());
+    }
+
+    #[test]
+    fn a_column_sorts_and_then_reverses() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::SortBy(4));
+        assert_eq!(state.sort, Some((4, true)));
+        let _ = state.update(None, Message::SortBy(4));
+        assert_eq!(state.sort, Some((4, false)), "the same column turns over");
+        let _ = state.update(None, Message::SortBy(0));
+        assert_eq!(
+            state.sort,
+            Some((0, true)),
+            "another column starts ascending"
+        );
+    }
+
+    #[test]
+    fn sorting_orders_numbers_as_numbers_and_puts_the_unknown_last() {
+        use sp_core::{DType, Domain, Provenance, Timebase};
+
+        let signal = |name: &str, samples: u64, stats: Option<sp_core::SignalStats>| Signal {
+            id: SignalId::new(samples as i64 + 1),
+            group_id: GroupId::new(1),
+            ordinal: 0,
+            name: name.to_owned(),
+            units: None,
+            dtype: DType::F32,
+            domain: Domain::Analog,
+            provenance: Provenance::Imported,
+            timebase: Timebase::regular(1_000.0, 0.0),
+            sample_count: samples,
+            stats,
+            attributes: sp_core::Attributes::new(),
+        };
+        let stats = |values: &[f64]| Some(values.iter().copied().collect::<sp_core::SignalStats>());
+        let signals = vec![
+            signal("b", 100, stats(&[5.0])),
+            signal("a", 9, stats(&[1.0])),
+            signal("c", 50, None),
+        ];
+
+        // 9 before 100: the column is numeric, not text.
+        let by_samples = sorted_signals(&signals, Some((4, true)));
+        assert_eq!(
+            by_samples
+                .iter()
+                .map(|s| s.sample_count)
+                .collect::<Vec<_>>(),
+            [9, 50, 100]
+        );
+        // A signal with no statistics has no maximum, so it sorts last either
+        // way rather than pretending to be zero.
+        let by_max = sorted_signals(&signals, Some((6, true)));
+        assert_eq!(by_max.last().unwrap().name, "c");
+        let by_max_desc = sorted_signals(&signals, Some((6, false)));
+        assert_eq!(by_max_desc.first().unwrap().name, "c");
+        // And the name column is text.
+        let by_name = sorted_signals(&signals, Some((0, true)));
+        assert_eq!(
+            by_name.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        // Unsorted is the order the store returned.
+        assert_eq!(sorted_signals(&signals, None)[0].name, "b");
     }
 
     #[test]

@@ -201,13 +201,29 @@ impl State {
         };
         self.profiling = true;
         Task::batch([
-            Task::perform(
-                jobs::read(store.clone(), move |conn| load_detail(conn, target)),
-                move |result| Message::Loaded(target, result),
-            ),
+            self.detail_task(store, target),
             self.profile_task(store, target),
             self.values_task(store, target, 0),
         ])
+    }
+
+    /// Re-reads the metadata alone.
+    ///
+    /// Renaming, tagging or editing a property changes a row, never a sample,
+    /// so nothing about the statistics or the values can have moved — and
+    /// re-profiling would re-read the whole column to learn that.
+    fn reload_detail(&self, store: Option<&Store>) -> Task<Message> {
+        match (store, self.target) {
+            (Some(store), Some(target)) => self.detail_task(store, target),
+            _ => Task::none(),
+        }
+    }
+
+    fn detail_task(&self, store: &Store, target: Target) -> Task<Message> {
+        Task::perform(
+            jobs::read(store.clone(), move |conn| load_detail(conn, target)),
+            move |result| Message::Loaded(target, result),
+        )
     }
 
     fn profile_task(&self, store: &Store, target: Target) -> Task<Message> {
@@ -372,8 +388,9 @@ impl State {
                     }
                 }
                 // Whatever changed, the row it changed is what the screen is
-                // showing, so read it back rather than patching it in place.
-                self.reload(store)
+                // showing, so read it back rather than patching it in place —
+                // the row only, since none of these edits touches a sample.
+                self.reload_detail(store)
             }
             Message::Page(delta) => {
                 let start = self.page_start as i64 + delta * PAGE as i64;
