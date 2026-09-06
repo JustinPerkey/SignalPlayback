@@ -25,7 +25,8 @@ pub use props::{
 };
 pub use pulse::{FieldRange, PulseField, PulseRef, TimeUnit};
 pub use run::{
-    ArtifactId, Diagnostic, Disposition, PipelineId, Retention, RunStatus, Severity, StageStatus,
+    ArtifactId, AssertStatus, BaselineId, Diagnostic, Disposition, PipelineId, Retention,
+    RunStatus, Severity, StageStatus, Tolerances,
 };
 pub use signal::{
     DType, Domain, Provenance, RunId, SampleBuffer, Samples, Scaling, Signal, SignalId, C64,

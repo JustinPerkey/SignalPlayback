@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{ArtifactSchema, FieldKind, FieldSpec};
+use super::{ArtifactSchema, FieldKind, FieldSpec, ViewHint};
 use crate::time::TimeRange;
 
 /// A payload that does not match the schema it was declared under.
@@ -443,6 +443,56 @@ fn finite(value: Option<f64>) -> Option<f64> {
     value.filter(|v| v.is_finite())
 }
 
+/// Reads a payload's shape back off the payload itself, for a reader that
+/// does not have the writing crate's schema (§10.4).
+///
+/// A regression diff runs long after the run it compares, possibly in a build
+/// that no longer links the stage that wrote the artifact. Rather than refuse
+/// to compare what it cannot type, it infers: every top-level key becomes a
+/// field, and the kind comes from the first entry that is not null. The result
+/// is a schema that decodes *this* payload — good enough to diff two of them
+/// field by field, and never used to draw anything, which is what a declared
+/// schema is for.
+#[must_use]
+pub fn infer_schema(payload: &Value) -> ArtifactSchema {
+    let Some(object) = payload.as_object() else {
+        return ArtifactSchema::opaque();
+    };
+    let fields = object
+        .iter()
+        .map(|(name, value)| FieldSpec::new(name.clone(), infer_kind(value)))
+        .collect();
+    ArtifactSchema::new(fields, ViewHint::Tree)
+}
+
+/// The kind that decodes `value`, which is an array of rows for every
+/// artifact the parallel-array convention covers.
+fn infer_kind(value: &Value) -> FieldKind {
+    let first = match value {
+        Value::Array(entries) => entries.iter().find(|entry| !entry.is_null()),
+        scalar => Some(scalar),
+    };
+    match first {
+        Some(Value::Bool(_)) => FieldKind::Bool,
+        Some(Value::String(_)) => FieldKind::Text,
+        Some(Value::Number(number)) => {
+            if number.is_i64() || number.is_u64() {
+                FieldKind::Int
+            } else {
+                FieldKind::Float
+            }
+        }
+        // A pair of numbers is a span; anything longer is a run of values.
+        // Both decode; only the pair carries timeline meaning.
+        Some(Value::Array(inner)) if inner.len() == 2 && inner.iter().all(Value::is_number) => {
+            FieldKind::SpanS
+        }
+        Some(Value::Array(_)) => FieldKind::FloatArray,
+        // An empty column, or one of nulls: Float decodes both to no rows.
+        _ => FieldKind::Float,
+    }
+}
+
 fn type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -624,6 +674,56 @@ mod tests {
         assert_eq!(spans.rows, (2, 1));
         assert_eq!(spans.mismatches, 1);
         assert_eq!(spans.first_divergence, Some(1));
+    }
+
+    #[test]
+    fn an_inferred_schema_decodes_the_payload_it_was_read_from() {
+        // What a diff has when the crate that wrote the artifact is not
+        // linked in: the payload and nothing else.
+        let payload = r#"{"spans":[[0.0,1.0],[2.0,3.0]],"scores":[0.9,0.4],
+                          "labels":["a","b"],"count":2,"ok":[true,false]}"#;
+        let value: Value = serde_json::from_str(payload).unwrap();
+        let schema = infer_schema(&value);
+
+        let kind = |name: &str| schema.field(name).unwrap().kind;
+        assert_eq!(kind("spans"), FieldKind::SpanS);
+        assert_eq!(kind("scores"), FieldKind::Float);
+        assert_eq!(kind("labels"), FieldKind::Text);
+        assert_eq!(kind("count"), FieldKind::Int);
+        assert_eq!(kind("ok"), FieldKind::Bool);
+
+        let data = ArtifactData::decode(schema, payload).unwrap();
+        assert_eq!(data.rows(), 2);
+        assert_eq!(data.column("scores").unwrap().number_at(1), Some(0.4));
+        assert_eq!(
+            data.column("spans").unwrap().span_at(1).unwrap().start_s,
+            2.0
+        );
+        // A scalar is a one-row column, which is how `count` reads back.
+        assert_eq!(data.column("count").unwrap().number_at(0), Some(2.0));
+    }
+
+    #[test]
+    fn two_payloads_of_the_same_shape_diff_through_their_inferred_schemas() {
+        let a: Value = serde_json::from_str(r#"{"scores":[0.9,0.4],"labels":["a","b"]}"#).unwrap();
+        let b: Value = serde_json::from_str(r#"{"scores":[0.9,0.5],"labels":["a","b"]}"#).unwrap();
+        let left = ArtifactData::from_value(infer_schema(&a), &a).unwrap();
+        let right = ArtifactData::from_value(infer_schema(&b), &b).unwrap();
+
+        let diffs = diff(&left, &right, 0.0);
+        let scores = diffs.iter().find(|d| d.field == "scores").unwrap();
+        assert_eq!(scores.mismatches, 1);
+        assert_eq!(scores.first_divergence, Some(1));
+        assert!((scores.max_abs_error - 0.1).abs() < 1e-12);
+        assert!(diffs
+            .iter()
+            .find(|d| d.field == "labels")
+            .unwrap()
+            .is_equal());
+
+        // Within tolerance the same pair is equal, which is what a baseline
+        // with a non-zero artifact tolerance asks for.
+        assert!(diff(&left, &right, 0.2).iter().all(FieldDiff::is_equal));
     }
 
     #[test]

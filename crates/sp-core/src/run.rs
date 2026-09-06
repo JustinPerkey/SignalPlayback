@@ -24,6 +24,11 @@ crate::id_newtype! {
     ArtifactId
 }
 
+crate::id_newtype! {
+    /// Identifies a run promoted to a named baseline (§10.4).
+    BaselineId
+}
+
 /// How a run ended, or that it has not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -281,6 +286,127 @@ impl Diagnostic {
     }
 }
 
+/// How one assertion turned out on one group (§9.7).
+///
+/// `NotApplicable` is a first-class outcome rather than a failure: an
+/// assertion about an artifact a group never produced, or one that compares
+/// against a baseline when no baseline was given, has nothing to say — and
+/// silently passing it would make a regression suite lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssertStatus {
+    Pass,
+    Fail,
+    NotApplicable,
+    /// The expression could not be evaluated — a malformed reference, or a
+    /// value that is not a number where the test needs one.
+    Error,
+}
+
+impl AssertStatus {
+    pub const ALL: [Self; 4] = [Self::Pass, Self::Fail, Self::NotApplicable, Self::Error];
+
+    /// The token stored in `run_assertion.status`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::NotApplicable => "not_applicable",
+            Self::Error => "error",
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "Passed",
+            Self::Fail => "Failed",
+            Self::NotApplicable => "Not applicable",
+            Self::Error => "Could not evaluate",
+        }
+    }
+
+    /// Whether this outcome should fail the group, and with it the run. An
+    /// assertion that could not be evaluated counts as a failure: a test that
+    /// silently stopped testing is worse than one that fails.
+    #[must_use]
+    pub const fn is_failure(self) -> bool {
+        matches!(self, Self::Fail | Self::Error)
+    }
+}
+
+/// How far a run may drift from a baseline and still pass (§10.4).
+///
+/// Every tolerance defaults to zero — bit-exact — because that is what G8
+/// claims: the same pipeline over the same inputs produces the same results.
+/// A tolerance is therefore always a deliberate statement that some difference
+/// is expected, made once when the baseline is promoted rather than per
+/// comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tolerances {
+    /// Absolute difference allowed between two samples.
+    pub sample_abs: f64,
+    /// Difference allowed between two samples as a fraction of the baseline
+    /// signal's RMS, which keeps one tolerance usable across signals of very
+    /// different amplitude.
+    pub sample_rel: f64,
+    /// Absolute difference allowed between two values of the same metric.
+    pub metric_abs: f64,
+    /// Difference allowed between two metrics as a fraction of the baseline
+    /// value.
+    pub metric_rel: f64,
+    /// Absolute difference allowed between two numeric artifact fields.
+    pub artifact_abs: f64,
+    /// Whether the run may cover groups the baseline does not. A group the
+    /// *baseline* has and the run does not is always a failure: it means a
+    /// case stopped being tested.
+    pub allow_new_groups: bool,
+}
+
+impl Default for Tolerances {
+    fn default() -> Self {
+        Self::EXACT
+    }
+}
+
+impl Tolerances {
+    /// Bit-exact: any difference at all is a deviation.
+    pub const EXACT: Self = Self {
+        sample_abs: 0.0,
+        sample_rel: 0.0,
+        metric_abs: 0.0,
+        metric_rel: 0.0,
+        artifact_abs: 0.0,
+        allow_new_groups: false,
+    };
+
+    /// The largest sample difference allowed for a signal whose baseline RMS
+    /// is `rms`, which is the looser of the absolute and relative bounds.
+    #[must_use]
+    pub fn sample_bound(&self, rms: f64) -> f64 {
+        self.sample_abs.max(self.sample_rel * rms.abs())
+    }
+
+    /// The largest difference allowed for a metric whose baseline value is
+    /// `baseline`.
+    #[must_use]
+    pub fn metric_bound(&self, baseline: f64) -> f64 {
+        self.metric_abs.max(self.metric_rel * baseline.abs())
+    }
+
+    /// Whether these tolerances allow no difference whatsoever.
+    #[must_use]
+    pub fn is_exact(&self) -> bool {
+        self.sample_abs == 0.0
+            && self.sample_rel == 0.0
+            && self.metric_abs == 0.0
+            && self.metric_rel == 0.0
+            && self.artifact_abs == 0.0
+    }
+}
+
 /// Generates the string plumbing every one of these tokens needs: they are
 /// written to a check-constrained column and read back out of it.
 macro_rules! token_conversions {
@@ -312,6 +438,7 @@ token_conversions!(StageStatus, "stage status");
 token_conversions!(Disposition, "disposition");
 token_conversions!(Retention, "retention policy");
 token_conversions!(Severity, "severity");
+token_conversions!(AssertStatus, "assertion status");
 
 #[cfg(test)]
 mod tests {
@@ -400,5 +527,49 @@ mod tests {
         // what keeps `diagnostics_json` readable.
         let json = serde_json::to_string(&Diagnostic::info("ok")).unwrap();
         assert_eq!(json, r#"{"severity":"info","message":"ok"}"#);
+    }
+
+    #[test]
+    fn an_assertion_that_could_not_be_evaluated_fails_the_run() {
+        // A test that silently stopped testing is worse than one that fails,
+        // so `Error` is a failure and `NotApplicable` is not.
+        assert!(AssertStatus::Fail.is_failure());
+        assert!(AssertStatus::Error.is_failure());
+        assert!(!AssertStatus::Pass.is_failure());
+        assert!(!AssertStatus::NotApplicable.is_failure());
+
+        let tokens: Vec<_> = AssertStatus::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(tokens, ["pass", "fail", "not_applicable", "error"]);
+    }
+
+    #[test]
+    fn tolerances_default_to_bit_exact() {
+        let exact = Tolerances::default();
+        assert!(exact.is_exact());
+        assert_eq!(exact.sample_bound(1000.0), 0.0);
+        assert_eq!(exact.metric_bound(1000.0), 0.0);
+
+        // An omitted field keeps its exact default, so an old baseline's
+        // tolerance JSON still reads.
+        let partial: Tolerances = serde_json::from_str(r#"{"sample_abs":1e-9}"#).unwrap();
+        assert_eq!(partial.sample_abs, 1e-9);
+        assert_eq!(partial.metric_rel, 0.0);
+        assert!(!partial.is_exact());
+    }
+
+    #[test]
+    fn a_tolerance_takes_the_looser_of_its_absolute_and_relative_bounds() {
+        let tolerances = Tolerances {
+            sample_abs: 0.01,
+            sample_rel: 0.001,
+            metric_abs: 0.5,
+            metric_rel: 0.05,
+            ..Tolerances::EXACT
+        };
+        // Relative wins on a large signal, absolute on a small one.
+        assert_eq!(tolerances.sample_bound(100.0), 0.1);
+        assert_eq!(tolerances.sample_bound(1.0), 0.01);
+        assert_eq!(tolerances.metric_bound(-40.0), 2.0);
+        assert_eq!(tolerances.metric_bound(1.0), 0.5);
     }
 }

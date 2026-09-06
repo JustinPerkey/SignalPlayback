@@ -6,8 +6,10 @@
 //! one per attempt.
 
 use sp_core::run::Retention;
+use sp_store::regress::AssertionRow;
 use sp_store::runs::PipelineStageRow;
 
+use crate::assert::{AssertError, Assertion};
 use crate::error::{ConfigError, ProcError};
 use crate::param::ParamSet;
 use crate::registry::StageRegistry;
@@ -82,11 +84,64 @@ impl PipelineStage {
     }
 }
 
-/// An ordered list of stages.
+/// An ordered list of stages, plus the assertions that decide whether a run
+/// of them passed (§9.7).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Pipeline {
     pub name: String,
     pub stages: Vec<PipelineStage>,
+    /// Evaluated per group after the last stage. A pipeline with none is not
+    /// a test — it still runs, and every group passes by having nothing to
+    /// fail.
+    pub assertions: Vec<PipelineAssertion>,
+}
+
+/// One assertion of a pipeline: the text the user wrote, and what it parsed
+/// to when it parsed.
+///
+/// The text is kept even when it does not parse, so an editor can hold a
+/// half-typed line without losing it — and a run refuses to start rather than
+/// silently skipping it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipelineAssertion {
+    pub source: String,
+    pub enabled: bool,
+    parsed: Result<Assertion, AssertError>,
+}
+
+impl PipelineAssertion {
+    #[must_use]
+    pub fn new(source: impl Into<String>) -> Self {
+        let source = source.into();
+        let parsed = Assertion::parse(&source);
+        Self {
+            source,
+            enabled: true,
+            parsed,
+        }
+    }
+
+    #[must_use]
+    pub fn disabled(mut self) -> Self {
+        self.enabled = false;
+        self
+    }
+
+    /// The parsed assertion, or why it would not parse.
+    pub fn parsed(&self) -> Result<&Assertion, &AssertError> {
+        self.parsed.as_ref()
+    }
+
+    #[must_use]
+    pub fn error(&self) -> Option<&AssertError> {
+        self.parsed.as_ref().err()
+    }
+
+    /// Whether this assertion has nothing to say without a baseline.
+    #[must_use]
+    pub fn needs_baseline(&self) -> bool {
+        self.parsed.as_ref().is_ok_and(Assertion::needs_baseline)
+    }
 }
 
 /// Something that would stop a pipeline running, pinned to the stage it is
@@ -102,6 +157,19 @@ pub enum PipelineIssue {
         label: String,
         #[source]
         source: ConfigError,
+    },
+
+    /// An assertion that does not parse. A run refuses rather than skipping
+    /// it: a test suite that quietly drops a test is worse than one that will
+    /// not start.
+    #[error("assertion {ordinal} ('{text}'): {reason}")]
+    BadAssertion {
+        ordinal: usize,
+        /// The line as written — named `text` rather than `source` so
+        /// `thiserror` does not read it as the underlying error.
+        text: String,
+        #[source]
+        reason: AssertError,
     },
 
     /// The heart of §9.3: a required input nothing upstream produces, named.
@@ -123,6 +191,7 @@ impl PipelineIssue {
         match self {
             Self::UnknownKind { ordinal, .. }
             | Self::BadParams { ordinal, .. }
+            | Self::BadAssertion { ordinal, .. }
             | Self::UnsatisfiedPort { ordinal, .. } => *ordinal,
         }
     }
@@ -143,6 +212,7 @@ impl Pipeline {
         Self {
             name: name.into(),
             stages: Vec::new(),
+            assertions: Vec::new(),
         }
     }
 
@@ -150,6 +220,22 @@ impl Pipeline {
     pub fn with_stage(mut self, stage: PipelineStage) -> Self {
         self.stages.push(stage);
         self
+    }
+
+    #[must_use]
+    pub fn asserting(mut self, source: impl Into<String>) -> Self {
+        self.assertions.push(PipelineAssertion::new(source));
+        self
+    }
+
+    /// The assertions that would actually be evaluated, with their positions
+    /// — the position is the ordinal a run records them under, so disabling
+    /// one does not renumber the rest.
+    pub fn enabled_assertions(&self) -> impl Iterator<Item = (usize, &PipelineAssertion)> {
+        self.assertions
+            .iter()
+            .enumerate()
+            .filter(|(_, assertion)| assertion.enabled)
     }
 
     /// The stages that would actually run, with their positions in the full
@@ -208,6 +294,16 @@ impl Pipeline {
             produced.extend(descriptor.outputs.iter().map(|port| port.kind));
         }
 
+        for (ordinal, assertion) in self.enabled_assertions() {
+            if let Err(reason) = assertion.parsed() {
+                issues.push(PipelineIssue::BadAssertion {
+                    ordinal,
+                    text: assertion.source.clone(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+
         issues
     }
 
@@ -227,8 +323,9 @@ impl Pipeline {
     /// The canonical hash of what this pipeline computes: kinds, versions and
     /// resolved parameters of the enabled stages, in order (§9.6).
     ///
-    /// Renaming a stage or changing its retention does not change the hash —
-    /// neither changes a single sample.
+    /// Renaming a stage, changing its retention or editing an assertion does
+    /// not change the hash — none of them changes a single sample, and an
+    /// assertion is a question asked of the result rather than part of it.
     pub fn hash(&self, registry: &StageRegistry) -> Result<String, ProcError> {
         let mut hasher = blake3::Hasher::new();
         for (ordinal, stage) in self.enabled() {
@@ -261,6 +358,20 @@ impl Pipeline {
             .collect()
     }
 
+    /// The rows that save this pipeline's assertions.
+    #[must_use]
+    pub fn to_assertion_rows(&self) -> Vec<AssertionRow> {
+        self.assertions
+            .iter()
+            .enumerate()
+            .map(|(ordinal, assertion)| {
+                let mut row = AssertionRow::new(ordinal as u32, assertion.source.clone());
+                row.enabled = assertion.enabled;
+                row
+            })
+            .collect()
+    }
+
     /// Rebuilds a pipeline from its saved rows. Rows are taken in the order
     /// given; the store returns them by ordinal.
     pub fn from_rows(
@@ -278,6 +389,20 @@ impl Pipeline {
             });
         }
         Ok(pipeline)
+    }
+
+    /// Adds the saved assertions to a pipeline rebuilt by [`Self::from_rows`].
+    #[must_use]
+    pub fn with_assertion_rows(mut self, rows: &[AssertionRow]) -> Self {
+        self.assertions = rows
+            .iter()
+            .map(|row| {
+                let mut assertion = PipelineAssertion::new(row.expression.clone());
+                assertion.enabled = row.enabled;
+                assertion
+            })
+            .collect();
+        self
     }
 }
 

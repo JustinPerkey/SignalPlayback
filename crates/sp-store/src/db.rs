@@ -17,7 +17,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use crate::error::{Result, StoreError};
 
 /// The newest schema this build understands.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Numbered migrations, applied in order inside one transaction each.
 const MIGRATIONS: &[(u32, &str)] = &[
@@ -25,6 +25,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (2, include_str!("../schema/0002_trains.sql")),
     (3, include_str!("../schema/0003_pyramid.sql")),
     (4, include_str!("../schema/0004_runs.sql")),
+    (5, include_str!("../schema/0005_regression.sql")),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

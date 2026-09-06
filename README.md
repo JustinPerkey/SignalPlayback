@@ -10,22 +10,37 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
 ## Status
 
-**M2 — Import.** CSV files reach the library. The grouped-block format (§7 of
-the design) is framed by its count column alone, previewed from its first
-group however large the file, and streamed in one pass into one column blob
-per pulse field — with a column-mapping panel for the count and time columns,
-the time unit, per-column storage and property binding; saved import profiles
-for recurring file shapes; strict or tolerant count handling with a positioned
-error list; and cancellable progress. The writer reverses the grammar exactly,
-so import → database → export round-trips (goal G1).
+**M7 — Regression.** A pipeline is now a test. A pipeline carries assertions —
+one line each, evaluated per group after the last stage — over the metrics,
+signal statistics, artifacts and stage timings the run recorded:
 
-Before it, **M1 — Store**: one SQLite file holding metadata and sample data,
-with numbered migrations, a chunked content-addressed blob store read through
-incremental blob I/O, a single-writer/many-reader store actor, user-defined
-property definitions with an indexed query mirror, pulse groups with zone-map
-cross-group search, and a `Verify Library` pass.
+```text
+detections.count == 4
+metrics.snr_db > 12.0
+signals["envelope"].rms within 5% of baseline
+stage[3].wall_ms < 250
+```
 
-Generation, playback and processing are the next milestones (§16).
+A run can be promoted to a named baseline with tolerances, and any two runs
+diff group by group: per-signal max absolute error, RMS error and the first
+sample that differs, a field-level artifact diff, and a metric-by-metric
+comparison. The same binary runs headless, so the whole loop is a CI gate
+(goal G8) — exit 1 says the request was wrong, exit 2 says the algorithm
+regressed.
+
+Before it, **M6 — Results**: any (group, stage) of a run is inspectable with
+its artifacts, drawn by their own view hints, with a stage rail that walks the
+algorithm, a global playhead, a metrics chart across groups, and stage-to-stage
+comparison by pinning. **M5 — Pipeline**: the `Stage` trait, registry, port
+typing, group-at-a-time scheduler and full run recording. **M4 — Playback**:
+render pyramids, viewport reduction, transport and scope. **M3 — Generate**:
+the `GenSpec` tree, primitives, combinators, sweeps and pulse trains.
+**M2 — Import**: the grouped-block CSV framer, mapping UI and round-tripping
+writer (G1). **M1 — Store**: one SQLite file, chunked blob store, property
+index and `Verify Library`.
+
+Polish — the inspector, tags and search, export, settings and packaging — is
+the last milestone (§16).
 
 ## Build and run
 
@@ -36,6 +51,25 @@ cargo run -p sp-app          # launch the application
 cargo test --workspace       # run the test suite
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## Running a pipeline headlessly
+
+The same binary is the window and the test runner. With no arguments it opens
+the application; with a subcommand it runs to completion on the terminal:
+
+```sh
+signalplayback run --library lib.db --pipeline "detector" \
+                   --dataset "impairment ladder" --assert-baseline golden
+signalplayback run --library lib.db --pipeline "detector" --promote golden
+signalplayback baselines --library lib.db
+signalplayback help
+```
+
+| Exit | Meaning |
+|------|---------|
+| 0 | the run finished and everything it was asked to check passed |
+| 1 | the request was wrong — bad arguments, no such pipeline, an unreadable library |
+| 2 | the run finished and failed: a stage error, a failed assertion, or a deviation from the baseline |
 
 ## Workspace
 
@@ -49,12 +83,12 @@ Dependencies point left-to-right only: `sp-core` depends on nothing else here,
 | `sp-csv` | Grouped-block CSV framer, parser, import profiles, writer | M2 |
 | `sp-gen` | `GenSpec` node tree and its renderer | M3 |
 | `sp-engine` | Transport state machine, playback clock, render pyramids | M4 |
-| `sp-proc` | `Stage` trait, registry, ports, scheduler, run recording | M5 |
+| `sp-proc` | `Stage` trait, registry, ports, scheduler, run recording, assertions, run diffing | M5, M7 |
 | `sp-dsp` | Built-in stages: conditioning, filtering, transforms, detection | M5 |
 | `sp-app` | The Iced application — the only crate that knows about pixels | M0+ |
 
 Inside `sp-store`, row-level functions (`library`, `props`, `pulses`, `blob`,
-`profiles`, `verify`) take a connection and do one thing; `Store` owns the connections and
+`profiles`, `regress`, `verify`) take a connection and do one thing; `Store` owns the connections and
 runs closures on the writer thread (`write`) or a pooled reader (`read`).
 
 ## Keyboard

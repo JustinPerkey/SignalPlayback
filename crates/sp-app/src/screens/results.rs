@@ -12,7 +12,9 @@
 //!   artifacts on the same time axis, plus the pinned stage and the residual
 //!   between them;
 //! * the **artifact panes**, one per non-overlay artifact, each drawn by its
-//!   own `ViewHint`.
+//!   own `ViewHint`, plus the metric chart across groups, this group's
+//!   assertion outcomes and — when one is chosen — the diff against another
+//!   run (§9.7, §10.4, §10.5).
 //!
 //! The playhead is global: it belongs to the screen, not to a pane, so
 //! scrubbing moves the scope cursor and the highlighted table row together.
@@ -23,21 +25,24 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use iced::widget::{
-    button, column, container, horizontal_rule, row, scrollable, slider, text, Space,
+    button, column, container, horizontal_rule, pick_list, row, scrollable, slider, text,
+    text_input, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, Theme};
 use sp_core::artifact::{self, ArtifactData, ArtifactRegistry, FieldDiff, ViewHint};
 use sp_core::stats::MinMax;
 use sp_core::{
-    ArtifactSchema, FieldKind, FieldSpec, GroupId, PipelineId, RunId, RunStatus, StageStatus,
-    TimeRange,
+    ArtifactSchema, AssertStatus, FieldKind, FieldSpec, GroupId, PipelineId, RunId, RunStatus,
+    StageStatus, TimeRange, Tolerances,
 };
 use sp_engine::compare;
 use sp_engine::reduce::{TraceDescriptor, TraceSnapshot, TraceStyle};
 use sp_engine::source::{self, ColumnSource};
 use sp_engine::viewport::Amplitude;
 use sp_engine::{reduce, Clock, Transport, TransportState, Viewport};
+use sp_proc::compare::{self as runcompare, DiffOptions, RunDiff};
 use sp_proc::StageRegistry;
+use sp_store::regress::{self, AssertionResultRow, BaselineRow};
 use sp_store::runs::{self, RunGroupRow, RunSignalRow, RunStageRow, SOURCE_STAGE};
 use sp_store::{library, Store};
 
@@ -62,6 +67,12 @@ pub struct RunChoice {
     pub pipeline: String,
     pub status: RunStatus,
     pub when: String,
+}
+
+impl std::fmt::Display for RunChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{} {} · {}", self.id.get(), self.pipeline, self.when)
+    }
 }
 
 /// One chip of the stage rail.
@@ -90,11 +101,25 @@ pub struct RunDetail {
     pub groups: Vec<GroupEntry>,
     /// Every recorded stage row, by `(group, stage ordinal)`.
     pub stage_rows: BTreeMap<(i64, i32), RunStageRow>,
+    /// How each group's assertions turned out (§9.7), by group.
+    pub assertions: BTreeMap<i64, Vec<AssertionResultRow>>,
 }
 
 impl RunDetail {
     fn stage_row(&self, group: GroupId, stage: i32) -> Option<&RunStageRow> {
         self.stage_rows.get(&(group.get(), stage))
+    }
+
+    fn group_assertions(&self, group: GroupId) -> &[AssertionResultRow] {
+        self.assertions.get(&group.get()).map_or(&[], Vec::as_slice)
+    }
+
+    /// How many of a group's assertions failed, for the group list.
+    fn failed_assertions(&self, group: GroupId) -> usize {
+        self.group_assertions(group)
+            .iter()
+            .filter(|row| row.status.is_failure())
+            .count()
     }
 
     /// Every metric name any stage recorded, for the metrics chart (§10.5).
@@ -202,6 +227,16 @@ pub struct State {
     /// shaped as an artifact so the same viewers draw it.
     metric: Option<String>,
     metric_data: Option<ArtifactData>,
+
+    /// The library's baselines, the name a promotion would use, and the
+    /// tolerance it would be stored with, as a percentage (§10.4).
+    baselines: Vec<BaselineRow>,
+    promote_as: String,
+    promote_tolerance: String,
+    /// The run this one is being diffed against, and the diff itself.
+    against: Option<RunId>,
+    diff: Option<RunDiff>,
+    diffing: bool,
 }
 
 impl Default for State {
@@ -236,6 +271,12 @@ impl Default for State {
             diffs: BTreeMap::new(),
             metric: None,
             metric_data: None,
+            baselines: Vec::new(),
+            promote_as: String::new(),
+            promote_tolerance: String::new(),
+            against: None,
+            diff: None,
+            diffing: false,
         }
     }
 }
@@ -258,7 +299,7 @@ fn registries() -> (ArtifactRegistry, StageRegistry) {
 #[derive(Debug, Clone)]
 pub enum Message {
     Refresh,
-    Runs(Result<Vec<RunChoice>, String>),
+    Runs(Result<(Vec<RunChoice>, Vec<BaselineRow>), String>),
     SelectRun(RunId),
     Detail(Result<RunDetail, String>),
     SelectGroup(GroupId),
@@ -274,6 +315,14 @@ pub enum Message {
     SortBy(String, String),
     MetricSelected(String),
 
+    PromoteAs(String),
+    PromoteTolerance(String),
+    Promote,
+    Promoted(Result<String, String>),
+    CompareWith(RunChoice),
+    Compared(Result<Box<RunDiff>, String>),
+    ClearComparison,
+
     Play,
     Pause,
     Toggle,
@@ -285,10 +334,16 @@ pub enum Message {
 }
 
 impl State {
-    /// Loads the runs the picker offers.
+    /// Loads the runs the picker offers, and the baselines they can be
+    /// promoted to or measured against.
     pub fn load(&mut self, store: &Store) -> Task<Message> {
         self.loading = true;
-        Task::perform(jobs::read(store.clone(), load_runs), Message::Runs)
+        Task::perform(
+            jobs::read(store.clone(), |conn| {
+                Ok((load_runs(conn)?, regress::list_baselines(conn)?))
+            }),
+            Message::Runs,
+        )
     }
 
     #[must_use]
@@ -313,10 +368,11 @@ impl State {
             Message::Runs(result) => {
                 self.loading = false;
                 match result {
-                    Ok(runs) => {
+                    Ok((runs, baselines)) => {
                         self.error = None;
                         let newest = runs.first().map(|choice| choice.id);
                         self.runs = runs;
+                        self.baselines = baselines;
                         // The run just finished is the one worth looking at.
                         match (self.run, newest) {
                             (None, Some(run)) => self.select_run(store, run),
@@ -479,6 +535,47 @@ impl State {
                 Task::none()
             }
 
+            Message::PromoteAs(name) => {
+                self.promote_as = name;
+                Task::none()
+            }
+            Message::PromoteTolerance(text) => {
+                self.promote_tolerance = text;
+                Task::none()
+            }
+            Message::Promote => self.promote(store),
+            Message::Promoted(Ok(name)) => {
+                self.status = Some(format!("Promoted this run to the baseline '{name}'."));
+                match store {
+                    Some(store) => self.load(store),
+                    None => Task::none(),
+                }
+            }
+            Message::Promoted(Err(error)) => {
+                self.error = Some(error);
+                Task::none()
+            }
+            Message::CompareWith(choice) => self.compare_with(store, choice.id),
+            Message::Compared(result) => {
+                self.diffing = false;
+                match result {
+                    Ok(diff) => {
+                        self.error = None;
+                        self.diff = Some(*diff);
+                    }
+                    Err(error) => {
+                        self.against = None;
+                        self.error = Some(error);
+                    }
+                }
+                Task::none()
+            }
+            Message::ClearComparison => {
+                self.against = None;
+                self.diff = None;
+                Task::none()
+            }
+
             Message::Play => {
                 self.transport.play();
                 self.clock.reset();
@@ -581,6 +678,103 @@ impl State {
         Task::perform(
             jobs::read(store, move |conn| load_detail(conn, &choice)),
             Message::Detail,
+        )
+    }
+
+    /// Promotes the open run to a named baseline (§10.4).
+    ///
+    /// The tolerance box is a percentage because that is how drift is
+    /// discussed; left empty it promotes bit-exact, which is what G8 claims
+    /// the same pipeline over the same inputs produces.
+    fn promote(&mut self, store: Option<&Store>) -> Task<Message> {
+        let Some(run) = self.run else {
+            return Task::none();
+        };
+        let name = self.promote_as.trim().to_owned();
+        if name.is_empty() {
+            self.error = Some("Give the baseline a name first.".into());
+            return Task::none();
+        }
+        let tolerances = match self.tolerances() {
+            Ok(tolerances) => tolerances,
+            Err(error) => {
+                self.error = Some(error);
+                return Task::none();
+            }
+        };
+        let Some(store) = store else {
+            self.error = Some("No library is open.".into());
+            return Task::none();
+        };
+
+        self.error = None;
+        let reported = name.clone();
+        Task::perform(
+            jobs::write(store.clone(), move |conn| {
+                regress::promote(conn, &name, run, &tolerances)?;
+                Ok(name)
+            }),
+            move |result| Message::Promoted(result.map_err(|error| format!("{reported}: {error}"))),
+        )
+    }
+
+    /// The tolerances the promote box describes: one percentage, applied to
+    /// samples and metrics alike.
+    fn tolerances(&self) -> Result<Tolerances, String> {
+        let text = self.promote_tolerance.trim();
+        if text.is_empty() {
+            return Ok(Tolerances::EXACT);
+        }
+        let percent: f64 = text
+            .trim_end_matches('%')
+            .trim()
+            .parse()
+            .map_err(|_| format!("'{text}' is not a percentage"))?;
+        if !percent.is_finite() || percent < 0.0 {
+            return Err(format!("'{text}' is not a percentage"));
+        }
+        Ok(Tolerances {
+            sample_rel: percent / 100.0,
+            metric_rel: percent / 100.0,
+            ..Tolerances::EXACT
+        })
+    }
+
+    /// Diffs the open run against another one (§10.4). The comparison reads
+    /// both runs' samples, so it runs off the UI thread like any other job.
+    fn compare_with(&mut self, store: Option<&Store>, other: RunId) -> Task<Message> {
+        let Some(run) = self.run else {
+            return Task::none();
+        };
+        if other == run {
+            self.error = Some("A run does not differ from itself.".into());
+            return Task::none();
+        }
+        let Some(store) = store else {
+            self.error = Some("No library is open.".into());
+            return Task::none();
+        };
+        self.against = Some(other);
+        self.diff = None;
+        self.diffing = true;
+        self.error = None;
+
+        // The baseline the other run is promoted to, when it is one, brings
+        // its tolerances with it: comparing against a baseline should mean
+        // the same thing here as it does in CI.
+        let tolerances = self
+            .baselines
+            .iter()
+            .find(|row| row.run_id == other)
+            .map_or(Tolerances::EXACT, |row| row.tolerances);
+        let store = store.clone();
+        Task::perform(
+            jobs::blocking(move || {
+                runcompare::diff_runs(&store, other, run, &DiffOptions::within(tolerances))
+                    .map(Box::new)
+                    .map_err(|error| error.to_string())
+            }),
+            Message::Compared,
         )
     }
 
@@ -905,6 +1099,7 @@ impl State {
                     .outcome
                     .wall_ms
                     .map_or_else(String::new, |ms| format!(" · {ms} ms"));
+                let failed_assertions = detail.failed_assertions(entry.id);
                 let label = column![
                     text(&entry.name).size(12),
                     text(format!("{status}{wall}")).size(10).style(
@@ -916,6 +1111,13 @@ impl State {
                     ),
                 ]
                 .spacing(1)
+                // A group whose stages all ran but whose assertions failed is
+                // still a failing case, and the list has to say so (§9.7).
+                .push_maybe((failed_assertions > 0).then(|| {
+                    text(format!("{failed_assertions} assertion(s) failed"))
+                        .size(10)
+                        .style(text::danger)
+                }))
                 .push_maybe(
                     (!metrics.is_empty()).then(|| text(metrics).size(10).style(text::secondary)),
                 );
@@ -964,12 +1166,84 @@ impl State {
                 horizontal_rule(1),
                 body,
             ]
-            .spacing(6),
+            .spacing(6)
+            .push_maybe(self.run.map(|_| horizontal_rule(1)))
+            .push_maybe(self.regression_controls()),
         )
         .padding(8)
         .width(Length::Fixed(250.0))
         .height(Length::Fill)
         .into()
+    }
+
+    /// Promoting the open run to a baseline, and diffing it against another
+    /// run (§10.4). Both belong next to the run list because both are about
+    /// the run as a whole rather than about one stage of it.
+    fn regression_controls(&self) -> Option<Element<'_, Message>> {
+        let run = self.run?;
+        let named: Vec<&BaselineRow> = self
+            .baselines
+            .iter()
+            .filter(|row| row.run_id == run)
+            .collect();
+
+        let mut panel = column![text("Regression").size(13)].spacing(4);
+        if let Some(baseline) = named.first() {
+            panel = panel.push(
+                text(format!("This run is the baseline '{}'.", baseline.name))
+                    .size(11)
+                    .style(text::success),
+            );
+        }
+
+        panel = panel
+            .push(
+                row![
+                    text_input("Baseline name", &self.promote_as)
+                        .on_input(Message::PromoteAs)
+                        .padding(4)
+                        .size(11)
+                        .width(Length::Fill),
+                    text_input("0%", &self.promote_tolerance)
+                        .on_input(Message::PromoteTolerance)
+                        .padding(4)
+                        .size(11)
+                        .width(Length::Fixed(46.0)),
+                ]
+                .spacing(4),
+            )
+            .push(
+                button(text("Promote to baseline").size(11))
+                    .padding([3.0, 8.0])
+                    .style(button::secondary)
+                    .on_press_maybe(
+                        (!self.promote_as.trim().is_empty()).then_some(Message::Promote),
+                    ),
+            );
+
+        let others: Vec<RunChoice> = self
+            .runs
+            .iter()
+            .filter(|choice| choice.id != run)
+            .cloned()
+            .collect();
+        if !others.is_empty() {
+            let selected = self
+                .against
+                .and_then(|id| others.iter().find(|choice| choice.id == id).cloned());
+            panel = panel.push(
+                pick_list(others, selected, Message::CompareWith)
+                    .placeholder("Compare with run…")
+                    .text_size(11)
+                    .padding(4)
+                    .width(Length::Fill),
+            );
+        }
+
+        if let Some(status) = &self.status {
+            panel = panel.push(text(status).size(10).style(text::secondary));
+        }
+        Some(panel.into())
     }
 
     /// The stage rail: one chip per stage, in order (§10.2).
@@ -1164,7 +1438,7 @@ impl State {
                     .padding([3.0, 8.0])
                     .style(button::text)
                     .on_press_maybe(has_content.then_some(Message::FitAll)),
-                iced::widget::pick_list(Layout::ALL, Some(self.layout), Message::LayoutChanged)
+                pick_list(Layout::ALL, Some(self.layout), Message::LayoutChanged)
                     .text_size(11)
                     .padding(3),
             ]
@@ -1245,8 +1519,14 @@ impl State {
         if let Some(chart) = self.metric_pane() {
             list = list.push(chart);
         }
+        if let Some(assertions) = self.assertions_pane() {
+            list = list.push(assertions);
+        }
         if let Some(diagnostics) = self.diagnostics_pane() {
             list = list.push(diagnostics);
+        }
+        if let Some(comparison) = self.comparison_pane() {
+            list = list.push(comparison);
         }
         if self.view.artifacts.is_empty() {
             list = list.push(
@@ -1364,6 +1644,125 @@ impl State {
         };
         let chart = panes::view(&pane, |_| Message::Refresh);
         Some(column![picker, chart].spacing(4).into())
+    }
+
+    /// How this group's assertions turned out (§9.7). Failures come first:
+    /// they are what the screen was opened for.
+    fn assertions_pane(&self) -> Option<Element<'_, Message>> {
+        let (detail, group) = (self.detail.as_ref()?, self.group?);
+        let rows = detail.group_assertions(group);
+        if rows.is_empty() {
+            return None;
+        }
+        let failed = detail.failed_assertions(group);
+
+        let mut list = column![row![
+            text("Assertions").size(13),
+            Space::with_width(Length::Fill),
+            text(if failed == 0 {
+                format!("{} passed", rows.len())
+            } else {
+                format!("{failed} of {} failed", rows.len())
+            })
+            .size(11)
+            .style(if failed == 0 {
+                text::success
+            } else {
+                text::danger
+            }),
+        ]
+        .align_y(Alignment::Center)]
+        .spacing(3);
+
+        let mut ordered: Vec<&AssertionResultRow> = rows.iter().collect();
+        ordered.sort_by_key(|row| (!row.status.is_failure(), row.ordinal));
+        for row in ordered {
+            let style = match row.status {
+                AssertStatus::Pass => text::success,
+                AssertStatus::NotApplicable => text::secondary,
+                AssertStatus::Fail | AssertStatus::Error => text::danger,
+            };
+            list = list.push(text(row.expression.clone()).size(11).style(style));
+            if let Some(message) = &row.message {
+                list = list.push(text(format!("  {message}")).size(10).style(text::secondary));
+            }
+        }
+        Some(list.into())
+    }
+
+    /// The diff against another run, when one has been chosen (§10.4). The
+    /// selected group's differences are spelled out; the rest are counted, so
+    /// a 500-group dataset does not fill the column.
+    fn comparison_pane(&self) -> Option<Element<'_, Message>> {
+        self.against?;
+        let mut list = column![row![
+            text("Compared with").size(13),
+            Space::with_width(Length::Fill),
+            button(text("Clear").size(10))
+                .padding([2.0, 6.0])
+                .style(button::text)
+                .on_press(Message::ClearComparison),
+        ]
+        .align_y(Alignment::Center)]
+        .spacing(3);
+
+        let Some(diff) = &self.diff else {
+            return Some(
+                list.push(
+                    text(if self.diffing {
+                        "Comparing…"
+                    } else {
+                        "No comparison."
+                    })
+                    .size(11)
+                    .style(text::secondary),
+                )
+                .into(),
+            );
+        };
+
+        list = list.push(text(diff.describe()).size(11).style(if diff.is_clean() {
+            text::success
+        } else {
+            text::danger
+        }));
+        if !diff.same_pipeline {
+            list = list.push(
+                text("the two runs ran different pipelines")
+                    .size(10)
+                    .style(text::secondary),
+            );
+        }
+
+        let deviations = diff.deviations();
+        let here = self.group;
+        for (group, reasons) in &deviations {
+            if Some(*group) != here {
+                continue;
+            }
+            for reason in reasons {
+                list = list.push(text(reason.clone()).size(10).style(text::danger));
+            }
+        }
+        let elsewhere = deviations
+            .iter()
+            .filter(|(group, _)| Some(*group) != here)
+            .count();
+        if elsewhere > 0 {
+            list = list.push(
+                text(format!("{elsewhere} other group(s) deviate"))
+                    .size(10)
+                    .style(text::secondary),
+            );
+        } else if !deviations.is_empty() && here.is_some() {
+            // Every deviation is in this group, which is worth saying plainly.
+            list = list.push(
+                text("no other group deviates")
+                    .size(10)
+                    .style(text::secondary),
+            );
+        }
+        Some(list.into())
     }
 
     /// What the selected stage said about this group (§9.4).
@@ -1520,11 +1919,17 @@ fn load_detail(conn: &sp_store::Connection, choice: &RunChoice) -> sp_store::Res
         .map(|row| ((row.group_id.get(), row.stage_ordinal), row))
         .collect();
 
+    let mut assertions: BTreeMap<i64, Vec<AssertionResultRow>> = BTreeMap::new();
+    for row in regress::run_assertions(conn, choice.id)? {
+        assertions.entry(row.group_id.get()).or_default().push(row);
+    }
+
     Ok(RunDetail {
         run: choice.id,
         stages,
         groups,
         stage_rows,
+        assertions,
     })
 }
 
@@ -1664,6 +2069,22 @@ mod tests {
                 })
                 .collect(),
             stage_rows,
+            assertions: (1..=2i64)
+                .map(|id| {
+                    let status = if id == 2 {
+                        AssertStatus::Fail
+                    } else {
+                        AssertStatus::Pass
+                    };
+                    let mut row =
+                        AssertionResultRow::new(group(id), 0, "metrics.snr_db > 4", status)
+                            .with_values(Some(id as f64 * 3.0), Some(4.0));
+                    if status.is_failure() {
+                        row = row.with_message("6 is not > 4");
+                    }
+                    (id, vec![row])
+                })
+                .collect(),
         }
     }
 
@@ -1682,6 +2103,48 @@ mod tests {
         };
         let _ = state.update(None, Message::Detail(Ok(detail())));
         state
+    }
+
+    #[test]
+    fn a_groups_assertion_outcomes_are_counted_and_shown() {
+        let mut state = opened();
+        let detail = state.detail.as_ref().unwrap();
+        assert_eq!(detail.failed_assertions(group(1)), 0);
+        assert_eq!(detail.failed_assertions(group(2)), 1);
+        assert_eq!(detail.group_assertions(group(2))[0].actual, Some(6.0));
+
+        // The pane exists for a group that has assertions, and not for one
+        // whose run recorded none.
+        assert!(state.assertions_pane().is_some());
+        state.detail.as_mut().unwrap().assertions.clear();
+        assert!(state.assertions_pane().is_none());
+    }
+
+    #[test]
+    fn a_baseline_is_promoted_under_a_name_and_a_tolerance() {
+        let mut state = opened();
+        // Without a name there is nothing to promote to.
+        let _ = state.update(None, Message::Promote);
+        assert!(state.error.as_ref().unwrap().contains("name"));
+
+        let _ = state.update(None, Message::PromoteAs("golden".into()));
+        assert!(state.tolerances().unwrap().is_exact(), "empty means exact");
+
+        let _ = state.update(None, Message::PromoteTolerance("2.5%".into()));
+        let tolerances = state.tolerances().unwrap();
+        assert_eq!(tolerances.sample_rel, 0.025);
+        assert_eq!(tolerances.metric_rel, 0.025);
+
+        let _ = state.update(None, Message::PromoteTolerance("loose".into()));
+        assert!(state.tolerances().is_err());
+    }
+
+    #[test]
+    fn a_run_cannot_be_compared_with_itself() {
+        let mut state = opened();
+        let _ = state.update(None, Message::CompareWith(state.runs[0].clone()));
+        assert!(state.error.as_ref().unwrap().contains("does not differ"));
+        assert_eq!(state.against, None);
     }
 
     #[test]

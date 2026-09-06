@@ -1,8 +1,9 @@
 //! The Pipeline screen (`docs/DESIGN.md` §9, §12.1).
 //!
-//! Three columns: the stage palette on the left, the ordered stage list in the
-//! middle, and on the right the parameter form for the selected stage above
-//! the run controls.
+//! Three columns: the stage palette on the left, the ordered stage list —
+//! with the pipeline's assertions beneath it (§9.7) — in the middle, and on
+//! the right the parameter form for the selected stage above the run
+//! controls.
 //!
 //! Nothing here knows what any particular stage does. The palette is whatever
 //! the [`StageRegistry`] holds, and the parameter form is generated from the
@@ -23,9 +24,10 @@ use iced::{Alignment, Element, Length, Subscription, Task};
 use sp_core::run::Retention;
 use sp_core::{Dataset, DatasetId, GroupId, PipelineId, PropertyValue, SignalGroup};
 use sp_proc::param::{ParamKind, ParamSpec};
-use sp_proc::pipeline::{Pipeline, PipelineIssue, PipelineStage};
+use sp_proc::pipeline::{Pipeline, PipelineAssertion, PipelineIssue, PipelineStage};
 use sp_proc::scheduler::{RunControl, RunOptions, RunProgress, RunSummary};
 use sp_proc::{StageDescriptor, StageRegistry};
+use sp_store::regress::{self, AssertionRow, BaselineRow};
 use sp_store::runs::{self, NewPipeline, PipelineRow};
 use sp_store::{library, Store};
 
@@ -43,6 +45,7 @@ struct Job {
 pub struct Loaded {
     datasets: Vec<Dataset>,
     saved: Vec<PipelineRow>,
+    baselines: Vec<BaselineRow>,
 }
 
 /// A dataset in the run panel's picker.
@@ -68,6 +71,20 @@ pub struct PipelineChoice {
 impl fmt::Display for PipelineChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.label)
+    }
+}
+
+/// A baseline in the run panel's picker. `None` — "no baseline" — is a real
+/// choice, so it is a variant rather than an empty selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineChoice(pub Option<String>);
+
+impl fmt::Display for BaselineChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(name) => f.write_str(name),
+            None => f.write_str("No baseline"),
+        }
     }
 }
 
@@ -118,6 +135,10 @@ pub struct State {
     dataset: Option<DatasetId>,
     groups: Vec<SignalGroup>,
     chosen: BTreeSet<GroupId>,
+    /// The library's baselines, and which one `baseline` in an assertion
+    /// resolves against for the next run (§9.7).
+    baselines: Vec<BaselineRow>,
+    baseline: Option<String>,
 
     job: Option<Job>,
     shown: Option<RunProgress>,
@@ -149,6 +170,8 @@ impl Default for State {
             dataset: None,
             groups: Vec::new(),
             chosen: BTreeSet::new(),
+            baselines: Vec::new(),
+            baseline: None,
             job: None,
             shown: None,
             summary: None,
@@ -177,14 +200,31 @@ pub enum Message {
     ParamToggled(&'static str, bool),
     ParamPicked(&'static str, Variant),
 
+    AddAssertion,
+    AssertionChanged(usize, String),
+    AssertionEnabled(usize, bool),
+    RemoveAssertion(usize),
+
     DatasetPicked(DatasetChoice),
     GroupToggled(GroupId, bool),
     AllGroups(bool),
+    BaselinePicked(BaselineChoice),
 
     Save,
     Saved(Result<PipelineId, String>),
     LoadPipeline(PipelineChoice),
-    PipelineLoaded(Result<(PipelineId, String, Vec<sp_store::PipelineStageRow>), String>),
+    #[allow(clippy::type_complexity)]
+    PipelineLoaded(
+        Result<
+            (
+                PipelineId,
+                String,
+                Vec<sp_store::PipelineStageRow>,
+                Vec<AssertionRow>,
+            ),
+            String,
+        >,
+    ),
 
     Run,
     Cancel,
@@ -199,6 +239,7 @@ impl State {
                 Ok(Loaded {
                     datasets: library::list_datasets(conn)?,
                     saved: runs::list_pipelines(conn)?,
+                    baselines: regress::list_baselines(conn)?,
                 })
             }),
             Message::Loaded,
@@ -225,6 +266,16 @@ impl State {
             Message::Loaded(Ok(loaded)) => {
                 self.datasets = loaded.datasets;
                 self.saved = loaded.saved;
+                self.baselines = loaded.baselines;
+                // A baseline that has been deleted stops being the one the
+                // next run compares against, rather than failing the run.
+                if !self
+                    .baselines
+                    .iter()
+                    .any(|row| Some(&row.name) == self.baseline.as_ref())
+                {
+                    self.baseline = None;
+                }
                 // Selecting the only dataset saves a click, and is what the
                 // user meant every time there is just one.
                 match (self.dataset, self.datasets.first()) {
@@ -310,6 +361,38 @@ impl State {
                 Task::none()
             }
 
+            Message::AddAssertion => {
+                self.pipeline.assertions.push(PipelineAssertion::new(""));
+                self.notice = None;
+                Task::none()
+            }
+            Message::AssertionChanged(index, text) => {
+                if let Some(slot) = self.pipeline.assertions.get_mut(index) {
+                    let enabled = slot.enabled;
+                    // Re-parsed on every keystroke: the editor flags a line as
+                    // it is typed rather than at save time, and a half-typed
+                    // line is kept as text either way.
+                    *slot = PipelineAssertion::new(text);
+                    slot.enabled = enabled;
+                }
+                Task::none()
+            }
+            Message::AssertionEnabled(index, enabled) => {
+                if let Some(slot) = self.pipeline.assertions.get_mut(index) {
+                    slot.enabled = enabled;
+                }
+                Task::none()
+            }
+            Message::RemoveAssertion(index) => {
+                if index < self.pipeline.assertions.len() {
+                    self.pipeline.assertions.remove(index);
+                }
+                Task::none()
+            }
+            Message::BaselinePicked(choice) => {
+                self.baseline = choice.0;
+                Task::none()
+            }
             Message::DatasetPicked(choice) => self.choose_dataset(store, choice.id),
             Message::GroupToggled(id, on) => {
                 if on {
@@ -348,15 +431,20 @@ impl State {
                 Task::perform(
                     jobs::read(store.clone(), move |conn| {
                         let header = runs::get_pipeline(conn, id)?;
-                        Ok((id, header.name, runs::pipeline_stages(conn, id)?))
+                        Ok((
+                            id,
+                            header.name,
+                            runs::pipeline_stages(conn, id)?,
+                            regress::pipeline_assertions(conn, id)?,
+                        ))
                     }),
                     Message::PipelineLoaded,
                 )
             }
-            Message::PipelineLoaded(Ok((id, name, rows))) => {
+            Message::PipelineLoaded(Ok((id, name, rows, assertions))) => {
                 match Pipeline::from_rows(name, &rows) {
                     Ok(pipeline) => {
-                        self.pipeline = pipeline;
+                        self.pipeline = pipeline.with_assertion_rows(&assertions);
                         self.saved_id = Some(id);
                         self.select(if self.pipeline.stages.is_empty() {
                             None
@@ -524,6 +612,7 @@ impl State {
         let existing = self.saved_id;
         let name = self.pipeline.name.trim().to_owned();
         let rows = self.pipeline.to_rows();
+        let assertions = self.pipeline.to_assertion_rows();
         Task::perform(
             jobs::write(store.clone(), move |conn| {
                 let id = match existing {
@@ -534,6 +623,7 @@ impl State {
                     None => runs::insert_pipeline(conn, &NewPipeline::new(name))?,
                 };
                 runs::set_pipeline_stages(conn, id, &rows)?;
+                regress::set_pipeline_assertions(conn, id, &assertions)?;
                 Ok(id)
             }),
             Message::Saved,
@@ -568,14 +658,25 @@ impl State {
             }));
 
         let groups: Vec<GroupId> = self.chosen.iter().copied().collect();
+        // The chosen baseline is what `baseline` in an assertion resolves
+        // against; a run without one reports those assertions as not
+        // applicable rather than failing them (§9.7).
+        let baseline_run = self.baseline.as_ref().and_then(|name| {
+            self.baselines
+                .iter()
+                .find(|row| &row.name == name)
+                .map(|row| row.run_id)
+        });
         let options = RunOptions {
             dataset_id: self.dataset,
+            baseline_run,
             ..RunOptions::default()
         };
         let pipeline = self.pipeline.clone();
         let existing = self.saved_id;
         let name = self.pipeline.name.trim().to_owned();
         let rows = self.pipeline.to_rows();
+        let assertions = self.pipeline.to_assertion_rows();
         let store = store.clone();
 
         self.job = Some(Job { progress, cancel });
@@ -608,6 +709,7 @@ impl State {
                                 None => runs::insert_pipeline(conn, &NewPipeline::new(name))?,
                             };
                             runs::set_pipeline_stages(conn, id, &rows)?;
+                            regress::set_pipeline_assertions(conn, id, &assertions)?;
                             Ok(id)
                         })
                         .map_err(|error| error.to_string())?;
@@ -740,6 +842,11 @@ impl State {
         for (index, stage) in self.pipeline.stages.iter().enumerate() {
             body = body.push(self.stage_row(index, stage, &issues));
         }
+
+        body = body
+            .push(Space::with_height(Length::Fixed(10.0)))
+            .push(self.assertions());
+
         if !issues.is_empty() {
             body = body
                 .push(Space::with_height(Length::Fixed(8.0)))
@@ -750,6 +857,67 @@ impl State {
             }
         }
         body.into()
+    }
+
+    /// The pipeline's assertions (§9.7): one line each, checked as it is
+    /// typed, so a line that will not parse says why next to itself rather
+    /// than only when a run refuses to start.
+    fn assertions(&self) -> Element<'_, Message> {
+        let mut list = column![row![
+            text("Assertions").size(14),
+            Space::with_width(Length::Fill),
+            small_button("Add", Some(Message::AddAssertion)),
+        ]
+        .align_y(Alignment::Center)]
+        .spacing(6);
+
+        if self.pipeline.assertions.is_empty() {
+            return list
+                .push(
+                    text(
+                        "A pipeline with assertions is a test: each one is evaluated per group \
+                         after the last stage. Try `metrics.snr_db > 12` or \
+                         `signals[\"rf\"].rms within 5% of baseline`.",
+                    )
+                    .size(12)
+                    .style(text::secondary),
+                )
+                .into();
+        }
+
+        for (index, assertion) in self.pipeline.assertions.iter().enumerate() {
+            let failing = assertion.error().is_some() && !assertion.source.trim().is_empty();
+            let mut line = column![row![
+                checkbox("", assertion.enabled)
+                    .size(14)
+                    .on_toggle(move |on| Message::AssertionEnabled(index, on)),
+                text_input("metrics.snr_db > 12", &assertion.source)
+                    .on_input(move |text| Message::AssertionChanged(index, text))
+                    .padding(5)
+                    .size(13)
+                    .width(Length::Fill),
+                small_button("Remove", Some(Message::RemoveAssertion(index))),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)]
+            .spacing(2);
+
+            if failing {
+                line = line.push(
+                    text(assertion.error().expect("just checked").to_string())
+                        .size(11)
+                        .style(text::danger),
+                );
+            } else if assertion.needs_baseline() {
+                line = line.push(
+                    text("compares against the run panel's baseline")
+                        .size(11)
+                        .style(text::secondary),
+                );
+            }
+            list = list.push(line);
+        }
+        list.into()
     }
 
     fn stage_row<'a>(
@@ -1061,6 +1229,38 @@ impl State {
             );
         }
 
+        if self
+            .pipeline
+            .assertions
+            .iter()
+            .any(PipelineAssertion::needs_baseline)
+        {
+            let choices: Vec<BaselineChoice> = std::iter::once(BaselineChoice(None))
+                .chain(
+                    self.baselines
+                        .iter()
+                        .map(|row| BaselineChoice(Some(row.name.clone()))),
+                )
+                .collect();
+            panel = panel.push(
+                pick_list(
+                    choices,
+                    Some(BaselineChoice(self.baseline.clone())),
+                    Message::BaselinePicked,
+                )
+                .text_size(12)
+                .padding(5)
+                .width(Length::Fill),
+            );
+            if self.baselines.is_empty() {
+                panel = panel.push(
+                    text("Promote a run on the Results screen to compare against it.")
+                        .size(11)
+                        .style(text::secondary),
+                );
+            }
+        }
+
         let runnable = self.job.is_none()
             && !self.chosen.is_empty()
             && self.pipeline.validate(&self.registry).is_ok();
@@ -1189,6 +1389,71 @@ mod tests {
 
     fn add(state: &mut State, kind: &'static str) {
         let _ = state.update(None, Message::AddStage(kind));
+    }
+
+    #[test]
+    fn an_assertion_is_checked_as_it_is_typed() {
+        let mut state = state();
+        add(&mut state, "dsp.condition.gain");
+        let _ = state.update(None, Message::AddAssertion);
+        assert_eq!(state.pipeline.assertions.len(), 1);
+
+        // A half-typed line is kept as text and flagged, not discarded.
+        let _ = state.update(None, Message::AssertionChanged(0, "metrics.snr".into()));
+        assert_eq!(state.pipeline.assertions[0].source, "metrics.snr");
+        assert!(state.pipeline.assertions[0].error().is_some());
+        let issues = state.pipeline.issues(&state.registry);
+        assert!(matches!(issues[0], PipelineIssue::BadAssertion { .. }));
+
+        let _ = state.update(
+            None,
+            Message::AssertionChanged(0, "metrics.snr > 12".into()),
+        );
+        assert!(state.pipeline.assertions[0].error().is_none());
+        assert!(state.pipeline.issues(&state.registry).is_empty());
+
+        // Disabling keeps the line but takes it out of the run.
+        let _ = state.update(None, Message::AssertionEnabled(0, false));
+        assert_eq!(state.pipeline.enabled_assertions().count(), 0);
+        assert_eq!(state.pipeline.assertions.len(), 1);
+
+        let _ = state.update(None, Message::RemoveAssertion(0));
+        assert!(state.pipeline.assertions.is_empty());
+    }
+
+    #[test]
+    fn a_disabled_assertion_that_will_not_parse_does_not_block_the_run() {
+        // Only what would actually be evaluated has to parse, so a line
+        // parked mid-edit can be switched off rather than deleted.
+        let mut state = state();
+        add(&mut state, "dsp.condition.gain");
+        let _ = state.update(None, Message::AddAssertion);
+        let _ = state.update(None, Message::AssertionChanged(0, "nonsense".into()));
+        assert!(!state.pipeline.issues(&state.registry).is_empty());
+        let _ = state.update(None, Message::AssertionEnabled(0, false));
+        assert!(state.pipeline.issues(&state.registry).is_empty());
+    }
+
+    #[test]
+    fn the_baseline_choice_survives_only_while_that_baseline_does() {
+        let mut state = state();
+        let _ = state.update(
+            None,
+            Message::BaselinePicked(BaselineChoice(Some("golden".into()))),
+        );
+        assert_eq!(state.baseline.as_deref(), Some("golden"));
+
+        // Reloading a library that no longer has it clears the choice rather
+        // than failing the next run.
+        let _ = state.update(
+            None,
+            Message::Loaded(Ok(Loaded {
+                datasets: Vec::new(),
+                saved: Vec::new(),
+                baselines: Vec::new(),
+            })),
+        );
+        assert_eq!(state.baseline, None);
     }
 
     #[test]
@@ -1378,12 +1643,15 @@ mod tests {
         let mut state = state();
         add(&mut state, "dsp.condition.gain");
         let _ = state.update(None, Message::ParamText("gain", "3".into()));
+        let _ = state.update(None, Message::AddAssertion);
+        let _ = state.update(None, Message::AssertionChanged(0, "metrics.snr > 1".into()));
         let rows = state.pipeline.to_rows();
+        let assertions = state.pipeline.to_assertion_rows();
 
         let mut reloaded = State::default();
         let _ = reloaded.update(
             None,
-            Message::PipelineLoaded(Ok((PipelineId::new(1), "loaded".into(), rows))),
+            Message::PipelineLoaded(Ok((PipelineId::new(1), "loaded".into(), rows, assertions))),
         );
         assert_eq!(reloaded.pipeline.name, "loaded");
         assert_eq!(reloaded.saved_id, Some(PipelineId::new(1)));
@@ -1392,6 +1660,8 @@ mod tests {
             Some(&PropertyValue::from(3.0))
         );
         assert_eq!(reloaded.selected, Some(0));
+        assert_eq!(reloaded.pipeline.assertions[0].source, "metrics.snr > 1");
+        assert!(reloaded.pipeline.assertions[0].error().is_none());
     }
 
     #[test]
