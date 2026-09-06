@@ -261,10 +261,40 @@ impl State {
         std::mem::take(&mut self.completed)
     }
 
+    /// Stages in the pipeline being edited. The screen draws the list itself;
+    /// this is how the root's tests say the list survived something.
+    #[cfg(test)]
+    #[must_use]
+    pub fn stage_count(&self) -> usize {
+        self.pipeline.stages.len()
+    }
+
     /// The saved pipeline the last run belonged to, for retention (§12.1).
     #[must_use]
     pub fn saved_id(&self) -> Option<PipelineId> {
         self.saved_id
+    }
+
+    /// Drops everything that refers to the open library, for when another one
+    /// is opened (§12.4).
+    ///
+    /// The stages and their parameters stay: a pipeline is an algorithm, and
+    /// an algorithm is not a property of the file it last ran over. What it
+    /// ran *on* — the dataset, the chosen groups, the baseline, the row it was
+    /// saved as — is, and an id from another library means something else
+    /// there or nothing at all. A run already in flight keeps its own handle
+    /// on the old library and finishes against it.
+    pub fn forget_library(&mut self) {
+        self.saved_id = None;
+        self.saved.clear();
+        self.datasets.clear();
+        self.dataset = None;
+        self.groups.clear();
+        self.chosen.clear();
+        self.baselines.clear();
+        self.baseline = None;
+        self.shown = None;
+        self.summary = None;
     }
 
     pub fn update(&mut self, store: Option<&Store>, message: Message) -> Task<Message> {

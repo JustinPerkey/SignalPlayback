@@ -175,6 +175,9 @@ impl App {
         self.inspector = inspector::State::default();
         self.results = results::State::default();
         self.runs = runs::State::default();
+        // The pipeline keeps its stages — an algorithm is not a property of
+        // the library it last ran over — but not what it ran on.
+        self.pipeline.forget_library();
         self.scope = scope::State::default();
         self.reload_everything()
     }
@@ -741,6 +744,26 @@ mod tests {
         assert!(
             app.library.summary().is_none(),
             "the tree is reloaded, not kept"
+        );
+    }
+
+    #[test]
+    fn opening_another_library_keeps_the_algorithm_but_not_what_it_ran_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let stages = app.pipeline.stage_count();
+
+        let _ = app.update(Message::Settings(settings_screen::Message::LibraryChosen(
+            Some(dir.path().join("other.db")),
+        )));
+        assert_eq!(
+            app.pipeline.stage_count(),
+            stages,
+            "the stages are the user's"
+        );
+        assert!(
+            app.pipeline.saved_id().is_none(),
+            "a row id from the old library means nothing in the new one"
         );
     }
 
