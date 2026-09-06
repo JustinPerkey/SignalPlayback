@@ -30,6 +30,11 @@ releasable.
   rate, strict/tolerant import, run retention, decimation quality and
   histogram bins, saved to `settings.json` as they change, plus what the open
   library is made of and a sweep for unreferenced blobs.
+- **Runs** — the history of what has been run: pipeline, algorithm hash,
+  status, timing, assertion outcomes and the baselines that name each run,
+  with promote, delete, and `Open`/`Diff` that hand the run to the Results
+  screen rather than drawing a second diff. Every screen in the design is now
+  built.
 - **Packaging** — a tagged release builds and publishes the binary for Windows
   and Linux.
 

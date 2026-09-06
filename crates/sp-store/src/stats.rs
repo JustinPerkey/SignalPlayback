@@ -243,6 +243,49 @@ mod tests {
     }
 
     #[test]
+    fn a_pulse_field_profiles_like_a_signal_does() {
+        use crate::pulses::{self, NewPulseField, NewPulseGroup};
+        use sp_core::TimeUnit;
+
+        let (_dir, store) = library();
+        let group = store
+            .write(|conn| {
+                let dataset = library::insert_dataset(
+                    conn,
+                    &NewDataset::new("pulses", SourceKind::CsvImport),
+                )?;
+                let train = trains::insert_train(
+                    conn,
+                    &NewTrain::new(dataset, 0).with_toa_unit(TimeUnit::Microseconds),
+                )?;
+                pulses::insert_pulse_group(
+                    conn,
+                    &NewPulseGroup::new(train, 0, vec![0.0, 1e-5, 2e-5, 3e-5]).with_field(
+                        NewPulseField::new("pulse width", vec![1.0, 2.0, f64::NAN, 4.0]),
+                    ),
+                )
+            })
+            .unwrap();
+
+        let profile = store
+            .read(move |conn| profile_pulse_field(conn, group, 0, 16))
+            .unwrap();
+        assert_eq!(profile.samples, 4);
+        assert_eq!(profile.stats().count(), 3);
+        assert_eq!(profile.stats().non_finite(), 1);
+        assert_eq!(profile.stats().min(), Some(1.0));
+        assert_eq!(profile.stats().max(), Some(4.0));
+        // Three finite values binned, the missing one counted apart.
+        assert_eq!(profile.histogram().total(), 3);
+        assert_eq!(profile.histogram().outside(), (0, 0, 1));
+
+        // A column that is not there is a not-found, not a panic.
+        assert!(store
+            .read(move |conn| profile_pulse_field(conn, group, 9, 16))
+            .is_err());
+    }
+
+    #[test]
     fn a_signal_profiles_in_one_pass() {
         let (_dir, store) = library();
         let values: Vec<f64> = (0..1_000).map(|i| (f64::from(i) * 0.01).sin()).collect();

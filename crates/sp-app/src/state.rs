@@ -8,7 +8,7 @@ use sp_store::Store;
 
 use crate::screens::settings::fmt_bytes;
 use crate::screens::{
-    self, generate, import, inspector, library, pipeline, properties, results, scope, settings,
+    generate, import, inspector, library, pipeline, properties, results, runs, scope, settings,
     Screen, Section,
 };
 use crate::settings::Settings;
@@ -39,6 +39,7 @@ pub struct App {
     properties: properties::State,
     inspector: inspector::State,
     settings_screen: settings::State,
+    runs: runs::State,
     /// The results screen keeps its run, group and stage selection — and its
     /// playhead — across navigation, for the same reason the scope does.
     results: results::State,
@@ -61,6 +62,7 @@ pub enum Message {
     Properties(properties::Message),
     Inspector(inspector::Message),
     Settings(settings::Message),
+    Runs(runs::Message),
     Results(results::Message),
     Scope(scope::Message),
 }
@@ -107,6 +109,7 @@ impl App {
             properties: properties::State::default(),
             inspector: inspector::State::default(),
             settings_screen: settings::State::default(),
+            runs: runs::State::default(),
             results: results::State::default(),
             scope: scope::State::default(),
             log_dir,
@@ -155,6 +158,7 @@ impl App {
             self.properties.load(&store).map(Message::Properties),
             self.inspector.load(&store).map(Message::Inspector),
             self.settings_screen.load(&store).map(Message::Settings),
+            self.runs.load(&store).map(Message::Runs),
             self.results.load(&store).map(Message::Results),
             self.scope.load(&store).map(Message::Scope),
         ])
@@ -170,6 +174,7 @@ impl App {
         self.library = library::State::default();
         self.inspector = inspector::State::default();
         self.results = results::State::default();
+        self.runs = runs::State::default();
         self.scope = scope::State::default();
         self.reload_everything()
     }
@@ -266,6 +271,7 @@ impl App {
                         self.prune_runs(&store),
                         self.library.load(&store).map(Message::Library),
                         self.results.load(&store).map(Message::Results),
+                        self.runs.load(&store).map(Message::Runs),
                         self.scope.load(&store).map(Message::Scope),
                     ]),
                     _ => task,
@@ -279,6 +285,25 @@ impl App {
                 .inspector
                 .update(self.store.as_ref(), message)
                 .map(Message::Inspector),
+            Message::Runs(message) => {
+                let task = self
+                    .runs
+                    .update(self.store.as_ref(), message)
+                    .map(Message::Runs);
+                // Opening or diffing a run is the Results screen's job, so the
+                // history hands it over rather than drawing a second one.
+                match self.runs.take_open_request() {
+                    Some((run, against)) => {
+                        self.screen = Screen::Results;
+                        let open = self
+                            .results
+                            .open_run(self.store.as_ref(), run, against)
+                            .map(Message::Results);
+                        Task::batch([task, open])
+                    }
+                    None => task,
+                }
+            }
             Message::Settings(message) => {
                 let task = self
                     .settings_screen
@@ -402,10 +427,10 @@ impl App {
             Screen::Pipeline => self.pipeline.view().map(Message::Pipeline),
             Screen::Properties => self.properties.view().map(Message::Properties),
             Screen::Inspector => self.inspector.view().map(Message::Inspector),
+            Screen::Runs => self.runs.view().map(Message::Runs),
             Screen::Settings => self.settings_screen.view().map(Message::Settings),
             Screen::Results => self.results.view().map(Message::Results),
             Screen::Scope => self.scope.view().map(Message::Scope),
-            other => screens::placeholder(other),
         };
 
         let content = column![
