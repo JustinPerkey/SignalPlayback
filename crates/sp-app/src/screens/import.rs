@@ -236,6 +236,15 @@ impl State {
         std::mem::take(&mut self.completed)
     }
 
+    /// The mode a fresh import profile starts in (Settings, §12.1).
+    ///
+    /// It applies to the profile on screen too: the mode is a decision about
+    /// the file being imported now, and the user who just changed the default
+    /// means it for this import as well.
+    pub fn set_default_mode(&mut self, mode: CountMode) {
+        self.profile.mode = mode;
+    }
+
     /// Loads the saved profiles and the property definitions a column can bind
     /// to.
     pub fn load(&mut self, store: &Store) -> Task<Message> {

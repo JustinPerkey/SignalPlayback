@@ -3,21 +3,19 @@
 //! [`Screen`] is the identity used for navigation; a screen's own
 //! `State`/`Message`/`update`/`view` live in its module and are owned by the
 //! root [`crate::state::App`], so a screen's state survives switching away
-//! from it (§12.3). Screens whose milestone has not landed show
-//! [`placeholder`].
+//! from it (§12.3). As of M8 every screen in §12.1 is built, so there is no
+//! stand-in body any more.
 
 pub mod generate;
 pub mod import;
+pub mod inspector;
 pub mod library;
 pub mod pipeline;
 pub mod properties;
 pub mod results;
+pub mod runs;
 pub mod scope;
-
-use iced::widget::{column, container, row, text, text::secondary, Space};
-use iced::{Element, Length};
-
-use crate::state::Message;
+pub mod settings;
 
 /// Where a screen sits in the navigation rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,67 +119,6 @@ impl Screen {
         }
     }
 
-    /// What the screen is for, taken from §12.1.
-    #[must_use]
-    pub const fn purpose(self) -> &'static str {
-        match self {
-            Self::Library => {
-                "Tree of Dataset → Group → Signal / pulse field, with search, property filters \
-                 and a sortable detail table. Hosts cross-group pulse search: a field predicate \
-                 returns matching pulses from every group."
-            }
-            Self::Import => {
-                "File picker → preview of the headers and first group → column-mapping panel \
-                 (which column is the time of arrival and in what unit, which columns bind to \
-                 property definitions) → profile save/load → progress with a live error list."
-            }
-            Self::Generate => {
-                "Node tree editor, parameter form, live preview, sweep configuration, preset \
-                 browser."
-            }
-            Self::Pipeline => {
-                "Stage palette on the left, ordered stage list in the middle, generated parameter \
-                 form on the right. Port validation inline. Run controls with group selection."
-            }
-            Self::Results => {
-                "Group list, stage rail, scope and artifact panes. The main working surface for \
-                 algorithm development."
-            }
-            Self::Runs => {
-                "History of runs with pipeline hash, status, timing and assertion results; \
-                 promote to baseline; diff two runs."
-            }
-            Self::Scope => {
-                "Playback-focused view of stored signals, with the same stage rail available when \
-                 a run is loaded."
-            }
-            Self::Inspector => {
-                "Detail for one signal, pulse field or pulse: full metadata, property editor, \
-                 tags, statistics, histogram, and a virtualised value table."
-            }
-            Self::Properties => "Manage property definitions and property sets.",
-            Self::Settings => {
-                "Library location, theme, default sample rate, strict/tolerant import, retention \
-                 defaults, decimation quality, keyboard map."
-            }
-        }
-    }
-
-    /// The milestone that fills this screen in (§16).
-    #[must_use]
-    pub const fn milestone(self) -> &'static str {
-        match self {
-            Self::Library | Self::Properties => "M1 — Store",
-            Self::Import => "M2 — Import",
-            Self::Generate => "M3 — Generate",
-            Self::Scope => "M4 — Playback",
-            Self::Pipeline => "M5 — Pipeline",
-            Self::Results => "M6 — Results",
-            Self::Runs => "M7 — Regression",
-            Self::Inspector | Self::Settings => "M8 — Polish",
-        }
-    }
-
     /// Digit pressed with the command modifier to reach this screen.
     #[must_use]
     pub fn shortcut(self) -> Option<char> {
@@ -203,43 +140,6 @@ impl Screen {
         };
         Self::ALL.get(index).copied()
     }
-}
-
-/// The stand-in body shown until a screen's milestone lands.
-pub fn placeholder(screen: Screen) -> Element<'static, Message> {
-    let heading = row![
-        text(screen.label()).size(28),
-        Space::with_width(Length::Fixed(12.0)),
-        container(text(screen.milestone()).size(12))
-            .padding([3, 8])
-            .style(|theme: &iced::Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    background: Some(palette.background.weak.color.into()),
-                    text_color: Some(palette.background.base.text),
-                    border: iced::border::rounded(4),
-                    ..container::Style::default()
-                }
-            }),
-    ]
-    .align_y(iced::Alignment::Center);
-
-    let body = column![
-        heading,
-        Space::with_height(Length::Fixed(10.0)),
-        text(screen.purpose()).size(15),
-        Space::with_height(Length::Fixed(24.0)),
-        text("Not built yet — this screen arrives with its milestone.")
-            .size(13)
-            .style(secondary),
-    ]
-    .max_width(680);
-
-    container(body)
-        .padding(32)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ pub mod pulses;
 pub mod pyramid;
 pub mod regress;
 pub mod runs;
+pub mod stats;
 pub mod trains;
 pub mod verify;
 
@@ -40,6 +41,7 @@ pub use runs::{
     ArtifactRow, CacheHit, NewArtifact, NewPipeline, NewRun, NewRunSignal, PipelineRow,
     PipelineStageRow, RunGroupRow, RunRow, RunSignalRow, RunStageRow, SOURCE_STAGE,
 };
+pub use stats::{ColumnProfile, StorageStats};
 pub use trains::NewTrain;
 pub use verify::VerifyReport;
 

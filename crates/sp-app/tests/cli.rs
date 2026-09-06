@@ -1,5 +1,6 @@
-//! The M7 exit criterion, exercised the way CI would: the real binary, a real
-//! library, and an exit code (`docs/DESIGN.md` §16, G8).
+//! The M7 and M8 exit criteria, exercised the way CI would: the real binary, a
+//! real library, and an exit code (`docs/DESIGN.md` §16, G8), plus the whole
+//! loop from a CSV file back out to one (G1).
 //!
 //! These tests spawn `signalplayback` as a process rather than calling into
 //! it, because the thing being checked is precisely what a CI job sees — the
@@ -218,4 +219,76 @@ fn help_lists_the_commands_and_the_exit_codes() {
     let text = stdout(&output);
     assert!(text.contains("--assert-baseline"));
     assert!(text.contains("Exit codes"));
+}
+
+#[test]
+fn a_dataset_exports_back_to_the_file_it_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("library.db");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample/sample.csv");
+    let original = std::fs::read_to_string(&source).unwrap();
+
+    // The whole loop on the terminal: the sample the design was written
+    // against goes in, and comes back out (G1).
+    let imported = cli(&[
+        "import",
+        "--library",
+        &path.to_string_lossy(),
+        "--file",
+        &source.to_string_lossy(),
+        "--name",
+        "sample",
+    ]);
+    assert_eq!(imported.status.code(), Some(0), "{}", stdout(&imported));
+    assert!(
+        stdout(&imported).contains("imported sample"),
+        "{}",
+        stdout(&imported)
+    );
+
+    let out = dir.path().join("out.csv");
+    let exported = cli(&[
+        "export",
+        "--library",
+        &path.to_string_lossy(),
+        "--dataset",
+        "sample",
+        "--out",
+        &out.to_string_lossy(),
+    ]);
+    assert_eq!(exported.status.code(), Some(0), "{}", stdout(&exported));
+    assert!(stdout(&exported).contains("exported 'sample'"));
+
+    // Field for field, the file that comes back out is the file that went in.
+    let written = std::fs::read_to_string(&out).unwrap();
+    let fields = |text: &str| -> Vec<Vec<String>> {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.split(',').map(|f| f.trim().to_owned()).collect())
+            .collect()
+    };
+    assert_eq!(fields(&written), fields(&original));
+}
+
+#[test]
+fn export_says_what_is_missing_rather_than_writing_half_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("library.db");
+    build_library(&path, 2.0);
+    let out = dir.path().join("out.csv");
+
+    // No --out at all.
+    let no_target = cli(&["export", "--library", &path.to_string_lossy()]);
+    assert_eq!(no_target.status.code(), Some(1));
+
+    // A generated dataset was never imported, so there is no layout to
+    // reverse — and no file is left behind.
+    let generated = cli(&[
+        "export",
+        "--library",
+        &path.to_string_lossy(),
+        "--out",
+        &out.to_string_lossy(),
+    ]);
+    assert_eq!(generated.status.code(), Some(1));
 }

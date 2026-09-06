@@ -7,6 +7,7 @@
 //! themselves. Draw cost is therefore proportional to viewport width, not to
 //! signal length, which is the whole of G2.
 
+use serde::{Deserialize, Serialize};
 use sp_core::stats::MinMax;
 use sp_core::{Domain, SampleRange, Timebase};
 
@@ -30,6 +31,62 @@ pub trait ColumnReader {
     fn cells(&self, level: u32, start: u64, end: u64) -> Result<Vec<MinMax>>;
 }
 
+/// How much the reducer is asked to read for a frame (§13, Settings).
+///
+/// The automatic choice puts one to two pyramid cells in a pixel. This shifts
+/// that by a level either way: `Fast` reads half as many cells, which is what
+/// a remote or a battery-powered machine wants, and `Fine` reads twice as
+/// many, which resolves a spike a coarser level would have averaged into its
+/// neighbour. It never promotes a level to a raw read — that is a bound on
+/// how much a frame may cost, not a quality setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quality {
+    /// One level coarser: fewer cells per frame.
+    Fast,
+    #[default]
+    Balanced,
+    /// One level finer: more cells per frame, more detail per pixel.
+    Fine,
+}
+
+impl Quality {
+    pub const ALL: [Self; 3] = [Self::Fast, Self::Balanced, Self::Fine];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::Balanced => "Balanced",
+            Self::Fine => "Fine",
+        }
+    }
+
+    /// Levels to shift the automatic choice by.
+    #[must_use]
+    pub const fn level_bias(self) -> i32 {
+        match self {
+            Self::Fast => 1,
+            Self::Balanced => 0,
+            Self::Fine => -1,
+        }
+    }
+
+    /// Applies the bias to a chosen reduction, staying inside the pyramid and
+    /// never turning a level into an unbounded raw read.
+    #[must_use]
+    pub fn apply(self, reduction: Reduction, level_count: u32) -> Reduction {
+        match reduction {
+            Reduction::Raw => Reduction::Raw,
+            Reduction::Level(level) => {
+                let top = level_count.saturating_sub(1);
+                let biased = i64::from(level) + i64::from(self.level_bias());
+                Reduction::Level(biased.clamp(0, i64::from(top)) as u32)
+            }
+        }
+    }
+}
+
 /// Per-trace display transform (§11.4). Colour and visibility are the UI's
 /// business; gain and offset change what the geometry *is*, so they are
 /// applied here, once, rather than per drawn primitive.
@@ -40,6 +97,8 @@ pub struct TraceStyle {
     /// Shifts this trace along the timeline for manual alignment — the
     /// playlist's `t_offset_s`.
     pub t_offset_s: f64,
+    /// How hard the reducer works for this frame.
+    pub quality: Quality,
 }
 
 impl Default for TraceStyle {
@@ -48,6 +107,7 @@ impl Default for TraceStyle {
             gain: 1.0,
             offset_v: 0.0,
             t_offset_s: 0.0,
+            quality: Quality::Balanced,
         }
     }
 }
@@ -238,7 +298,10 @@ pub fn trace(
     let samples_per_pixel = viewport.samples_per_pixel(rate);
     let header = reader.pyramid();
     let reduction = match header.as_ref() {
-        Some(header) => pyramid::choose(samples_per_pixel, header),
+        Some(header) => style.quality.apply(
+            pyramid::choose(samples_per_pixel, header),
+            header.level_count,
+        ),
         None => Reduction::Raw,
     };
 
@@ -442,6 +505,51 @@ mod tests {
     }
 
     #[test]
+    fn decimation_quality_shifts_the_level_the_frame_reads() {
+        let column = Column::new(ramp(1_000_000));
+        let view = viewport(0.0, 1.0, 1_000.0);
+        let reduce_at = |quality| {
+            trace(
+                &column,
+                descriptor(1_000_000, 1_000_000.0),
+                &view,
+                TraceStyle {
+                    quality,
+                    ..TraceStyle::default()
+                },
+            )
+            .unwrap()
+            .reduction
+        };
+
+        let (Reduction::Level(fast), Reduction::Level(balanced), Reduction::Level(fine)) = (
+            reduce_at(Quality::Fast),
+            reduce_at(Quality::Balanced),
+            reduce_at(Quality::Fine),
+        ) else {
+            panic!("a million samples over a thousand pixels reduces through the pyramid");
+        };
+        assert_eq!(fast, balanced + 1);
+        assert_eq!(fine, balanced - 1);
+    }
+
+    #[test]
+    fn quality_never_promotes_a_level_to_a_raw_read() {
+        // At level 0 there is nothing finer inside the pyramid, and a raw read
+        // at this zoom is what the bounded-read rule exists to prevent.
+        assert_eq!(
+            Quality::Fine.apply(Reduction::Level(0), 8),
+            Reduction::Level(0)
+        );
+        assert_eq!(Quality::Fine.apply(Reduction::Raw, 8), Reduction::Raw);
+        // Nor past the top of the pyramid.
+        assert_eq!(
+            Quality::Fast.apply(Reduction::Level(7), 8),
+            Reduction::Level(7)
+        );
+    }
+
+    #[test]
     fn the_pyramid_and_the_raw_path_agree() {
         // 800 samples per pixel, so the level path is used; compare against the
         // same viewport reduced without a pyramid.
@@ -557,7 +665,7 @@ mod tests {
         let style = TraceStyle {
             gain: -2.0,
             offset_v: 1.0,
-            t_offset_s: 0.0,
+            ..TraceStyle::default()
         };
         let snapshot = trace(&column, descriptor(10_000, 10_000.0), &view, style).unwrap();
         let TraceGeometry::Bars { cells, .. } = &snapshot.geometry else {

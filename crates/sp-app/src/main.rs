@@ -13,6 +13,7 @@ mod jobs;
 mod logging;
 mod paths;
 mod screens;
+mod settings;
 mod state;
 mod widgets;
 
@@ -44,7 +45,11 @@ fn main() -> iced::Result {
         })
         .antialiasing(true)
         .run_with(move || {
-            let (app, task) = App::new(log_dir, paths::default_library_file());
+            let (app, task) = App::new(
+                log_dir,
+                paths::settings_file(),
+                paths::default_library_file(),
+            );
             (app, Task::batch([task]))
         });
 

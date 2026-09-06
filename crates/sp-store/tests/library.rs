@@ -529,12 +529,45 @@ fn tags_attach_and_filter() {
             Ok(())
         })
         .unwrap();
+    // A filter over several tags narrows: both, not either.
+    store
+        .read(|conn| {
+            assert_eq!(
+                library::tag_counts(conn)?,
+                vec![("golden".to_owned(), 1), ("noisy".to_owned(), 2)]
+            );
+            assert_eq!(
+                library::signals_with_all_tags(conn, &["noisy".into()])?,
+                vec![a, b]
+            );
+            assert_eq!(
+                library::signals_with_all_tags(conn, &["noisy".into(), "golden".into()])?,
+                vec![a]
+            );
+            assert!(library::signals_with_all_tags(conn, &[])?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+
     store
         .write(move |conn| library::untag_signal(conn, a, "golden"))
         .unwrap();
     store
         .read(|conn| {
             assert!(library::signals_with_tag(conn, "golden")?.is_empty());
+            // The tag itself outlives its last use, so it can be reapplied.
+            assert_eq!(library::tag_counts(conn)?[0], ("golden".to_owned(), 0));
+            Ok(())
+        })
+        .unwrap();
+
+    // Deleting the tag takes it out of the library for good.
+    assert!(store
+        .write(|conn| library::delete_tag(conn, "golden"))
+        .unwrap());
+    store
+        .read(|conn| {
+            assert_eq!(library::list_tags(conn)?, ["noisy"]);
             Ok(())
         })
         .unwrap();

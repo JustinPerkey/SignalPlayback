@@ -31,7 +31,7 @@ pub use run::{
 pub use signal::{
     DType, Domain, Provenance, RunId, SampleBuffer, Samples, Scaling, Signal, SignalId, C64,
 };
-pub use stats::{MinMax, SignalStats};
+pub use stats::{Histogram, MinMax, Profile, Profiler, SignalStats};
 pub use time::{SampleIndex, SampleRange, TimeRange, Timebase, Timestamp};
 
 /// Declares an `i64` newtype for a database-backed identifier.

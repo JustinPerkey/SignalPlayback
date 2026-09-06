@@ -10,7 +10,36 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
 ## Status
 
-**M7 — Regression.** A pipeline is now a test. A pipeline carries assertions —
+**M8 — Polish.** The last milestone: the loop runs end to end and the binary is
+releasable.
+
+- **Inspector** — one signal or pulse field in full: its metadata, an editable
+  name, a property editor over the declared definitions (unrecognised
+  attributes shown, never dropped), tags, statistics recomputed from the
+  samples in a single streaming pass — min, max, peak-to-peak, mean, RMS,
+  standard deviation, zero crossings — the distribution behind them, and a
+  paged value table. A pulse group's table is the pulse records themselves,
+  one row per pulse across every field.
+- **Import and export on the terminal** — `signalplayback import` reads a CSV
+  file into the library and `signalplayback export` writes a dataset back out
+  in the format it came from, so the whole loop — import, run, export — is
+  scriptable (G1).
+- **Library filters** — a tag filter and a property filter (`prf_hz` with
+  `>= 1000`, `coding` with `nrz`) beside full-text search, and a group's
+  signal table sorts on any column.
+- **Settings** — library location (it reopens in place), theme, default sample
+  rate, strict/tolerant import, run retention, decimation quality and
+  histogram bins, saved to `settings.json` as they change, plus what the open
+  library is made of and a sweep for unreferenced blobs.
+- **Runs** — the history of what has been run: pipeline, algorithm hash,
+  status, timing, assertion outcomes and the baselines that name each run,
+  with promote, delete, and `Open`/`Diff` that hand the run to the Results
+  screen rather than drawing a second diff. Every screen in the design is now
+  built.
+- **Packaging** — a tagged release builds and publishes the binary for Windows
+  and Linux.
+
+Before it, **M7 — Regression**: a pipeline is a test. It carries assertions —
 one line each, evaluated per group after the last stage — over the metrics,
 signal statistics, artifacts and stage timings the run recorded:
 
@@ -22,14 +51,12 @@ stage[3].wall_ms < 250
 ```
 
 A run can be promoted to a named baseline with tolerances, and any two runs
-diff group by group: per-signal max absolute error, RMS error and the first
-sample that differs, a field-level artifact diff, and a metric-by-metric
-comparison. The same binary runs headless, so the whole loop is a CI gate
-(goal G8) — exit 1 says the request was wrong, exit 2 says the algorithm
+diff group by group. The same binary runs headless, so the whole loop is a CI
+gate (goal G8) — exit 1 says the request was wrong, exit 2 says the algorithm
 regressed.
 
-Before it, **M6 — Results**: any (group, stage) of a run is inspectable with
-its artifacts, drawn by their own view hints, with a stage rail that walks the
+**M6 — Results**: any (group, stage) of a run is inspectable with its
+artifacts, drawn by their own view hints, with a stage rail that walks the
 algorithm, a global playhead, a metrics chart across groups, and stage-to-stage
 comparison by pinning. **M5 — Pipeline**: the `Stage` trait, registry, port
 typing, group-at-a-time scheduler and full run recording. **M4 — Playback**:
@@ -38,9 +65,6 @@ the `GenSpec` tree, primitives, combinators, sweeps and pulse trains.
 **M2 — Import**: the grouped-block CSV framer, mapping UI and round-tripping
 writer (G1). **M1 — Store**: one SQLite file, chunked blob store, property
 index and `Verify Library`.
-
-Polish — the inspector, tags and search, export, settings and packaging — is
-the last milestone (§16).
 
 ## Build and run
 
@@ -62,6 +86,8 @@ signalplayback run --library lib.db --pipeline "detector" \
                    --dataset "impairment ladder" --assert-baseline golden
 signalplayback run --library lib.db --pipeline "detector" --promote golden
 signalplayback baselines --library lib.db
+signalplayback import --library lib.db --file capture.csv --name "capture 1"
+signalplayback export --library lib.db --dataset "capture 1" --out out.csv
 signalplayback help
 ```
 
@@ -78,8 +104,8 @@ Dependencies point left-to-right only: `sp-core` depends on nothing else here,
 
 | Crate | Contents | Milestone |
 |-------|----------|-----------|
-| `sp-core` | Domain vocabulary: signals, groups, time, properties, artifacts, statistics | M0 |
-| `sp-store` | SQLite schema and migrations, chunked blob store, store actor, property index, pulse search, verify | M1 |
+| `sp-core` | Domain vocabulary: signals, groups, time, properties, artifacts, statistics, histograms | M0, M8 |
+| `sp-store` | SQLite schema and migrations, chunked blob store, store actor, property index, pulse search, verify, tags, column profiling and storage figures | M1, M8 |
 | `sp-csv` | Grouped-block CSV framer, parser, import profiles, writer | M2 |
 | `sp-gen` | `GenSpec` node tree and its renderer | M3 |
 | `sp-engine` | Transport state machine, playback clock, render pyramids | M4 |
@@ -88,8 +114,9 @@ Dependencies point left-to-right only: `sp-core` depends on nothing else here,
 | `sp-app` | The Iced application — the only crate that knows about pixels | M0+ |
 
 Inside `sp-store`, row-level functions (`library`, `props`, `pulses`, `blob`,
-`profiles`, `regress`, `verify`) take a connection and do one thing; `Store` owns the connections and
-runs closures on the writer thread (`write`) or a pooled reader (`read`).
+`profiles`, `regress`, `stats`, `verify`) take a connection and do one thing; `Store` owns
+the connections and runs closures on the writer thread (`write`) or a pooled reader
+(`read`).
 
 ## Keyboard
 
@@ -97,6 +124,26 @@ runs closures on the writer thread (`write`) or a pooled reader (`read`).
 |------|--------|
 | `Ctrl`+`1`…`9`, `Ctrl`+`0` | Jump to a screen |
 | `Ctrl`+`T` | Toggle light/dark theme |
+
+## Settings
+
+Settings live in `settings.json` in the application data directory — not in the
+library, since one of them is which library to open. The Settings screen writes
+each change as it is made:
+
+| Setting | Effect |
+|---------|--------|
+| Library location | Which library opens; changing it reopens in place |
+| Theme | Dark or light; `Ctrl`+`T` sets the same value |
+| Default sample rate | The rate a new generator spec starts at |
+| Strict / tolerant import | Whether an import refuses a file whose counts do not add up |
+| Retention | Finished runs kept per pipeline; a run a baseline names is never deleted |
+| Decimation quality | Shifts the scope's automatic pyramid level by one either way |
+| Histogram bins | Resolution of the Inspector's histogram |
+
+A settings file that will not parse, or one written by an older build, falls
+back to the defaults for the fields it does not carry: losing a preference
+never costs you the application.
 
 ## Where things live
 

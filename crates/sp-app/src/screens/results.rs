@@ -36,7 +36,7 @@ use sp_core::{
     StageStatus, TimeRange, Tolerances,
 };
 use sp_engine::compare;
-use sp_engine::reduce::{TraceDescriptor, TraceSnapshot, TraceStyle};
+use sp_engine::reduce::{Quality, TraceDescriptor, TraceSnapshot, TraceStyle};
 use sp_engine::source::{self, ColumnSource};
 use sp_engine::viewport::Amplitude;
 use sp_engine::{reduce, Clock, Transport, TransportState, Viewport};
@@ -237,6 +237,12 @@ pub struct State {
     against: Option<RunId>,
     diff: Option<RunDiff>,
     diffing: bool,
+    /// How hard the reducer works per frame, from Settings.
+    quality: Quality,
+    /// A run the Runs screen asked for, waiting for the run list to arrive,
+    /// and the run it should be diffed against once it has opened.
+    pending_open: Option<RunId>,
+    pending_against: Option<RunId>,
 }
 
 impl Default for State {
@@ -277,6 +283,9 @@ impl Default for State {
             against: None,
             diff: None,
             diffing: false,
+            quality: Quality::default(),
+            pending_open: None,
+            pending_against: None,
         }
     }
 }
@@ -346,6 +355,34 @@ impl State {
         )
     }
 
+    /// Sets how hard the reducer works per frame (Settings, §12.1); the next
+    /// reduction uses it.
+    pub fn set_quality(&mut self, quality: Quality) {
+        self.quality = quality;
+    }
+
+    /// Opens `run`, and diffs it against `against` when one is given — what
+    /// the Runs screen hands over so there is one place a diff is drawn
+    /// (§10.4, §12.1).
+    ///
+    /// A run this screen has not listed yet is opened once the list arrives,
+    /// so a run created a moment ago on another screen still opens.
+    pub fn open_run(
+        &mut self,
+        store: Option<&Store>,
+        run: RunId,
+        against: Option<RunId>,
+    ) -> Task<Message> {
+        self.pending_against = against;
+        self.against = None;
+        self.diff = None;
+        if self.runs.iter().any(|choice| choice.id == run) {
+            return self.select_run(store, run);
+        }
+        self.pending_open = Some(run);
+        store.map_or_else(Task::none, |store| self.load(store))
+    }
+
     #[must_use]
     pub fn is_playing(&self) -> bool {
         self.transport.state().is_playing()
@@ -373,9 +410,11 @@ impl State {
                         let newest = runs.first().map(|choice| choice.id);
                         self.runs = runs;
                         self.baselines = baselines;
-                        // The run just finished is the one worth looking at.
-                        match (self.run, newest) {
-                            (None, Some(run)) => self.select_run(store, run),
+                        // A run asked for by name wins over the newest one.
+                        match (self.pending_open.take(), self.run, newest) {
+                            (Some(run), _, _) => self.select_run(store, run),
+                            // The run just finished is the one worth looking at.
+                            (None, None, Some(run)) => self.select_run(store, run),
                             _ => Task::none(),
                         }
                     }
@@ -400,7 +439,11 @@ impl State {
                         self.pinned = None;
                         self.detail = Some(detail);
                         self.rebuild_metric();
-                        self.reload(store, true)
+                        let reload = self.reload(store, true);
+                        match self.pending_against.take() {
+                            Some(other) => Task::batch([reload, self.compare_with(store, other)]),
+                            None => reload,
+                        }
                     }
                     Err(error) => {
                         tracing::error!(%error, "results could not open the run");
@@ -922,13 +965,16 @@ impl State {
 
         self.reducing = true;
         let viewport = self.viewport;
+        let style = TraceStyle {
+            quality: self.quality,
+            ..TraceStyle::default()
+        };
         Task::perform(
             jobs::read(store, move |conn| {
                 let mut out = Vec::with_capacity(requests.len());
                 for (index, blob, descriptor) in requests {
-                    let reduced = ColumnSource::open(conn, blob).and_then(|source| {
-                        reduce::trace(&source, descriptor, &viewport, TraceStyle::default())
-                    });
+                    let reduced = ColumnSource::open(conn, blob)
+                        .and_then(|source| reduce::trace(&source, descriptor, &viewport, style));
                     match reduced {
                         Ok(snapshot) => out.push((index, snapshot)),
                         Err(error) => return Ok(Err(error.to_string())),
