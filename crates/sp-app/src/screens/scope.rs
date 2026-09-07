@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, pick_list, row, scrollable, slider, text,
-    text_input, Space,
+    button, checkbox, column, container, pick_list, row, scrollable, slider, text, text_input,
+    Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, Theme};
 use sp_core::stats::MinMax;
@@ -28,6 +28,8 @@ use sp_engine::{
 use sp_store::{library, Store};
 
 use crate::jobs;
+use crate::typography;
+use crate::ui;
 use crate::widgets::scope::{self as canvas_scope, Action, Caches, Layout, TraceView, PALETTE};
 
 /// Traces the scope will hold at once. Past this the palette repeats and the
@@ -688,11 +690,18 @@ impl State {
         container(canvas.map(Message::Canvas))
             .width(Length::Fill)
             .height(Length::Fill)
+            // The plot is the subject of this screen: a hairline and square
+            // corners, not a rounded card that would frame it as one widget
+            // among several.
             .style(|theme: &Theme| {
                 let palette = theme.extended_palette();
                 container::Style {
                     background: Some(palette.background.weak.color.into()),
-                    border: iced::border::rounded(4),
+                    border: iced::Border {
+                        color: crate::theme::tokens(theme).rule,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
                     ..container::Style::default()
                 }
             })
@@ -713,44 +722,60 @@ impl State {
             }
             shown += 1;
             let loaded = self.traces.iter().any(|t| t.signal.id == entry.signal.id);
+            // A signal already on the scope is a state, not an action, so it
+            // takes the same band a selected row takes anywhere else. The
+            // group, the domain and the sample count under it are all machine
+            // output and are set as one reading.
             let label = column![
-                text(&entry.signal.name).size(13),
+                text(&entry.signal.name)
+                    .size(typography::BODY_SIZE)
+                    .font(if loaded {
+                        typography::BODY_STRONG
+                    } else {
+                        typography::BODY
+                    }),
                 text(format!(
                     "{} · {} · {}",
                     entry.group,
                     entry.signal.domain.label(),
                     format_count(entry.signal.sample_count),
                 ))
-                .size(10)
-                .style(text::secondary),
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim),
             ]
             .spacing(1);
             list = list.push(
                 button(label)
                     .width(Length::Fill)
                     .padding([5.0, 8.0])
-                    .style(if loaded {
-                        button::primary
-                    } else {
-                        button::text
-                    })
+                    .style(ui::selectable(loaded))
                     .on_press(Message::Add(entry.signal.id)),
             );
         }
 
         let body: Element<'_, Message> = if self.loading {
-            text("Loading…").size(12).style(text::secondary).into()
+            ui::empty(
+                "Reading the library…",
+                "Only the metadata is read; samples stay on disk.",
+            )
         } else if let Some(error) = &self.error {
-            text(error).size(12).style(text::danger).into()
+            text(error)
+                .size(typography::BODY_SIZE)
+                .style(text::danger)
+                .into()
         } else if shown == 0 {
-            text(if self.entries.is_empty() {
-                "No signals in the library yet — import or generate some."
+            if self.entries.is_empty() {
+                ui::empty(
+                    "The library holds no signals yet.",
+                    "Import a CSV on the Import screen, or synthesise one on Generate.",
+                )
             } else {
-                "No signal matches the filter."
-            })
-            .size(12)
-            .style(text::secondary)
-            .into()
+                ui::empty(
+                    "No signal matches the filter.",
+                    "The filter reads both the signal name and the group it came from.",
+                )
+            }
         } else {
             scrollable(list).height(Length::Fill).into()
         };
@@ -758,26 +783,32 @@ impl State {
         container(
             column![
                 row![
-                    text("Signals").size(14),
+                    ui::caption("Signals"),
                     Space::with_width(Length::Fill),
-                    button(text("Refresh").size(11))
-                        .padding([3.0, 8.0])
-                        .style(button::text)
-                        .on_press(Message::Refresh),
+                    button(
+                        text("Refresh")
+                            .size(typography::LABEL_SIZE)
+                            .font(typography::LABEL)
+                            .style(ui::dim),
+                    )
+                    .padding([3.0, 8.0])
+                    .style(button::text)
+                    .on_press(Message::Refresh),
                 ]
                 .align_y(Alignment::Center),
                 text_input("Filter…", &self.filter)
                     .on_input(Message::FilterChanged)
-                    .size(12)
+                    .size(typography::BODY_SIZE)
                     .padding(5),
-                horizontal_rule(1),
+                ui::rule(),
                 body,
             ]
-            .spacing(6),
+            .spacing(8),
         )
-        .padding(8)
+        .padding([10, 10])
         .width(Length::Fixed(250.0))
         .height(Length::Fill)
+        .style(ui::panel)
         .into()
     }
 
@@ -788,25 +819,36 @@ impl State {
         for (index, trace) in self.traces.iter().enumerate() {
             let selected = self.selected == Some(index);
             let colour = PALETTE[trace.colour_index % PALETTE.len()];
-            let header = row![
-                container(text("■").size(14).style(move |_: &Theme| text::Style {
-                    color: Some(colour)
-                })),
-                button(text(&trace.signal.name).size(12))
+            let header =
+                row![
+                    container(
+                        text("■")
+                            .size(typography::BODY_SIZE)
+                            .style(move |_: &Theme| text::Style {
+                                color: Some(colour)
+                            })
+                    ),
+                    button(text(&trace.signal.name).size(typography::BODY_SIZE).font(
+                        if selected {
+                            typography::BODY_STRONG
+                        } else {
+                            typography::BODY
+                        }
+                    ),)
                     .padding(0)
                     .style(button::text)
                     .on_press(Message::Select(index)),
-                Space::with_width(Length::Fill),
-                checkbox("", trace.visible)
-                    .size(14)
-                    .on_toggle(move |_| Message::ToggleVisible(index)),
-                button(text("✕").size(11))
-                    .padding([1.0, 5.0])
-                    .style(button::text)
-                    .on_press(Message::Remove(index)),
-            ]
-            .spacing(5)
-            .align_y(Alignment::Center);
+                    Space::with_width(Length::Fill),
+                    checkbox("", trace.visible)
+                        .size(14)
+                        .on_toggle(move |_| Message::ToggleVisible(index)),
+                    button(text("✕").size(typography::LABEL_SIZE))
+                        .padding([1.0, 5.0])
+                        .style(button::text)
+                        .on_press(Message::Remove(index)),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center);
 
             let mut entry = column![header].spacing(3);
             entry = entry.push(
@@ -815,8 +857,9 @@ impl State {
                     trace.group,
                     describe_reduction(trace.snapshot.as_ref(), trace.pyramid_ready)
                 ))
-                .size(10)
-                .style(text::secondary),
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim),
             );
             if selected {
                 entry = entry.push(slider_row(
@@ -842,33 +885,33 @@ impl State {
                     move |v| Message::TimeOffsetChanged(index, v),
                 ));
                 entry = entry.push(
-                    button(text("Reset").size(11))
-                        .padding([2.0, 8.0])
-                        .style(button::text)
-                        .on_press(Message::ResetStyle(index)),
+                    button(
+                        text("Reset")
+                            .size(typography::LABEL_SIZE)
+                            .font(typography::LABEL),
+                    )
+                    .padding([2.0, 8.0])
+                    .style(button::text)
+                    .on_press(Message::ResetStyle(index)),
                 );
             }
-            list = list.push(container(entry).padding(6).width(Length::Fill).style(
-                move |theme: &Theme| {
-                    let palette = theme.extended_palette();
-                    container::Style {
-                        background: Some(if selected {
-                            palette.background.weak.color.into()
-                        } else {
-                            iced::Background::Color(iced::Color::TRANSPARENT)
-                        }),
-                        border: iced::border::rounded(4),
-                        ..container::Style::default()
-                    }
+            // The open trace is the one whose controls are showing, which is
+            // a selection, so it takes the selection band rather than a step
+            // of the neutral ladder that reads as an unrelated surface.
+            list = list.push(container(entry).padding([6, 8]).width(Length::Fill).style(
+                move |theme: &Theme| container::Style {
+                    background: selected.then(|| crate::theme::tokens(theme).selection.into()),
+                    border: iced::border::rounded(2),
+                    ..container::Style::default()
                 },
             ));
         }
 
         let body: Element<'_, Message> = if self.traces.is_empty() {
-            text("Pick a signal on the left to put it on the scope.")
-                .size(12)
-                .style(text::secondary)
-                .into()
+            ui::empty(
+                "No traces yet.",
+                "Pick a signal on the left. Each one added gets the next colour of the                  palette and its own gain, offset and alignment.",
+            )
         } else {
             scrollable(list).height(Length::Fill).into()
         };
@@ -876,25 +919,27 @@ impl State {
         container(
             column![
                 row![
-                    text("Traces").size(14),
+                    ui::caption("Traces"),
                     Space::with_width(Length::Fill),
                     text(format!("{}/{MAX_TRACES}", self.traces.len()))
-                        .size(11)
-                        .style(text::secondary),
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::READOUT)
+                        .style(ui::dim),
                 ]
                 .align_y(Alignment::Center),
                 pick_list(Layout::ALL, Some(self.layout), Message::LayoutChanged)
-                    .text_size(12)
+                    .text_size(typography::BODY_SIZE)
                     .padding(4)
                     .width(Length::Fill),
-                horizontal_rule(1),
+                ui::rule(),
                 body,
             ]
-            .spacing(6),
+            .spacing(8),
         )
-        .padding(8)
+        .padding([10, 10])
         .width(Length::Fixed(260.0))
         .height(Length::Fill)
+        .style(ui::panel)
         .into()
     }
 
@@ -903,7 +948,7 @@ impl State {
         let has_content = !self.transport.range().is_empty();
 
         let play: Element<'_, Message> =
-            button(text(if playing { "❚❚ Pause" } else { "▶ Play" }).size(12))
+            button(text(if playing { "❚❚ Pause" } else { "▶ Play" }).size(typography::BODY_SIZE))
                 .padding([4.0, 12.0])
                 .style(button::primary)
                 .on_press_maybe(has_content.then_some(if playing {
@@ -925,16 +970,19 @@ impl State {
             column![
                 row![
                     play,
-                    button(text("■ Stop").size(12))
+                    button(text("■ Stop").size(typography::BODY_SIZE))
                         .padding([4.0, 10.0])
                         .style(button::secondary)
                         .on_press_maybe(has_content.then_some(Message::Stop)),
                     Space::with_width(Length::Fixed(8.0)),
-                    text(format!(
-                        "{:>8}",
-                        canvas_scope::format_time(self.transport.playhead_s())
-                    ))
-                    .size(12),
+                    // The clock is the one number the transport exists to
+                    // show, so it is set as one: monospaced, so a digit
+                    // ticking over never shifts the ones beside it, and at
+                    // display size, because a playhead position read from
+                    // across a bench is worth more than the space it costs.
+                    text(canvas_scope::format_time(self.transport.playhead_s()))
+                        .size(typography::DISPLAY_SIZE)
+                        .font(typography::READOUT),
                     Space::with_width(Length::Fixed(8.0)),
                     scrub,
                 ]
@@ -948,7 +996,7 @@ impl State {
                             Some(self.transport.rate().abs()),
                             Message::RateChanged
                         )
-                        .text_size(11)
+                        .text_size(typography::BODY_SIZE)
                         .padding(3)
                         .into(),
                     ),
@@ -959,38 +1007,23 @@ impl State {
                             Some(self.transport.loop_mode()),
                             Message::LoopModeChanged,
                         )
-                        .text_size(11)
+                        .text_size(typography::BODY_SIZE)
                         .padding(3)
                         .into(),
                     ),
                     labelled(
                         "Follow",
                         pick_list(FollowMode::ALL, Some(self.follow), Message::FollowChanged)
-                            .text_size(11)
+                            .text_size(typography::BODY_SIZE)
                             .padding(3)
                             .into(),
                     ),
                     Space::with_width(Length::Fill),
-                    button(text("[ In").size(11))
-                        .padding([3.0, 8.0])
-                        .style(button::text)
-                        .on_press_maybe(has_content.then_some(Message::SetLoopStart)),
-                    button(text("] Out").size(11))
-                        .padding([3.0, 8.0])
-                        .style(button::text)
-                        .on_press_maybe(has_content.then_some(Message::SetLoopEnd)),
-                    button(text("Clear loop").size(11))
-                        .padding([3.0, 8.0])
-                        .style(button::text)
-                        .on_press_maybe(has_content.then_some(Message::ClearLoop)),
-                    button(text("Fit").size(11))
-                        .padding([3.0, 8.0])
-                        .style(button::secondary)
-                        .on_press_maybe(has_content.then_some(Message::FitAll)),
-                    button(text("Fit Y").size(11))
-                        .padding([3.0, 8.0])
-                        .style(button::text)
-                        .on_press_maybe(has_content.then_some(Message::FitAmplitude)),
+                    command("[ In", has_content.then_some(Message::SetLoopStart)),
+                    command("] Out", has_content.then_some(Message::SetLoopEnd)),
+                    command("Clear loop", has_content.then_some(Message::ClearLoop)),
+                    command("Fit", has_content.then_some(Message::FitAll)),
+                    command("Fit Y", has_content.then_some(Message::FitAmplitude)),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -1029,17 +1062,27 @@ impl State {
             .unwrap_or_default();
 
         container(
+            // Every field here is a reading, so every field is monospaced and
+            // the line does not reflow while the transport runs.
             row![
-                text(state).size(11),
+                text(state)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT),
                 Space::with_width(Length::Fixed(16.0)),
-                text(window).size(11).style(text::secondary),
+                text(window)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
                 Space::with_width(Length::Fixed(16.0)),
-                text(hover).size(11).style(text::secondary),
+                text(hover)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
                 Space::with_width(Length::Fill),
                 text(if self.reducing { "reducing…" } else { "" })
-                    .size(11)
-                    .style(text::secondary),
-                text(note).size(11).style(text::danger),
+                    .size(typography::LABEL_SIZE)
+                    .style(ui::dim),
+                text(note).size(typography::LABEL_SIZE).style(text::danger),
             ]
             .spacing(4)
             .align_y(Alignment::Center),
@@ -1073,6 +1116,23 @@ fn load_entries(conn: &sp_store::Connection) -> sp_store::Result<Vec<Entry>> {
     Ok(entries)
 }
 
+/// A command that acts on the view rather than on the data: fit, loop, clear.
+///
+/// These are quiet by design. The transport has exactly one loud control and
+/// it is Play; a row of five filled buttons beside it would say all six are
+/// the thing to press.
+fn command<'a>(label: &'a str, on_press: Option<Message>) -> Element<'a, Message> {
+    button(
+        text(label)
+            .size(typography::LABEL_SIZE)
+            .font(typography::LABEL),
+    )
+    .padding([3.0, 8.0])
+    .style(button::text)
+    .on_press_maybe(on_press)
+    .into()
+}
+
 fn slider_row<'a>(
     label: &'a str,
     value: f32,
@@ -1081,11 +1141,18 @@ fn slider_row<'a>(
     on_change: impl Fn(f32) -> Message + 'a,
 ) -> Element<'a, Message> {
     row![
-        container(text(label).size(10).style(text::secondary)).width(Length::Fixed(44.0)),
+        container(ui::caption(label)).width(Length::Fixed(44.0)),
         slider(range, value, on_change)
             .step(step)
             .width(Length::Fill),
-        container(text(format!("{value:.2}")).size(10)).width(Length::Fixed(38.0)),
+        // The number a slider is currently at is a reading, and a reading that
+        // changes as it is dragged has to be monospaced or the row twitches.
+        container(
+            text(format!("{value:.2}"))
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT),
+        )
+        .width(Length::Fixed(40.0)),
     ]
     .spacing(4)
     .align_y(Alignment::Center)
@@ -1093,8 +1160,8 @@ fn slider_row<'a>(
 }
 
 fn labelled<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
-    row![text(label).size(11).style(text::secondary), control]
-        .spacing(4)
+    row![ui::caption(label), control]
+        .spacing(5)
         .align_y(Alignment::Center)
         .into()
 }

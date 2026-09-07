@@ -25,8 +25,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use iced::widget::{
-    button, column, container, horizontal_rule, pick_list, row, scrollable, slider, text,
-    text_input, Space,
+    button, column, container, pick_list, row, scrollable, slider, text, text_input, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, Theme};
 use sp_core::artifact::{self, ArtifactData, ArtifactRegistry, FieldDiff, ViewHint};
@@ -47,6 +46,8 @@ use sp_store::runs::{self, RunGroupRow, RunSignalRow, RunStageRow, SOURCE_STAGE}
 use sp_store::{library, Store};
 
 use crate::jobs;
+use crate::typography;
+use crate::ui;
 use crate::widgets::panes::{self, Pane, Sort};
 use crate::widgets::scope::{
     self as canvas_scope, Action, Caches, Layout, OverlayItem, OverlayView, TraceView, PALETTE,
@@ -1094,7 +1095,7 @@ impl State {
     pub fn view(&self) -> Element<'_, Message> {
         let body = column![
             self.rail(),
-            horizontal_rule(1),
+            ui::rule(),
             self.canvas(),
             self.transport_bar(),
             self.status_line(),
@@ -1113,20 +1114,36 @@ impl State {
         let mut runs = column![].spacing(2);
         for choice in &self.runs {
             let selected = self.run == Some(choice.id);
+            // The pipeline is what the run is; the status and the clock time
+            // are what it did. Two registers, not one interpunct-joined line.
             let label = column![
-                text(format!("{} · {}", choice.pipeline, choice.status.label())).size(12),
-                text(&choice.when).size(10).style(text::secondary),
+                row![
+                    text(&choice.pipeline)
+                        .size(typography::BODY_SIZE)
+                        .font(if selected {
+                            typography::BODY_STRONG
+                        } else {
+                            typography::BODY
+                        }),
+                    Space::with_width(Length::Fill),
+                    text(choice.status.label())
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::LABEL)
+                        .style(ui::dim),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                text(&choice.when)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
             ]
             .spacing(1);
             runs = runs.push(
                 button(label)
                     .width(Length::Fill)
                     .padding([4.0, 8.0])
-                    .style(if selected {
-                        button::primary
-                    } else {
-                        button::text
-                    })
+                    .style(ui::selectable(selected))
                     .on_press(Message::SelectRun(choice.id)),
             );
         }
@@ -1147,53 +1164,70 @@ impl State {
                     .map_or_else(String::new, |ms| format!(" · {ms} ms"));
                 let failed_assertions = detail.failed_assertions(entry.id);
                 let label = column![
-                    text(&entry.name).size(12),
-                    text(format!("{status}{wall}")).size(10).style(
-                        if row.is_some_and(|row| row.status == StageStatus::Failed) {
-                            text::danger
+                    text(&entry.name)
+                        .size(typography::BODY_SIZE)
+                        .font(if selected {
+                            typography::BODY_STRONG
                         } else {
-                            text::secondary
-                        }
-                    ),
+                            typography::BODY
+                        }),
+                    text(format!("{status}{wall}"))
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::READOUT)
+                        .style(
+                            if row.is_some_and(|row| row.status == StageStatus::Failed) {
+                                text::danger
+                            } else {
+                                ui::dim
+                            }
+                        ),
                 ]
                 .spacing(1)
                 // A group whose stages all ran but whose assertions failed is
                 // still a failing case, and the list has to say so (§9.7).
                 .push_maybe((failed_assertions > 0).then(|| {
-                    text(format!("{failed_assertions} assertion(s) failed"))
-                        .size(10)
-                        .style(text::danger)
+                    text(format!(
+                        "{failed_assertions} assertion{} failed",
+                        if failed_assertions == 1 { "" } else { "s" }
+                    ))
+                    .size(typography::LABEL_SIZE)
+                    .style(text::danger)
                 }))
-                .push_maybe(
-                    (!metrics.is_empty()).then(|| text(metrics).size(10).style(text::secondary)),
-                );
+                .push_maybe((!metrics.is_empty()).then(|| {
+                    text(metrics)
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::READOUT)
+                        .style(ui::dim)
+                }));
                 groups = groups.push(
                     button(label)
                         .width(Length::Fill)
                         .padding([4.0, 8.0])
-                        .style(if selected {
-                            button::primary
-                        } else {
-                            button::text
-                        })
+                        .style(ui::selectable(selected))
                         .on_press(Message::SelectGroup(entry.id)),
                 );
             }
         }
 
         let body: Element<'_, Message> = if let Some(error) = &self.error {
-            text(error).size(12).style(text::danger).into()
+            text(error)
+                .size(typography::BODY_SIZE)
+                .style(text::danger)
+                .into()
         } else if self.runs.is_empty() {
-            text(if self.loading {
-                "Loading…"
+            if self.loading {
+                ui::empty(
+                    "Reading the history…",
+                    "Runs are read from the open library.",
+                )
             } else {
-                "No runs yet — run a pipeline on the Pipeline screen."
-            })
-            .size(12)
-            .style(text::secondary)
-            .into()
+                ui::empty(
+                    "No runs yet.",
+                    "Build a pipeline on the Pipeline screen and run it; its stages land here.",
+                )
+            }
         } else {
-            scrollable(column![runs, horizontal_rule(1), groups].spacing(8))
+            scrollable(column![runs, ui::rule(), groups].spacing(8))
                 .height(Length::Fill)
                 .into()
         };
@@ -1201,24 +1235,30 @@ impl State {
         container(
             column![
                 row![
-                    text("Runs & groups").size(14),
+                    ui::caption("Runs & groups"),
                     Space::with_width(Length::Fill),
-                    button(text("Refresh").size(11))
-                        .padding([3.0, 8.0])
-                        .style(button::text)
-                        .on_press(Message::Refresh),
+                    button(
+                        text("Refresh")
+                            .size(typography::LABEL_SIZE)
+                            .font(typography::LABEL)
+                            .style(ui::dim),
+                    )
+                    .padding([3.0, 8.0])
+                    .style(button::text)
+                    .on_press(Message::Refresh),
                 ]
                 .align_y(Alignment::Center),
-                horizontal_rule(1),
+                ui::rule(),
                 body,
             ]
             .spacing(6)
-            .push_maybe(self.run.map(|_| horizontal_rule(1)))
+            .push_maybe(self.run.map(|_| ui::rule()))
             .push_maybe(self.regression_controls()),
         )
-        .padding(8)
+        .padding([10, 10])
         .width(Length::Fixed(250.0))
         .height(Length::Fill)
+        .style(ui::panel)
         .into()
     }
 
@@ -1233,11 +1273,11 @@ impl State {
             .filter(|row| row.run_id == run)
             .collect();
 
-        let mut panel = column![text("Regression").size(13)].spacing(4);
+        let mut panel = column![ui::caption("Regression")].spacing(6);
         if let Some(baseline) = named.first() {
             panel = panel.push(
                 text(format!("This run is the baseline '{}'.", baseline.name))
-                    .size(11)
+                    .size(typography::LABEL_SIZE)
                     .style(text::success),
             );
         }
@@ -1248,18 +1288,18 @@ impl State {
                     text_input("Baseline name", &self.promote_as)
                         .on_input(Message::PromoteAs)
                         .padding(4)
-                        .size(11)
+                        .size(typography::BODY_SIZE)
                         .width(Length::Fill),
                     text_input("0%", &self.promote_tolerance)
                         .on_input(Message::PromoteTolerance)
                         .padding(4)
-                        .size(11)
+                        .size(typography::BODY_SIZE)
                         .width(Length::Fixed(46.0)),
                 ]
                 .spacing(4),
             )
             .push(
-                button(text("Promote to baseline").size(11))
+                button(text("Promote to baseline").size(typography::BODY_SIZE))
                     .padding([3.0, 8.0])
                     .style(button::secondary)
                     .on_press_maybe(
@@ -1280,14 +1320,14 @@ impl State {
             panel = panel.push(
                 pick_list(others, selected, Message::CompareWith)
                     .placeholder("Compare with run…")
-                    .text_size(11)
+                    .text_size(typography::BODY_SIZE)
                     .padding(4)
                     .width(Length::Fill),
             );
         }
 
         if let Some(status) = &self.status {
-            panel = panel.push(text(status).size(10).style(text::secondary));
+            panel = panel.push(text(status).size(typography::LABEL_SIZE).style(ui::dim));
         }
         Some(panel.into())
     }
@@ -1295,11 +1335,10 @@ impl State {
     /// The stage rail: one chip per stage, in order (§10.2).
     fn rail(&self) -> Element<'_, Message> {
         let Some(detail) = &self.detail else {
-            return container(
-                text("Pick a run on the left.")
-                    .size(12)
-                    .style(text::secondary),
-            )
+            return container(ui::empty(
+                "Pick a run on the left.",
+                "The rail that appears here is the pipeline it ran, one chip per stage,                  in the order they were applied.",
+            ))
             .padding(6)
             .into();
         };
@@ -1325,36 +1364,47 @@ impl State {
                 .and_then(|group| detail.stage_row(group, chip.ordinal));
             let produced = self.chip_summary(chip.ordinal, row);
             let label = column![
-                text(heading).size(12),
-                text(produced).size(10).style(
-                    if row.is_some_and(|row| row.status == StageStatus::Failed) {
-                        text::danger
-                    } else {
-                        text::secondary
-                    }
-                ),
+                text(heading).size(typography::BODY_SIZE).font(if selected {
+                    typography::BODY_STRONG
+                } else {
+                    typography::BODY
+                }),
+                text(produced)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(
+                        if row.is_some_and(|row| row.status == StageStatus::Failed) {
+                            text::danger
+                        } else {
+                            ui::dim
+                        },
+                    ),
             ]
             .spacing(1);
 
+            // Selected and pinned are two different states and were drawn as
+            // two fills of the same shape, which made them look like degrees
+            // of one thing. The chip carries the selection; the pin control
+            // carries the pin, which is the control that sets it.
             chips = chips.push(
                 button(label)
                     .padding([4.0, 8.0])
-                    .style(match (selected, pinned) {
-                        (true, _) => button::primary,
-                        (_, true) => button::secondary,
-                        _ => button::text,
-                    })
+                    .style(ui::selectable(selected))
                     .on_press(Message::SelectStage(chip.ordinal)),
             );
             chips = chips.push(
-                button(text(if pinned { "unpin" } else { "pin" }).size(9))
-                    .padding([2.0, 4.0])
-                    .style(button::text)
-                    .on_press(if pinned {
-                        Message::Unpin
-                    } else {
-                        Message::Pin(chip.ordinal)
-                    }),
+                button(
+                    text(if pinned { "unpin" } else { "pin" })
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::LABEL),
+                )
+                .padding([2.0, 5.0])
+                .style(ui::selectable(pinned))
+                .on_press(if pinned {
+                    Message::Unpin
+                } else {
+                    Message::Pin(chip.ordinal)
+                }),
             );
         }
 
@@ -1438,11 +1488,18 @@ impl State {
         container(canvas.map(Message::Canvas))
             .width(Length::Fill)
             .height(Length::Fill)
+            // The plot is the subject of this screen, so it gets a hairline
+            // and square corners: a rounded card would frame it as one widget
+            // among several rather than as the instrument face.
             .style(|theme: &Theme| {
                 let palette = theme.extended_palette();
                 container::Style {
                     background: Some(palette.background.weak.color.into()),
-                    border: iced::border::rounded(4),
+                    border: iced::Border {
+                        color: crate::theme::tokens(theme).rule,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
                     ..container::Style::default()
                 }
             })
@@ -1462,36 +1519,39 @@ impl State {
 
         container(
             row![
-                button(text(if playing { "❚❚ Pause" } else { "▶ Play" }).size(12))
-                    .padding([4.0, 12.0])
-                    .style(button::primary)
-                    .on_press_maybe(has_content.then_some(if playing {
-                        Message::Pause
-                    } else {
-                        Message::Play
-                    })),
-                button(text("■ Stop").size(12))
+                button(
+                    text(if playing { "❚❚ Pause" } else { "▶ Play" }).size(typography::BODY_SIZE)
+                )
+                .padding([4.0, 12.0])
+                .style(button::primary)
+                .on_press_maybe(has_content.then_some(if playing {
+                    Message::Pause
+                } else {
+                    Message::Play
+                })),
+                button(text("■ Stop").size(typography::BODY_SIZE))
                     .padding([4.0, 10.0])
                     .style(button::secondary)
                     .on_press_maybe(has_content.then_some(Message::Stop)),
-                text(format!(
-                    "{:>8}",
-                    canvas_scope::format_time(self.transport.playhead_s())
-                ))
-                .size(12),
+                // The clock is the one number on this screen that changes
+                // continuously, so it is set monospaced: the digits do not
+                // shove each other about as it runs.
+                text(canvas_scope::format_time(self.transport.playhead_s()))
+                    .size(typography::HEADING_SIZE)
+                    .font(typography::READOUT),
                 scrub,
-                button(text("Fit").size(11))
+                button(text("Fit").size(typography::LABEL_SIZE))
                     .padding([3.0, 8.0])
                     .style(button::text)
                     .on_press_maybe(has_content.then_some(Message::FitAll)),
                 pick_list(Layout::ALL, Some(self.layout), Message::LayoutChanged)
-                    .text_size(11)
+                    .text_size(typography::BODY_SIZE)
                     .padding(3),
             ]
-            .spacing(6)
+            .spacing(8)
             .align_y(Alignment::Center),
         )
-        .padding([4, 6])
+        .padding([6, 6])
         .width(Length::Fill)
         .into()
     }
@@ -1517,19 +1577,31 @@ impl State {
             .unwrap_or_default();
 
         container(
+            // Every field on this line is a reading, so every field is
+            // monospaced: the line does not reflow as the transport runs.
             row![
-                text(state).size(11),
+                text(state)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT),
                 Space::with_width(Length::Fixed(12.0)),
-                text(window).size(11).style(text::secondary),
+                text(window)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
                 Space::with_width(Length::Fixed(12.0)),
-                text(hover).size(11).style(text::secondary),
+                text(hover)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
                 Space::with_width(Length::Fill),
-                text(residual).size(11),
+                text(residual)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT),
                 text(if self.reducing { " reducing…" } else { "" })
-                    .size(11)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .style(ui::dim),
                 text(self.status.clone().unwrap_or_default())
-                    .size(11)
+                    .size(typography::LABEL_SIZE)
                     .style(text::danger),
             ]
             .spacing(4)
@@ -1575,17 +1647,17 @@ impl State {
             list = list.push(comparison);
         }
         if self.view.artifacts.is_empty() {
-            list = list.push(
-                text("This stage emitted no artifacts.")
-                    .size(12)
-                    .style(text::secondary),
-            );
+            list = list.push(ui::empty(
+                "This stage emitted no artifacts.",
+                "It still ran — what it produced went downstream as a signal rather than                  as a table or a chart.",
+            ));
         }
 
         container(scrollable(list).height(Length::Fill))
-            .padding(8)
+            .padding([10, 10])
             .width(Length::Fixed(330.0))
             .height(Length::Fill)
+            .style(ui::panel)
             .into()
     }
 
@@ -1668,14 +1740,14 @@ impl State {
         for name in names {
             let selected = name == current;
             picker = picker.push(
-                button(text(name.clone()).size(10))
-                    .padding([2.0, 6.0])
-                    .style(if selected {
-                        button::primary
-                    } else {
-                        button::text
-                    })
-                    .on_press(Message::MetricSelected(name)),
+                button(
+                    text(name.clone())
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::READOUT),
+                )
+                .padding([2.0, 6.0])
+                .style(ui::selectable(selected))
+                .on_press(Message::MetricSelected(name)),
             );
         }
 
@@ -1703,14 +1775,15 @@ impl State {
         let failed = detail.failed_assertions(group);
 
         let mut list = column![row![
-            text("Assertions").size(13),
+            ui::caption("Assertions"),
             Space::with_width(Length::Fill),
             text(if failed == 0 {
                 format!("{} passed", rows.len())
             } else {
                 format!("{failed} of {} failed", rows.len())
             })
-            .size(11)
+            .size(typography::LABEL_SIZE)
+            .font(typography::READOUT)
             .style(if failed == 0 {
                 text::success
             } else {
@@ -1718,19 +1791,30 @@ impl State {
             }),
         ]
         .align_y(Alignment::Center)]
-        .spacing(3);
+        .spacing(4);
 
         let mut ordered: Vec<&AssertionResultRow> = rows.iter().collect();
         ordered.sort_by_key(|row| (!row.status.is_failure(), row.ordinal));
         for row in ordered {
             let style = match row.status {
                 AssertStatus::Pass => text::success,
-                AssertStatus::NotApplicable => text::secondary,
+                AssertStatus::NotApplicable => ui::dim,
                 AssertStatus::Fail | AssertStatus::Error => text::danger,
             };
-            list = list.push(text(row.expression.clone()).size(11).style(style));
+            // The expression is the thing that was asserted, in the form the
+            // user wrote it, so it is set as written.
+            list = list.push(
+                text(row.expression.clone())
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(style),
+            );
             if let Some(message) = &row.message {
-                list = list.push(text(format!("  {message}")).size(10).style(text::secondary));
+                list = list.push(
+                    text(message.clone())
+                        .size(typography::LABEL_SIZE)
+                        .style(ui::dim),
+                );
             }
         }
         Some(list.into())
@@ -1742,15 +1826,20 @@ impl State {
     fn comparison_pane(&self) -> Option<Element<'_, Message>> {
         self.against?;
         let mut list = column![row![
-            text("Compared with").size(13),
+            ui::caption("Compared with"),
             Space::with_width(Length::Fill),
-            button(text("Clear").size(10))
-                .padding([2.0, 6.0])
-                .style(button::text)
-                .on_press(Message::ClearComparison),
+            button(
+                text("Clear")
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::LABEL)
+                    .style(ui::dim),
+            )
+            .padding([2.0, 6.0])
+            .style(button::text)
+            .on_press(Message::ClearComparison),
         ]
         .align_y(Alignment::Center)]
-        .spacing(3);
+        .spacing(4);
 
         let Some(diff) = &self.diff else {
             return Some(
@@ -1760,23 +1849,28 @@ impl State {
                     } else {
                         "No comparison."
                     })
-                    .size(11)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .style(ui::dim),
                 )
                 .into(),
             );
         };
 
-        list = list.push(text(diff.describe()).size(11).style(if diff.is_clean() {
-            text::success
-        } else {
-            text::danger
-        }));
+        list = list.push(text(diff.describe()).size(typography::LABEL_SIZE).style(
+            if diff.is_clean() {
+                text::success
+            } else {
+                text::danger
+            },
+        ));
         if !diff.same_pipeline {
+            // Two runs of different pipelines can differ for a reason that
+            // is not a regression, which the reader has to know before they
+            // read the deviations below.
             list = list.push(
-                text("the two runs ran different pipelines")
-                    .size(10)
-                    .style(text::secondary),
+                text("The two runs ran different pipelines.")
+                    .size(typography::LABEL_SIZE)
+                    .style(ui::warned),
             );
         }
 
@@ -1787,7 +1881,11 @@ impl State {
                 continue;
             }
             for reason in reasons {
-                list = list.push(text(reason.clone()).size(10).style(text::danger));
+                list = list.push(
+                    text(reason.clone())
+                        .size(typography::LABEL_SIZE)
+                        .style(text::danger),
+                );
             }
         }
         let elsewhere = deviations
@@ -1797,15 +1895,15 @@ impl State {
         if elsewhere > 0 {
             list = list.push(
                 text(format!("{elsewhere} other group(s) deviate"))
-                    .size(10)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .style(ui::dim),
             );
         } else if !deviations.is_empty() && here.is_some() {
             // Every deviation is in this group, which is worth saying plainly.
             list = list.push(
                 text("no other group deviates")
-                    .size(10)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .style(ui::dim),
             );
         }
         Some(list.into())
@@ -1821,9 +1919,13 @@ impl State {
         if row.diagnostics.is_empty() && row.message.is_none() {
             return None;
         }
-        let mut list = column![text("Diagnostics").size(13)].spacing(3);
+        let mut list = column![ui::caption("Diagnostics")].spacing(4);
         if let Some(message) = &row.message {
-            list = list.push(text(message.clone()).size(11).style(text::danger));
+            list = list.push(
+                text(message.clone())
+                    .size(typography::LABEL_SIZE)
+                    .style(text::danger),
+            );
         }
         for diagnostic in &row.diagnostics {
             let where_at = diagnostic
@@ -1842,11 +1944,14 @@ impl State {
                     diagnostic.severity.as_str(),
                     diagnostic.message
                 ))
-                .size(11)
+                .size(typography::LABEL_SIZE)
+                // A warning was taking the accent, which is the colour the
+                // playhead and the selection are spent on; it now takes the
+                // theme's warning, which is what it is.
                 .style(match diagnostic.severity {
                     sp_core::Severity::Error => text::danger,
-                    sp_core::Severity::Warn => text::primary,
-                    sp_core::Severity::Info => text::secondary,
+                    sp_core::Severity::Warn => ui::warned,
+                    sp_core::Severity::Info => ui::dim,
                 }),
             );
         }
@@ -1861,7 +1966,7 @@ fn colour_for(trace: &Trace) -> iced::Color {
     match trace.role {
         Role::Selected => base,
         Role::Pinned => iced::Color { a: 0.45, ..base },
-        Role::Residual => iced::Color::from_rgb(0.93, 0.42, 0.51),
+        Role::Residual => crate::theme::RESIDUAL,
     }
 }
 

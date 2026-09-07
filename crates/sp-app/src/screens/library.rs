@@ -19,9 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use iced::widget::{
-    button, column, container, horizontal_rule, row, scrollable, text, text_input, Space,
-};
+use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length, Task, Theme};
 use sp_core::group::DatasetId;
 use sp_core::{
@@ -31,6 +29,10 @@ use sp_store::{library, props, pulses, trains, LibrarySummary, PropertyQuery, St
 
 use crate::jobs;
 use crate::screens::inspector::Target;
+use crate::typography;
+use crate::ui::{
+    cell, column_label, dim, heading, heading_aligned, rule, selectable, spec, value, warned,
+};
 
 /// Pulse rows shown in the detail table before the user needs the Inspector.
 const PULSE_PREVIEW_ROWS: u64 = 200;
@@ -376,13 +378,22 @@ impl State {
 
     #[must_use]
     pub fn view(&self) -> Element<'_, Message> {
+        // The rail sits on its own surface and is divided from the pane by a
+        // hairline rather than by a shadow: the two are beside each other, not
+        // one floating over the other.
         let tree = container(self.tree())
-            .width(Length::Fixed(360.0))
+            .width(Length::Fixed(340.0))
             .height(Length::Fill)
             .style(|theme: &Theme| {
                 let palette = theme.extended_palette();
+                let tokens = crate::theme::tokens(theme);
                 container::Style {
-                    background: Some(palette.background.weak.color.scale_alpha(0.5).into()),
+                    background: Some(palette.background.weak.color.into()),
+                    border: iced::Border {
+                        color: tokens.rule,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
                     ..container::Style::default()
                 }
             });
@@ -390,7 +401,7 @@ impl State {
         let detail = container(self.detail_pane())
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding([12, 16]);
+            .padding([16, 20]);
 
         row![tree, detail].height(Length::Fill).into()
     }
@@ -400,12 +411,12 @@ impl State {
             text_input("Search signals…", &self.search)
                 .on_input(Message::SearchChanged)
                 .on_submit(Message::Search)
-                .size(13),
-            button(text("Go").size(12))
+                .size(typography::BODY_SIZE),
+            button(text("Go").size(typography::BODY_SIZE))
                 .padding([5, 9])
                 .style(button::secondary)
                 .on_press(Message::Search),
-            button(text("Refresh").size(12))
+            button(text("Refresh").size(typography::BODY_SIZE))
                 .padding([5, 9])
                 .style(button::text)
                 .on_press(Message::Refresh),
@@ -419,12 +430,12 @@ impl State {
             text_input("property", &self.prop_key)
                 .on_input(Message::PropKeyChanged)
                 .on_submit(Message::Search)
-                .size(12)
+                .size(typography::BODY_SIZE)
                 .width(Length::FillPortion(2)),
             text_input("any value", &self.prop_value)
                 .on_input(Message::PropValueChanged)
                 .on_submit(Message::Search)
-                .size(12)
+                .size(typography::BODY_SIZE)
                 .width(Length::FillPortion(3)),
         ]
         .spacing(6)
@@ -433,29 +444,50 @@ impl State {
         let mut list = column![].spacing(2).width(Length::Fill);
 
         if let Some(error) = &self.error {
-            list = list.push(text(error).size(13).style(text::danger));
+            list = list.push(text(error).size(typography::BODY_SIZE).style(text::danger));
         }
         if let Some(notice) = &self.notice {
-            list = list.push(text(notice).size(12).style(text::success));
+            list = list.push(
+                text(notice)
+                    .size(typography::BODY_SIZE)
+                    .style(text::success),
+            );
         }
 
         if let Some(index) = &self.index {
             if !index.tags.is_empty() {
+                // A tag and how many signals carry it are two different kinds
+                // of thing, so they are set as two: the name in the label face,
+                // the count monospaced beside it. A wall of solid pills said
+                // neither, and spent the accent on every tag in the library
+                // rather than on the ones that are on.
                 let mut chips = row![].spacing(4);
                 for (tag, count) in &index.tags {
                     let active = self.tag_filter.contains(tag);
                     chips = chips.push(
-                        button(text(format!("{tag} {count}")).size(11))
-                            .padding([2, 8])
-                            .style(if active {
-                                button::primary
-                            } else {
-                                button::secondary
-                            })
-                            .on_press(Message::ToggleTag(tag.clone())),
+                        button(
+                            row![
+                                text(tag.to_uppercase()).size(typography::LABEL_SIZE).font(
+                                    if active {
+                                        typography::BODY_STRONG
+                                    } else {
+                                        typography::LABEL
+                                    }
+                                ),
+                                text(count.to_string())
+                                    .size(typography::LABEL_SIZE)
+                                    .font(typography::READOUT)
+                                    .style(if active { text::base } else { dim }),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .padding([2, 8])
+                        .style(selectable(active))
+                        .on_press(Message::ToggleTag(tag.clone())),
                     );
                 }
-                list = list.push(container(chips.wrap()).padding([2, 0]));
+                list = list.push(container(chips.wrap()).padding([4, 0]));
             }
         }
 
@@ -472,13 +504,19 @@ impl State {
                         hits.len(),
                         if hits.len() == 1 { "" } else { "es" }
                     ))
-                    .size(12)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::LABEL)
+                    .style(dim),
                     Space::with_width(Length::Fill),
-                    button(text("Clear").size(11))
-                        .padding([2, 6])
-                        .style(button::text)
-                        .on_press(Message::ClearSearch),
+                    button(
+                        text("Clear")
+                            .size(typography::LABEL_SIZE)
+                            .font(typography::LABEL)
+                            .style(dim),
+                    )
+                    .padding([2, 6])
+                    .style(button::text)
+                    .on_press(Message::ClearSearch),
                 ]
                 .align_y(Alignment::Center),
             );
@@ -487,15 +525,16 @@ impl State {
                     row![
                         button(
                             column![
-                                text(&hit.name).size(13),
+                                text(&hit.name).size(typography::BODY_SIZE),
                                 text(format!(
                                     "{} · {} samples · group {}",
                                     hit.domain.label(),
                                     hit.sample_count,
                                     hit.group_id.get()
                                 ))
-                                .size(11)
-                                .style(text::secondary),
+                                .size(typography::LABEL_SIZE)
+                                .font(typography::READOUT)
+                                .style(dim),
                             ]
                             .spacing(1),
                         )
@@ -503,7 +542,7 @@ impl State {
                         .padding([4, 10])
                         .style(button::text)
                         .on_press(Message::SelectGroup(hit.group_id)),
-                        button(text("Inspect").size(11))
+                        button(text("Inspect").size(typography::LABEL_SIZE))
                             .padding([2, 8])
                             .style(button::text)
                             .on_press(Message::Inspect(Target::Signal(hit.id))),
@@ -511,38 +550,65 @@ impl State {
                     .align_y(Alignment::Center),
                 );
             }
-            list = list.push(horizontal_rule(1));
+            list = list.push(Space::with_height(Length::Fixed(6.0)));
+            list = list.push(rule());
+            list = list.push(Space::with_height(Length::Fixed(6.0)));
         }
 
         match &self.index {
             None if self.loading => {
-                list = list.push(text("Loading library…").size(13).style(text::secondary));
+                list = list.push(
+                    text("Loading library…")
+                        .size(typography::BODY_SIZE)
+                        .style(dim),
+                );
             }
             None => {
-                list = list.push(text("No library open.").size(13).style(text::secondary));
+                list = list.push(
+                    column![
+                        text("No library open.").size(typography::BODY_SIZE),
+                        text("Settings names the file this opens from.")
+                            .size(typography::BODY_SIZE)
+                            .style(dim),
+                    ]
+                    .spacing(4)
+                    .padding([8, 4]),
+                );
             }
             Some(index) if index.datasets.is_empty() => {
                 list = list.push(
                     column![
-                        text("The library is empty.").size(14),
+                        text("The library is empty.").size(typography::BODY_SIZE),
                         text("Import a CSV file or generate a signal to add a dataset.")
-                            .size(12)
-                            .style(text::secondary),
+                            .size(typography::BODY_SIZE)
+                            .style(dim),
                     ]
                     .spacing(4)
                     .padding([8, 4]),
                 );
             }
             Some(index) => {
-                for dataset in &index.datasets {
+                for (ordinal, dataset) in index.datasets.iter().enumerate() {
                     let trains = index.trains.get(&dataset.id).map_or(&[][..], Vec::as_slice);
                     let collapsed = self.collapsed.contains(&dataset.id);
+                    // A dataset is the top of a branch, so it is set as a
+                    // heading rather than as one more row at one less indent:
+                    // small capitals, and air above it that the rows inside it
+                    // do not get. The depth is legible from the type before it
+                    // is legible from the indent.
+                    if ordinal > 0 {
+                        list = list.push(Space::with_height(Length::Fixed(14.0)));
+                    }
                     list = list.push(
                         row![
                             button(
                                 row![
-                                    text(if collapsed { "▸" } else { "▾" }).size(13),
-                                    text(&dataset.name).size(14),
+                                    text(if collapsed { "▸" } else { "▾" })
+                                        .size(typography::LABEL_SIZE)
+                                        .style(dim),
+                                    text(dataset.name.to_uppercase())
+                                        .size(typography::LABEL_SIZE)
+                                        .font(typography::LABEL),
                                     Space::with_width(Length::Fill),
                                     text(format!(
                                         "{} · {} train{}",
@@ -550,8 +616,8 @@ impl State {
                                         trains.len(),
                                         if trains.len() == 1 { "" } else { "s" }
                                     ))
-                                    .size(11)
-                                    .style(text::secondary),
+                                    .size(typography::LABEL_SIZE)
+                                    .style(dim),
                                 ]
                                 .spacing(6)
                                 .align_y(Alignment::Center),
@@ -562,15 +628,20 @@ impl State {
                             .on_press(Message::ToggleDataset(dataset.id)),
                             // Only an imported dataset carries the layout the
                             // writer reverses, so only one offers the export.
-                            button(text("Export").size(11))
-                                .padding([2, 6])
-                                .style(button::text)
-                                .on_press_maybe(
-                                    dataset
-                                        .attributes
-                                        .contains_key(sp_csv::profile::Layout::ATTRIBUTE)
-                                        .then_some(Message::ExportDataset(dataset.id)),
-                                ),
+                            button(
+                                text("Export")
+                                    .size(typography::LABEL_SIZE)
+                                    .font(typography::LABEL)
+                                    .style(dim),
+                            )
+                            .padding([2, 6])
+                            .style(button::text)
+                            .on_press_maybe(
+                                dataset
+                                    .attributes
+                                    .contains_key(sp_csv::profile::Layout::ATTRIBUTE)
+                                    .then_some(Message::ExportDataset(dataset.id)),
+                            ),
                         ]
                         .align_y(Alignment::Center),
                     );
@@ -589,9 +660,11 @@ impl State {
                         list = list.push(
                             button(
                                 row![
-                                    Space::with_width(Length::Fixed(12.0)),
-                                    text(if folded { "▸" } else { "▾" }).size(12),
-                                    text(train.display_name()).size(13),
+                                    Space::with_width(Length::Fixed(10.0)),
+                                    text(if folded { "▸" } else { "▾" })
+                                        .size(typography::LABEL_SIZE)
+                                        .style(dim),
+                                    text(train.display_name()).size(typography::BODY_SIZE),
                                     Space::with_width(Length::Fill),
                                     // The counts are the train's, across every
                                     // group in it: that is the capture (§6.6).
@@ -600,8 +673,9 @@ impl State {
                                         if group_count == 1 { "" } else { "s" },
                                         if records == 1 { "" } else { "s" },
                                     ))
-                                    .size(11)
-                                    .style(text::secondary),
+                                    .size(typography::LABEL_SIZE)
+                                    .font(typography::READOUT)
+                                    .style(dim),
                                 ]
                                 .spacing(5)
                                 .align_y(Alignment::Center),
@@ -622,27 +696,33 @@ impl State {
                             } else {
                                 format!("{} signals", group.actual_count)
                             };
+                            // A group is the only level of the tree that is
+                            // picked rather than opened, so it is the only one
+                            // that carries a selection at all. The name takes
+                            // the medium weight when it is the one on show,
+                            // which says so even where the tint does not carry.
                             list = list.push(
                                 button(
                                     row![
-                                        Space::with_width(Length::Fixed(28.0)),
-                                        text(group.display_name()).size(13),
+                                        Space::with_width(Length::Fixed(24.0)),
+                                        text(group.display_name())
+                                            .size(typography::BODY_SIZE)
+                                            .font(if active {
+                                                typography::BODY_STRONG
+                                            } else {
+                                                typography::BODY
+                                            }),
                                         Space::with_width(Length::Fill),
-                                        text(kind).size(11).style(if active {
-                                            text::base
-                                        } else {
-                                            text::secondary
-                                        }),
+                                        text(kind)
+                                            .size(typography::LABEL_SIZE)
+                                            .font(typography::READOUT)
+                                            .style(if active { text::base } else { dim }),
                                     ]
                                     .align_y(Alignment::Center),
                                 )
                                 .width(Length::Fill)
                                 .padding([4, 8])
-                                .style(if active {
-                                    button::primary
-                                } else {
-                                    button::text
-                                })
+                                .style(selectable(active))
                                 .on_press(Message::SelectGroup(group.id)),
                             );
                         }
@@ -663,10 +743,20 @@ impl State {
             return Space::new(Length::Fill, Length::Fill).into();
         };
         let Some(selected) = self.selected else {
+            // An empty state that names the shape of the tree is worth more
+            // than one that says nothing is here: the reason a group is two
+            // levels down is the reason the tree has three.
             return container(
-                text("Select a group to see its signals or pulse fields.")
-                    .size(14)
-                    .style(text::secondary),
+                column![
+                    text("Pick a group on the left.").size(typography::BODY_SIZE),
+                    text(
+                        "A dataset holds the trains that were captured from it,                          and a train holds the groups one capture resolved to."
+                    )
+                    .size(typography::BODY_SIZE)
+                    .style(dim),
+                ]
+                .spacing(4)
+                .max_width(460),
             )
             .into();
         };
@@ -675,51 +765,76 @@ impl State {
         };
 
         let (train_groups, train_records) = index.train_extent(train);
-        let mut header = column![
-            text(group.display_name()).size(22),
-            // The group is a segment, so the line says which capture of.
-            text(format!(
-                "{} · {} · block {} of {train_groups} · declared {} · read {}{}",
-                dataset.name,
-                train.display_name(),
-                group.ordinal,
-                group.declared_count,
-                group.actual_count,
-                group
-                    .toa_unit
-                    .map_or_else(String::new, |unit| format!(" · time of arrival in {unit}")),
-            ))
-            .size(12)
-            .style(text::secondary),
-            text(format!(
-                "The train holds {train_records} record{} across {train_groups} group{}.",
-                if train_records == 1 { "" } else { "s" },
-                if train_groups == 1 { "" } else { "s" },
-            ))
-            .size(11)
-            .style(text::secondary),
+
+        // What the group is, as a panel states it: a caption over a reading,
+        // one per fact. The line this replaced ran the same six facts together
+        // with interpuncts and then said the last two again in a sentence, so
+        // the reader had to parse a paragraph to find a number that was
+        // already on screen.
+        let mut strip = row![
+            spec("DATASET", dataset.name.clone(), text::base),
+            spec("TRAIN", train.display_name().to_owned(), text::base),
+            spec(
+                "BLOCK",
+                format!("{} / {train_groups}", group.ordinal),
+                text::base,
+            ),
+            spec("DECLARED", group.declared_count.to_string(), text::base),
+            // A count that disagrees with what was declared is the one thing
+            // on this strip that can be wrong, so it is the one thing that can
+            // carry a colour.
+            spec(
+                "READ",
+                group.actual_count.to_string(),
+                if group.count_matches() {
+                    text::base
+                } else {
+                    warned
+                },
+            ),
+            spec(
+                "IN TRAIN",
+                format!("{train_records} across {train_groups}"),
+                text::base,
+            ),
         ]
-        .spacing(4);
+        .spacing(24);
+
+        if let Some(unit) = group.toa_unit {
+            strip = strip.push(spec("TIME OF ARRIVAL", unit.to_string(), text::base));
+        }
+
+        let mut header = column![
+            text(group.display_name())
+                .size(typography::TITLE_SIZE)
+                .font(typography::TITLE),
+            strip.wrap(),
+        ]
+        .spacing(10);
 
         if !group.count_matches() {
             header = header.push(
-                text("Declared count differs from rows read (tolerant import).")
-                    .size(12)
-                    .style(text::danger),
+                text("Read in tolerant mode: the file declared one count and held another.")
+                    .size(typography::LABEL_SIZE)
+                    .style(warned),
             );
         }
         if !group.attributes.is_empty() {
-            let attrs = group
-                .attributes
-                .iter()
-                .map(|(k, v)| format!("{k} = {}", value_text(v)))
-                .collect::<Vec<_>>()
-                .join("   ");
-            header = header.push(text(attrs).size(12));
+            // The attributes came out of the file and go back into it
+            // unchanged (G1), so they are shown as they are stored: the key as
+            // a caption, the value as a reading.
+            let mut attributes = row![].spacing(20);
+            for (key, held) in group.attributes.iter() {
+                attributes = attributes.push(spec(key, value_text(held), text::base));
+            }
+            header = header.push(attributes.wrap());
         }
 
         let body: Element<'_, Message> = if let Some(error) = &self.detail_error {
-            text(error).size(13).style(text::danger).into()
+            text(error)
+                .size(typography::BODY_SIZE)
+                .style(text::danger)
+                .into()
         } else {
             match &self.detail {
                 Some((id, detail)) if *id == selected => match detail {
@@ -731,15 +846,21 @@ impl State {
                         total,
                     } => pulse_table(group, fields, toa_s, rows, *total),
                 },
-                _ => text("Loading…").size(13).style(text::secondary).into(),
+                _ => text("Loading…")
+                    .size(typography::BODY_SIZE)
+                    .style(dim)
+                    .into(),
             }
         };
 
+        // The header is what the group is; below the rule is what is in it.
+        // The gap above the rule is wider than the gap below it, so the rule
+        // belongs to the table rather than floating between two halves.
         column![
             header,
+            Space::with_height(Length::Fixed(20.0)),
+            rule(),
             Space::with_height(Length::Fixed(12.0)),
-            horizontal_rule(1),
-            Space::with_height(Length::Fixed(8.0)),
             scrollable(body).height(Length::Fill),
         ]
         .into()
@@ -800,19 +921,13 @@ fn load_detail(
 
 const COLUMN_WIDTHS: [f32; 9] = [180.0, 110.0, 60.0, 110.0, 100.0, 90.0, 90.0, 90.0, 90.0];
 
-fn cell<'a>(content: impl ToString, width: f32) -> Element<'a, Message> {
-    container(text(content.to_string()).size(12))
-        .width(Length::Fixed(width))
-        .padding([3, 6])
-        .into()
-}
-
-fn heading<'a>(content: impl ToString, width: f32) -> Element<'a, Message> {
-    container(text(content.to_string()).size(11).style(text::secondary))
-        .width(Length::Fixed(width))
-        .padding([3, 6])
-        .into()
-}
+/// Which of those columns hold a reading rather than a word.
+///
+/// Name, domain and type are read as language and stay left, where the eye
+/// starts. Everything from the sample rate rightwards is a quantity, and a
+/// quantity is set monospaced and flush right so the column can be scanned
+/// down instead of read across.
+const NUMERIC_COLUMNS: [usize; 6] = [3, 4, 5, 6, 7, 8];
 
 /// Orders a group's signals by the column the user clicked.
 ///
@@ -865,8 +980,8 @@ fn sorted_signals(signals: &[Signal], sort: Option<(usize, bool)>) -> Vec<&Signa
 fn signal_table(signals: &[Signal], sort: Option<(usize, bool)>) -> Element<'_, Message> {
     if signals.is_empty() {
         return text("This group has no signals.")
-            .size(13)
-            .style(text::secondary)
+            .size(typography::BODY_SIZE)
+            .style(dim)
             .into();
     }
     let labels = [
@@ -884,9 +999,16 @@ fn signal_table(signals: &[Signal], sort: Option<(usize, bool)>) -> Element<'_, 
         };
         head = head.push(
             button(
-                text(format!("{label}{marker}"))
-                    .size(11)
-                    .style(text::secondary),
+                container(column_label(
+                    format!("{label}{marker}"),
+                    matches!(sort, Some((column, _)) if column == index),
+                ))
+                .width(Length::Fill)
+                .align_x(if NUMERIC_COLUMNS.contains(&index) {
+                    Alignment::End
+                } else {
+                    Alignment::Start
+                }),
             )
             .width(Length::Fixed(width))
             .padding([3, 6])
@@ -895,7 +1017,7 @@ fn signal_table(signals: &[Signal], sort: Option<(usize, bool)>) -> Element<'_, 
         );
     }
     head = head.push(heading("", 80.0));
-    table = table.push(head).push(horizontal_rule(1));
+    table = table.push(head).push(rule());
     for signal in sorted_signals(signals, sort) {
         let stats = signal.stats;
         let rate = signal
@@ -914,11 +1036,15 @@ fn signal_table(signals: &[Signal], sort: Option<(usize, bool)>) -> Element<'_, 
             fmt_opt(stats.and_then(|s| s.rms())),
         ];
         let mut line = row![].align_y(Alignment::Center);
-        for (value, width) in cells.into_iter().zip(COLUMN_WIDTHS) {
-            line = line.push(cell(value, width));
+        for (index, (content, width)) in cells.into_iter().zip(COLUMN_WIDTHS).enumerate() {
+            line = line.push(if NUMERIC_COLUMNS.contains(&index) {
+                value(content, width)
+            } else {
+                cell(content, width)
+            });
         }
         line = line.push(
-            button(text("Inspect").size(11))
+            button(text("Inspect").size(typography::LABEL_SIZE))
                 .padding([2, 8])
                 .style(button::text)
                 .on_press(Message::Inspect(Target::Signal(signal.id))),
@@ -938,18 +1064,22 @@ fn pulse_table<'a>(
     let unit = group.toa_unit.unwrap_or_default();
     let field_width = 120.0;
 
-    let mut summary = column![text("Fields").size(14)].spacing(2);
+    let mut summary = column![text("FIELDS")
+        .size(typography::LABEL_SIZE)
+        .font(typography::LABEL)
+        .style(dim)]
+    .spacing(4);
     let mut head = row![
         heading("Field", 180.0),
         heading("Type", 60.0),
-        heading("Min", 100.0),
-        heading("Max", 100.0),
-        heading("Mean", 100.0),
-        heading("RMS", 100.0),
-        heading("Missing", 80.0),
+        heading_aligned("Min", 100.0, Alignment::End),
+        heading_aligned("Max", 100.0, Alignment::End),
+        heading_aligned("Mean", 100.0, Alignment::End),
+        heading_aligned("RMS", 100.0, Alignment::End),
+        heading_aligned("Missing", 80.0, Alignment::End),
     ];
     head = head.push(Space::with_width(Length::Fill));
-    summary = summary.push(head).push(horizontal_rule(1));
+    summary = summary.push(head).push(rule());
     for field in fields {
         let stats = field.stats;
         let name = match &field.unit {
@@ -960,12 +1090,12 @@ fn pulse_table<'a>(
             row![
                 cell(name, 180.0),
                 cell(field.dtype, 60.0),
-                cell(fmt_opt(stats.and_then(|s| s.min())), 100.0),
-                cell(fmt_opt(stats.and_then(|s| s.max())), 100.0),
-                cell(fmt_opt(stats.and_then(|s| s.mean())), 100.0),
-                cell(fmt_opt(stats.and_then(|s| s.rms())), 100.0),
-                cell(stats.map_or(0, |s| s.non_finite()), 80.0),
-                button(text("Inspect").size(11))
+                value(fmt_opt(stats.and_then(|s| s.min())), 100.0),
+                value(fmt_opt(stats.and_then(|s| s.max())), 100.0),
+                value(fmt_opt(stats.and_then(|s| s.mean())), 100.0),
+                value(fmt_opt(stats.and_then(|s| s.rms())), 100.0),
+                value(stats.map_or(0, |s| s.non_finite()), 80.0),
+                button(text("Inspect").size(typography::LABEL_SIZE))
                     .padding([2, 8])
                     .style(button::text)
                     .on_press(Message::Inspect(Target::PulseField {
@@ -978,17 +1108,33 @@ fn pulse_table<'a>(
     }
 
     let shown = rows.len();
-    let mut records =
-        column![text(format!("Pulses — first {shown} of {total}")).size(14)].spacing(2);
-    let mut head = row![heading("#", 60.0), heading(format!("TOA ({unit})"), 120.0)];
+    let mut records = column![row![
+        text("PULSES")
+            .size(typography::LABEL_SIZE)
+            .font(typography::LABEL)
+            .style(dim),
+        text(format!("first {shown} of {total}"))
+            .size(typography::LABEL_SIZE)
+            .font(typography::READOUT)
+            .style(dim),
+    ]
+    .spacing(8)]
+    .spacing(4);
+    let mut head = row![
+        heading_aligned("#", 60.0, Alignment::End),
+        heading_aligned(format!("TOA ({unit})"), 120.0, Alignment::End),
+    ];
     for field in fields {
-        head = head.push(heading(&field.name, field_width));
+        head = head.push(heading_aligned(&field.name, field_width, Alignment::End));
     }
-    records = records.push(head).push(horizontal_rule(1));
+    records = records.push(head).push(rule());
     for (i, (toa, values)) in toa_s.iter().zip(rows).enumerate() {
-        let mut line = row![cell(i, 60.0), cell(fmt_num(unit.from_seconds(*toa)), 120.0)];
-        for value in values {
-            line = line.push(cell(fmt_num(*value), field_width));
+        let mut line = row![
+            value(i, 60.0),
+            value(fmt_num(unit.from_seconds(*toa)), 120.0)
+        ];
+        for reading in values {
+            line = line.push(value(fmt_num(*reading), field_width));
         }
         records = records.push(line);
     }

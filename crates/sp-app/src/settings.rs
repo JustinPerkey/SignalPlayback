@@ -50,8 +50,8 @@ impl ThemeChoice {
     #[must_use]
     pub fn theme(self) -> iced::Theme {
         match self {
-            Self::Dark => iced::Theme::Dark,
-            Self::Light => iced::Theme::Light,
+            Self::Dark => crate::theme::dark(),
+            Self::Light => crate::theme::light(),
         }
     }
 

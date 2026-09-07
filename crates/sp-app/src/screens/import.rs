@@ -15,10 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, pick_list, progress_bar, row, scrollable,
-    text, text_input, Space,
+    button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
+    text_input, Space,
 };
-use iced::{Alignment, Element, Length, Subscription, Task, Theme};
+use iced::{Alignment, Element, Length, Subscription, Task};
 use sp_core::{DType, PropScope, PropertyDef, TimeUnit};
 use sp_csv::profile::{ColumnRule, CountMode};
 use sp_csv::{
@@ -28,6 +28,8 @@ use sp_csv::{
 use sp_store::{profiles, props, SavedProfile, Store};
 
 use crate::jobs;
+use crate::typography;
+use crate::ui;
 
 /// Diagnostics listed before the panel says "and N more".
 const DIAGNOSTIC_ROWS: usize = 200;
@@ -639,13 +641,7 @@ impl State {
         let settings = container(scrollable(self.settings_pane()).height(Length::Fill))
             .width(Length::Fixed(430.0))
             .height(Length::Fill)
-            .style(|theme: &Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    background: Some(palette.background.weak.color.scale_alpha(0.5).into()),
-                    ..container::Style::default()
-                }
-            });
+            .style(ui::panel);
 
         row![settings, self.preview_pane()]
             .height(Length::Fill)
@@ -661,8 +657,8 @@ impl State {
                 text_input("Path to a CSV file…", &self.path)
                     .on_input(Message::PathChanged)
                     .on_submit(Message::Sniff)
-                    .size(13),
-                button(text("Browse…").size(12))
+                    .size(typography::BODY_SIZE),
+                button(text("Browse…").size(typography::BODY_SIZE))
                     .padding([5, 9])
                     .style(button::secondary)
                     .on_press(Message::Browse),
@@ -674,7 +670,7 @@ impl State {
             "Dataset name",
             text_input("From the file name", &self.dataset_name)
                 .on_input(Message::DatasetNameChanged)
-                .size(13)
+                .size(typography::BODY_SIZE)
                 .into(),
         ));
 
@@ -683,7 +679,7 @@ impl State {
             "Preamble lines",
             text_input("1", &self.profile.preamble_lines.to_string())
                 .on_input(Message::PreambleChanged)
-                .size(13)
+                .size(typography::BODY_SIZE)
                 .into(),
         ));
         pane = pane.push(labelled(
@@ -693,7 +689,7 @@ impl State {
                 Some(DelimiterChoice(self.profile.delimiter)),
                 Message::DelimiterPicked,
             )
-            .text_size(13)
+            .text_size(typography::BODY_SIZE)
             .into(),
         ));
         pane = pane.push(labelled(
@@ -703,7 +699,7 @@ impl State {
                 Some(UnitChoice(self.profile.time_unit)),
                 Message::UnitPicked,
             )
-            .text_size(13)
+            .text_size(typography::BODY_SIZE)
             .into(),
         ));
         pane = pane.push(labelled(
@@ -713,7 +709,7 @@ impl State {
                 Some(ModeChoice(self.profile.mode)),
                 Message::ModePicked,
             )
-            .text_size(13)
+            .text_size(typography::BODY_SIZE)
             .into(),
         ));
 
@@ -727,7 +723,7 @@ impl State {
                     Some(preview.layout.count_label().to_owned()),
                     Message::CountColumnPicked,
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .into(),
             ));
             pane = pane.push(labelled(
@@ -737,7 +733,7 @@ impl State {
                     Some(preview.layout.time_label().to_owned()),
                     Message::TimeColumnPicked,
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .into(),
             ));
             pane = pane.push(labelled(
@@ -750,7 +746,7 @@ impl State {
                         .and_then(|index| group_labels.get(index).cloned()),
                     Message::NameColumnPicked,
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .into(),
             ));
 
@@ -766,8 +762,8 @@ impl State {
                 text_input("Save these settings as…", &self.save_as)
                     .on_input(Message::SaveAsChanged)
                     .on_submit(Message::SaveProfile)
-                    .size(13),
-                button(text("Save").size(12))
+                    .size(typography::BODY_SIZE),
+                button(text("Save").size(typography::BODY_SIZE))
                     .padding([5, 9])
                     .style(button::secondary)
                     .on_press(Message::SaveProfile),
@@ -776,29 +772,37 @@ impl State {
             .align_y(Alignment::Center),
         );
         if self.saved.is_empty() {
-            pane = pane.push(
-                text("No saved profiles yet.")
-                    .size(12)
-                    .style(text::secondary),
-            );
+            pane = pane.push(ui::empty(
+                "No saved profiles yet.",
+                "Every framing constant above is a setting rather than a rule; save the                  set that reads one instrument and it opens the next file in one press.",
+            ));
         }
         for saved in &self.saved {
             let active = self.loaded_profile == Some(saved.id);
             pane = pane.push(
                 row![
-                    button(text(&saved.name).size(12))
-                        .padding([3, 8])
-                        .width(Length::Fill)
-                        .style(if active {
-                            button::primary
-                        } else {
-                            button::text
-                        })
-                        .on_press(Message::LoadProfile(saved.id)),
-                    button(text("Delete").size(11))
-                        .padding([3, 8])
-                        .style(button::text)
-                        .on_press(Message::DeleteProfile(saved.id)),
+                    button(
+                        text(&saved.name)
+                            .size(typography::BODY_SIZE)
+                            .font(if active {
+                                typography::BODY_STRONG
+                            } else {
+                                typography::BODY
+                            }),
+                    )
+                    .padding([3, 8])
+                    .width(Length::Fill)
+                    .style(ui::selectable(active))
+                    .on_press(Message::LoadProfile(saved.id)),
+                    button(
+                        text("Delete")
+                            .size(typography::LABEL_SIZE)
+                            .font(typography::LABEL)
+                            .style(ui::dim),
+                    )
+                    .padding([3, 8])
+                    .style(button::text)
+                    .on_press(Message::DeleteProfile(saved.id)),
                 ]
                 .spacing(4)
                 .align_y(Alignment::Center),
@@ -817,8 +821,8 @@ impl State {
             if hint.index == preview.layout.count_index {
                 list = list.push(
                     text(format!("{} — the count column", hint.label))
-                        .size(12)
-                        .style(text::secondary),
+                        .size(typography::BODY_SIZE)
+                        .style(ui::dim),
                 );
                 continue;
             }
@@ -834,25 +838,27 @@ impl State {
                     row![
                         checkbox(hint.label.clone(), rule.include)
                             .size(14)
-                            .text_size(13)
+                            .text_size(typography::BODY_SIZE)
                             .on_toggle({
                                 let label = hint.label.clone();
                                 move |include| Message::ToggleGroupColumn(label.clone(), include)
                             }),
                         Space::with_width(Length::Fill),
                         text(format!("e.g. {}", sample_of(hint)))
-                            .size(11)
-                            .style(text::secondary),
+                            .size(typography::LABEL_SIZE)
+                            .style(ui::dim),
                     ]
                     .align_y(Alignment::Center),
                     row![
-                        text(format!("→ {key}")).size(11).style(text::secondary),
+                        text(format!("→ {key}"))
+                            .size(typography::LABEL_SIZE)
+                            .style(ui::dim),
                         Space::with_width(Length::Fill),
                         pick_list(options.clone(), Some(Binding(rule.key.clone())), {
                             let label = hint.label.clone();
                             move |binding| Message::GroupBindingPicked(label.clone(), binding)
                         },)
-                        .text_size(12),
+                        .text_size(typography::BODY_SIZE),
                     ]
                     .align_y(Alignment::Center),
                 ]
@@ -871,10 +877,10 @@ impl State {
             list = list.push(
                 row![
                     text("Some columns hold only whole numbers.")
-                        .size(11)
-                        .style(text::secondary),
+                        .size(typography::LABEL_SIZE)
+                        .style(ui::dim),
                     Space::with_width(Length::Fill),
-                    button(text("Narrow them").size(11))
+                    button(text("Narrow them").size(typography::LABEL_SIZE))
                         .padding([2, 6])
                         .style(button::text)
                         .on_press(Message::ApplyProposals),
@@ -890,8 +896,8 @@ impl State {
                         "{} — the time of arrival, in {}",
                         hint.label, self.profile.time_unit
                     ))
-                    .size(12)
-                    .style(text::secondary),
+                    .size(typography::BODY_SIZE)
+                    .style(ui::dim),
                 );
                 continue;
             }
@@ -901,15 +907,15 @@ impl State {
                     row![
                         checkbox(hint.label.clone(), rule.include)
                             .size(14)
-                            .text_size(13)
+                            .text_size(typography::BODY_SIZE)
                             .on_toggle({
                                 let label = hint.label.clone();
                                 move |include| Message::TogglePulseColumn(label.clone(), include)
                             }),
                         Space::with_width(Length::Fill),
                         text(format!("e.g. {}", sample_of(hint)))
-                            .size(11)
-                            .style(text::secondary),
+                            .size(typography::LABEL_SIZE)
+                            .style(ui::dim),
                     ]
                     .align_y(Alignment::Center),
                     row![
@@ -918,14 +924,14 @@ impl State {
                                 let label = hint.label.clone();
                                 move |key| Message::PulseKeyChanged(label.clone(), key)
                             })
-                            .size(12)
+                            .size(typography::BODY_SIZE)
                             .width(Length::Fixed(150.0)),
                         Space::with_width(Length::Fill),
                         pick_list(Storage::ALL.to_vec(), Some(Storage::of(Some(&rule))), {
                             let label = hint.label.clone();
                             move |storage| Message::PulseStoragePicked(label.clone(), storage)
                         })
-                        .text_size(12),
+                        .text_size(typography::BODY_SIZE),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
@@ -942,10 +948,10 @@ impl State {
         pane = pane.push(self.action_row());
 
         if let Some(error) = &self.error {
-            pane = pane.push(text(error).size(13).style(text::danger));
+            pane = pane.push(text(error).size(typography::BODY_SIZE).style(text::danger));
         }
         if let Some(notice) = &self.notice {
-            pane = pane.push(text(notice).size(12).style(text::secondary));
+            pane = pane.push(text(notice).size(typography::BODY_SIZE).style(ui::dim));
         }
         if let Some(job) = &self.job {
             pane = pane.push(self.progress_row(job));
@@ -953,43 +959,44 @@ impl State {
 
         let body: Element<'_, Message> = match (&self.preview, &self.preview_error) {
             (_, Some(error)) => column![
-                text("This file cannot be read as the grouped-block format.").size(14),
-                text(error).size(13).style(text::danger),
+                text("This file cannot be read as the grouped-block format.")
+                    .size(typography::BODY_SIZE),
+                // The parser said exactly what stopped it, and it said it in
+                // the file's own terms, so it is quoted rather than paraphrased.
+                text(error)
+                    .size(typography::BODY_SIZE)
+                    .font(typography::READOUT)
+                    .style(text::danger),
                 text(
-                    "Adjust the preamble line count or the delimiter — every framing constant \
-                     is a setting, not a rule."
+                    "Adjust the preamble line count or the delimiter on the left — every \
+                     framing constant is a setting, not a rule."
                 )
-                .size(12)
-                .style(text::secondary),
+                .size(typography::BODY_SIZE)
+                .style(ui::dim)
+                .width(Length::Fixed(520.0)),
             ]
             .spacing(6)
             .into(),
             (Some(preview), None) => self.preview_table(preview),
-            (None, None) if self.sniffing => text("Reading the first group…")
-                .size(13)
-                .style(text::secondary)
-                .into(),
-            (None, None) => column![
-                text("Nothing selected.").size(14),
-                text(
-                    "Choose a CSV file: only its preamble, headers and first group are read, so \
-                     a multi-gigabyte file previews instantly."
-                )
-                .size(12)
-                .style(text::secondary),
-            ]
-            .spacing(6)
-            .into(),
+            (None, None) if self.sniffing => ui::empty(
+                "Reading the first group…",
+                "Only the preamble, the headers and the first block are read.",
+            ),
+            (None, None) => ui::empty(
+                "No file chosen.",
+                "Pick a CSV on the left: only its preamble, headers and first group are \
+                 read, so a multi-gigabyte file previews instantly.",
+            ),
         };
 
-        pane = pane.push(horizontal_rule(1));
+        pane = pane.push(ui::rule());
         pane = pane.push(scrollable(body).height(Length::Fill));
         pane.into()
     }
 
     fn action_row(&self) -> Element<'_, Message> {
         let ready = self.preview.is_some() && self.preview_error.is_none() && self.job.is_none();
-        let mut import = button(text("Import").size(13))
+        let mut import = button(text("Import").size(typography::BODY_SIZE))
             .padding([6, 14])
             .style(button::primary);
         if ready {
@@ -999,24 +1006,31 @@ impl State {
         let mut actions = row![import].spacing(8).align_y(Alignment::Center);
         if self.job.is_some() {
             actions = actions.push(
-                button(text("Cancel").size(13))
+                button(text("Cancel").size(typography::BODY_SIZE))
                     .padding([6, 14])
                     .style(button::danger)
                     .on_press(Message::Cancel),
             );
         }
         actions = actions.push(
-            button(text("Re-read file").size(12))
-                .padding([6, 10])
-                .style(button::text)
-                .on_press(Message::Sniff),
+            button(
+                text("Re-read file")
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::LABEL),
+            )
+            .padding([6, 10])
+            .style(button::text)
+            .on_press(Message::Sniff),
         );
         actions = actions.push(Space::with_width(Length::Fill));
+        // What the sniffer decided the file is. It sits at the far end of the
+        // action row because it is the fact the Import button acts on.
         if let Some(preview) = &self.preview {
             actions = actions.push(
                 text(preview.layout.describe())
-                    .size(11)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
             );
         }
         actions.into()
@@ -1030,17 +1044,24 @@ impl State {
         };
         column![
             bar,
-            text(format!(
-                "{} group{} · {} pulse{} · {} diagnostic{}",
-                progress.groups,
-                plural(u64::from(progress.groups)),
-                progress.pulses,
-                plural(progress.pulses),
-                progress.diagnostics,
-                plural(progress.diagnostics as u64),
-            ))
-            .size(11)
-            .style(text::secondary),
+            // Three running counts, and the third is the one that decides
+            // whether the import is worth keeping, so it says so in colour
+            // rather than waiting for the reader to notice it is not zero.
+            row![
+                ui::fact("Groups", progress.groups),
+                ui::fact("Pulses", progress.pulses),
+                ui::spec(
+                    "Diagnostics",
+                    progress.diagnostics,
+                    if progress.diagnostics == 0 {
+                        text::base
+                    } else {
+                        ui::warned
+                    },
+                ),
+            ]
+            .spacing(20)
+            .wrap(),
         ]
         .spacing(4)
         .into()
@@ -1056,14 +1077,14 @@ impl State {
                 plural(u64::from(preview.declared_count)),
                 preview.first_group_rows,
             ))
-            .size(14),
+            .size(typography::BODY_SIZE),
         );
 
         if !preview.layout.preamble.is_empty() {
             body = body.push(
                 text(format!("Preamble: {}", preview.layout.preamble.join(" ⏎ ")))
-                    .size(11)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .style(ui::dim),
             );
         }
 
@@ -1084,12 +1105,12 @@ impl State {
                 hint.label.clone()
             };
             head = head.push(
-                container(text(label).size(11).style(text::secondary))
+                container(text(label).size(typography::LABEL_SIZE).style(ui::dim))
                     .width(Length::Fixed(width))
                     .padding([3, 6]),
             );
         }
-        body = body.push(head).push(horizontal_rule(1));
+        body = body.push(head).push(ui::rule());
 
         for cells in &preview.rows {
             let mut line = row![];
@@ -1100,7 +1121,7 @@ impl State {
                     cell.as_str()
                 };
                 line = line.push(
-                    container(text(shown).size(12))
+                    container(text(shown).size(typography::BODY_SIZE))
                         .width(Length::Fixed(width))
                         .padding([3, 6]),
                 );
@@ -1108,11 +1129,10 @@ impl State {
             body = body.push(line);
         }
         if preview.rows.is_empty() {
-            body = body.push(
-                text("The first group declares no rows.")
-                    .size(12)
-                    .style(text::secondary),
-            );
+            body = body.push(ui::empty(
+                "The first group declares no rows.",
+                "Its header was read, so the framing is right; the block itself is empty.",
+            ));
         }
 
         body = body.push(Space::with_height(Length::Fixed(14.0)));
@@ -1138,15 +1158,22 @@ impl State {
         };
 
         if total == 0 {
-            return text("No diagnostics.")
-                .size(12)
-                .style(text::secondary)
+            return row![ui::caption("Diagnostics"), ui::dim_reading("none")]
+                .spacing(8)
+                .align_y(Alignment::Center)
                 .into();
         }
 
-        let mut list =
-            column![text(format!("{total} diagnostic{}", plural(total as u64))).size(14)]
-                .spacing(2);
+        let mut list = column![row![
+            ui::caption("Diagnostics"),
+            text(total.to_string())
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::warned),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)]
+        .spacing(3);
         for diagnostic in items.iter().take(DIAGNOSTIC_ROWS) {
             list = list.push(diagnostic_row(diagnostic));
         }
@@ -1156,8 +1183,8 @@ impl State {
                     "…and {} more",
                     total.saturating_sub(items.len().min(DIAGNOSTIC_ROWS))
                 ))
-                .size(11)
-                .style(text::secondary),
+                .size(typography::LABEL_SIZE)
+                .style(ui::dim),
             );
         }
         list.into()
@@ -1169,17 +1196,25 @@ fn diagnostic_row(diagnostic: &Diagnostic) -> Element<'_, Message> {
         Some(column) => format!("line {}, col {}", diagnostic.line, column + 1),
         None => format!("line {}", diagnostic.line),
     };
+    // Where it happened is a coordinate in the file, so it is monospaced and
+    // in a fixed column: a list of them can be read straight down.
     row![
-        container(text(position).size(11).style(text::secondary)).width(Length::Fixed(120.0)),
+        container(
+            text(position)
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim),
+        )
+        .width(Length::Fixed(120.0)),
         text(&diagnostic.message)
-            .size(12)
+            .size(typography::BODY_SIZE)
             .style(if diagnostic.is_error() {
                 text::danger
             } else {
-                text::base
+                ui::warned
             }),
     ]
-    .spacing(6)
+    .spacing(8)
     .into()
 }
 
@@ -1201,22 +1236,27 @@ fn sample_of(hint: &ColumnHint) -> String {
     }
 }
 
+/// A group of settings, announced by a caption over a hairline.
+///
+/// The air above the caption is what makes it a section — more space above
+/// than below, so the rule and everything under it belong to the heading
+/// rather than floating between two groups.
 fn section(title: &str) -> Element<'_, Message> {
     column![
-        Space::with_height(Length::Fixed(4.0)),
-        text(title).size(12).style(text::secondary),
-        horizontal_rule(1),
+        Space::with_height(Length::Fixed(8.0)),
+        ui::caption(title),
+        ui::rule(),
     ]
-    .spacing(3)
+    .spacing(4)
     .into()
 }
 
 fn labelled<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
     row![
-        container(text(label).size(12)).width(Length::Fixed(130.0)),
+        container(ui::caption(label)).width(Length::Fixed(130.0)),
         control,
     ]
-    .spacing(6)
+    .spacing(8)
     .align_y(Alignment::Center)
     .into()
 }

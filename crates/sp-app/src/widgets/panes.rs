@@ -9,6 +9,8 @@
 //! emphasises it, so scrubbing the scope moves the highlight in the table at
 //! the same instant (§10.3).
 
+use crate::typography;
+use crate::ui;
 use iced::advanced::text::Shaping;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Text};
@@ -98,17 +100,21 @@ pub fn view<'a, M: Clone + 'a>(
         ViewHint::Tree => tree(pane),
     };
 
-    let mut heading = row![text(pane.title).size(13)]
-        .spacing(6)
+    // The port is what the stage called this artifact, so it is the pane's
+    // name and it is set as a caption over the pane rather than as a line of
+    // body text competing with the rows under it.
+    let mut heading = row![ui::caption(pane.title)]
+        .spacing(8)
         .align_y(Alignment::Center);
     if let Some(summary) = pane.summary {
-        heading = heading.push(text(summary).size(11).style(text::secondary));
+        heading = heading.push(text(summary).size(typography::LABEL_SIZE).style(ui::dim));
     }
     heading = heading.push(Space::with_width(Length::Fill));
     heading = heading.push(
-        text(format!("{} row(s)", pane.data.rows()))
-            .size(11)
-            .style(text::secondary),
+        text(format!("{} rows", pane.data.rows()))
+            .size(typography::LABEL_SIZE)
+            .font(typography::READOUT)
+            .style(ui::dim),
     );
 
     let mut content = column![heading].spacing(6);
@@ -117,18 +123,15 @@ pub fn view<'a, M: Clone + 'a>(
     }
     content = content.push(body);
 
-    container(content)
-        .padding(8)
-        .width(Length::Fill)
-        .style(|theme: &Theme| {
-            let palette = theme.extended_palette();
-            container::Style {
-                background: Some(palette.background.weak.color.into()),
-                border: iced::border::rounded(4),
-                ..container::Style::default()
-            }
-        })
-        .into()
+    // A pane already sits inside a rail on its own surface, so painting it
+    // as a second surface would be a card inside a card. A hairline above it
+    // is enough to say where one artifact ends and the next begins.
+    column![
+        ui::rule(),
+        container(content).padding([8, 2]).width(Length::Fill)
+    ]
+    .spacing(6)
+    .into()
 }
 
 /// The rows in display order.
@@ -217,8 +220,11 @@ fn draw_table<'a, M: Clone + 'a>(
             }
             _ => "",
         };
+        // The column the table is sorted on is the one piece of state the
+        // header carries, so it is the one heading in the full text colour.
+        let sorted = matches!(pane.sort, Some(sort) if sort.field == *field);
         header_row = header_row.push(
-            button(text(format!("{header}{marker}")).size(11))
+            button(ui::column_label(format!("{header}{marker}"), sorted))
                 .padding([2.0, 4.0])
                 .style(button::text)
                 .width(Length::Fill)
@@ -235,16 +241,23 @@ fn draw_table<'a, M: Clone + 'a>(
                 .data
                 .column(field)
                 .map_or_else(String::new, |column| column.display_at(index, *precision));
-            cells = cells.push(text(value).size(11).width(Length::Fill));
+            // Every cell of an artifact table is machine output, so the whole
+            // grid is monospaced and a column can be scanned rather than read.
+            cells = cells.push(
+                text(value)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .width(Length::Fill),
+            );
         }
+        // The row under the playhead was painted in the accent at full
+        // strength, which is louder than the trace the playhead is on. It
+        // takes the same band a selection takes everywhere else.
         body = body.push(container(cells).padding([2, 4]).width(Length::Fill).style(
-            move |theme: &Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    background: current.then(|| palette.primary.weak.color.into()),
-                    border: iced::border::rounded(2),
-                    ..container::Style::default()
-                }
+            move |theme: &Theme| container::Style {
+                background: current.then(|| crate::theme::tokens(theme).selection.into()),
+                border: iced::border::rounded(2),
+                ..container::Style::default()
             },
         ));
     }
@@ -264,10 +277,12 @@ fn scalars<'a, M: 'a>(pane: &Pane<'a>) -> Element<'a, M> {
         };
         list = list.push(
             row![
-                container(text(label).size(11).style(text::secondary)).width(Length::Fixed(160.0)),
-                text(column.display_at(0, Some(6))).size(12),
+                container(ui::caption(label)).width(Length::Fixed(160.0)),
+                text(column.display_at(0, Some(6)))
+                    .size(typography::BODY_SIZE)
+                    .font(typography::READOUT),
             ]
-            .spacing(6),
+            .spacing(8),
         );
     }
     if pane.data.is_empty() {
@@ -291,7 +306,8 @@ fn tree<'a, M: 'a>(pane: &Pane<'a>) -> Element<'a, M> {
                 column.len(),
                 describe_kind(spec.kind)
             ))
-            .size(11),
+            .size(typography::LABEL_SIZE)
+            .font(typography::READOUT),
         );
     }
     scrollable(list).height(Length::Fill).into()
@@ -301,7 +317,7 @@ fn diff_summary<'a, M: 'a>(diff: &[FieldDiff]) -> Element<'a, M> {
     let changed: Vec<&FieldDiff> = diff.iter().filter(|d| !d.is_equal()).collect();
     if changed.is_empty() {
         return text("Identical to the pinned stage.")
-            .size(11)
+            .size(typography::LABEL_SIZE)
             .style(text::success)
             .into();
     }
@@ -312,10 +328,14 @@ fn diff_summary<'a, M: 'a>(diff: &[FieldDiff]) -> Element<'a, M> {
             .map_or_else(String::new, |row| format!(", first at row {row}"));
         list = list.push(
             text(format!(
-                "{}: {} row(s) differ, max |Δ| {:.6}{first}",
-                field.field, field.mismatches, field.max_abs_error
+                "{}: {} row{} differ, max |Δ| {:.6}{first}",
+                field.field,
+                field.mismatches,
+                if field.mismatches == 1 { "" } else { "s" },
+                field.max_abs_error
             ))
-            .size(11)
+            .size(typography::LABEL_SIZE)
+            .font(typography::READOUT)
             .style(text::danger),
         );
     }
@@ -323,7 +343,7 @@ fn diff_summary<'a, M: 'a>(diff: &[FieldDiff]) -> Element<'a, M> {
 }
 
 fn empty<'a, M: 'a>(message: &'a str) -> Element<'a, M> {
-    container(text(message).size(11).style(text::secondary))
+    container(text(message).size(typography::LABEL_SIZE).style(ui::dim))
         .padding(6)
         .width(Length::Fill)
         .into()

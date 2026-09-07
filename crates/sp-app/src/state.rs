@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, horizontal_rule, row, scrollable, text, Space};
+use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
 use sp_store::Store;
 
@@ -12,6 +12,8 @@ use crate::screens::{
     Screen, Section,
 };
 use crate::settings::Settings;
+use crate::typography;
+use crate::ui;
 
 /// Everything the UI reads.
 ///
@@ -438,9 +440,9 @@ impl App {
 
         let content = column![
             self.header(),
-            horizontal_rule(1),
+            ui::rule(),
             container(body).height(Length::Fill),
-            horizontal_rule(1),
+            ui::rule(),
             self.status_bar(),
         ];
 
@@ -452,58 +454,80 @@ impl App {
     fn nav_rail(&self) -> Element<'_, Message> {
         // The scrollable's content must size to its contents, so the rail's
         // fixed brand and version rows sit outside it.
+        // A section is a caption over the screens in it, with air above it
+        // rather than a rule between: the group reads as a group because of
+        // the space, and the rail stays a list rather than becoming five boxes.
         let mut list = column![].width(Length::Fill);
-        for section in Section::ALL {
-            list = list.push(
-                container(text(section.label()).size(11).style(text::secondary)).padding([10, 12]),
-            );
+        for (ordinal, section) in Section::ALL.into_iter().enumerate() {
+            list = list.push(Space::with_height(Length::Fixed(if ordinal == 0 {
+                4.0
+            } else {
+                16.0
+            })));
+            list = list.push(container(ui::caption(section.label())).padding([0, 14]));
+            list = list.push(Space::with_height(Length::Fixed(4.0)));
             for screen in section.screens() {
                 list = list.push(self.nav_button(screen));
             }
         }
 
+        // The one place the expanded face appears in the chrome. It is a
+        // wordmark rather than a heading — it names the instrument, it does
+        // not label the pane under it.
         let rail = column![
-            container(text("SignalPlayback").size(16))
-                .padding([14, 12])
-                .width(Length::Fill),
+            container(
+                text("SignalPlayback")
+                    .size(typography::HEADING_SIZE)
+                    .font(typography::TITLE),
+            )
+            .padding([16, 14])
+            .width(Length::Fill),
             scrollable(list).height(Length::Fill),
+            ui::rule(),
             container(
                 text(format!("v{}", env!("CARGO_PKG_VERSION")))
-                    .size(11)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
             )
-            .padding([10, 12]),
+            .padding([8, 14]),
         ]
         .width(Length::Fixed(190.0))
         .height(Length::Fill);
 
-        container(rail)
-            .height(Length::Fill)
-            .style(|theme: &Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    background: Some(palette.background.weak.color.into()),
-                    ..container::Style::default()
-                }
-            })
-            .into()
+        container(rail).height(Length::Fill).style(ui::panel).into()
     }
 
     fn nav_button(&self, screen: Screen) -> Element<'_, Message> {
         let active = self.screen == screen;
-        let label = match screen.shortcut() {
-            Some(digit) => format!("{}   ⌃{digit}", screen.label()),
-            None => screen.label().to_owned(),
-        };
 
-        button(text(label).size(14))
+        // The name and the key that reaches it are two different things and
+        // were being run together into one padded string. The name is read;
+        // the shortcut is a key on a keyboard, so it is set as one and pushed
+        // to the far edge where the eye can ignore it until it is wanted.
+        let label = row![
+            text(screen.label())
+                .size(typography::BODY_SIZE)
+                .font(if active {
+                    typography::BODY_STRONG
+                } else {
+                    typography::BODY
+                }),
+            Space::with_width(Length::Fill),
+        ]
+        .push_maybe(screen.shortcut().map(|digit| {
+            text(format!("⌃{digit}"))
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim)
+        }))
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        button(label)
             .width(Length::Fill)
-            .padding([7.0, 14.0])
-            .style(if active {
-                button::primary
-            } else {
-                button::text
-            })
+            .padding([6.0, 14.0])
+            .style(ui::selectable(active))
             .on_press(Message::Nav(screen))
             .into()
     }
@@ -511,18 +535,29 @@ impl App {
     fn header(&self) -> Element<'_, Message> {
         let theme_label = format!("{} theme", self.settings.theme.toggled().label());
 
+        // The screen name is the page heading, so it is set as one rather
+        // than as a slightly larger line of body text. Switching the theme is
+        // a preference and not what this screen is for, so it is a quiet
+        // command at the far edge.
         container(
             row![
-                text(self.screen.label()).size(15),
+                text(self.screen.label())
+                    .size(typography::TITLE_SIZE)
+                    .font(typography::TITLE),
                 Space::with_width(Length::Fill),
-                button(text(theme_label).size(12))
-                    .padding([5.0, 10.0])
-                    .style(button::secondary)
-                    .on_press(Message::ToggleTheme),
+                button(
+                    text(theme_label)
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::LABEL)
+                        .style(ui::dim),
+                )
+                .padding([5.0, 10.0])
+                .style(button::text)
+                .on_press(Message::ToggleTheme),
             ]
             .align_y(Alignment::Center),
         )
-        .padding([10, 16])
+        .padding([12, 20])
         .width(Length::Fill)
         .into()
     }
@@ -530,33 +565,53 @@ impl App {
     fn status_bar(&self) -> Element<'_, Message> {
         let library: Element<'_, Message> = match (&self.store, &self.store_error) {
             (Some(store), _) => {
+                // What the library holds, as counts rather than as a sentence
+                // with six plural rules in it. The path is what is open; the
+                // counts are what is in it.
                 let counts = self.library.summary().map_or_else(String::new, |s| {
                     format!(
-                        " · {} dataset{} · {} train{} · {} group{} · {} signal{} · \
-                         {} pulse field{} · {}",
+                        "{}d {}t {}g {}s {}f  {}",
                         s.datasets,
-                        plural(s.datasets),
                         s.trains,
-                        plural(s.trains),
                         s.groups,
-                        plural(s.groups),
                         s.signals,
-                        plural(s.signals),
                         s.pulse_fields,
-                        plural(s.pulse_fields),
                         fmt_bytes(s.blob_bytes),
                     )
                 });
-                text(format!("Library: {}{counts}", store.path().display()))
-                    .size(11)
-                    .style(text::secondary)
-                    .into()
+                row![
+                    ui::caption("Library"),
+                    text(store.path().display().to_string())
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::READOUT),
+                    text(counts)
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::READOUT)
+                        .style(ui::dim),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into()
             }
-            (None, Some(error)) => text(format!("Library not open: {error}"))
-                .size(11)
-                .style(text::danger)
-                .into(),
-            (None, None) => text("Library: none").size(11).style(text::secondary).into(),
+            (None, Some(error)) => row![
+                ui::caption("Library"),
+                text(format!("not open — {error}"))
+                    .size(typography::LABEL_SIZE)
+                    .style(text::danger),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
+            (None, None) => row![
+                ui::caption("Library"),
+                text("none")
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
         };
 
         let logs = self
@@ -567,14 +622,17 @@ impl App {
         container(
             row![
                 library,
-                Space::with_width(Length::Fixed(24.0)),
-                text(format!("Logs: {logs}"))
-                    .size(11)
-                    .style(text::secondary),
+                Space::with_width(Length::Fill),
+                ui::caption("Logs"),
+                text(logs)
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
             ]
+            .spacing(8)
             .align_y(Alignment::Center),
         )
-        .padding([6, 16])
+        .padding([6, 20])
         .width(Length::Fill)
         .into()
     }
@@ -628,14 +686,6 @@ fn open_library(path: Option<PathBuf>) -> (Option<Store>, Option<String>) {
     }
 }
 
-fn plural(n: u64) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,14 +722,17 @@ mod tests {
         assert_eq!(app.screen, Screen::Library);
     }
 
+    /// The application no longer opens Iced's built-in themes, so the two it
+    /// does open are told apart by what they are rather than by which
+    /// variant they are (`src/theme.rs`).
     #[test]
     fn theme_toggles_both_ways() {
         let mut app = app();
-        assert!(matches!(app.theme(), Theme::Dark));
+        assert!(app.theme().extended_palette().is_dark);
         let _ = app.update(Message::ToggleTheme);
-        assert!(matches!(app.theme(), Theme::Light));
+        assert!(!app.theme().extended_palette().is_dark);
         let _ = app.update(Message::ToggleTheme);
-        assert!(matches!(app.theme(), Theme::Dark));
+        assert!(app.theme().extended_palette().is_dark);
     }
 
     #[test]
@@ -694,7 +747,7 @@ mod tests {
         drop(app);
         let reopened = app_in(dir.path());
         assert_eq!(reopened.settings.theme, ThemeChoice::Light);
-        assert!(matches!(reopened.theme(), Theme::Light));
+        assert!(!reopened.theme().extended_palette().is_dark);
     }
 
     #[test]
