@@ -164,6 +164,114 @@ mod tests {
         }
     }
 
+    /// No character the application can put on screen may be one the faces
+    /// cannot draw.
+    ///
+    /// A missing glyph does not fall back to anything on a machine with no
+    /// font holding it — it renders as a hollow box, which is what the
+    /// disclosure arrows, sort markers, transport controls and the sidebar's
+    /// shortcut hints were doing before [`crate::widgets::glyph`] replaced
+    /// them with drawn shapes. Archivo and Martian Mono are text faces: they
+    /// carry the dash, the ellipsis, the interpunct, the arrows and the
+    /// micro sign, and nothing from the geometric-shapes block at all.
+    ///
+    /// Every non-ASCII character in the crate's own source is checked, prose
+    /// in comments included, because a string moves out of a comment and into
+    /// a label often enough that drawing the line there would not hold.
+    #[test]
+    fn every_character_the_sources_carry_can_be_drawn() {
+        let coverage: Vec<(String, std::collections::BTreeSet<u32>)> = FACES
+            .iter()
+            .map(|bytes| (name_and_weight(bytes).0, characters(bytes)))
+            .collect();
+
+        for file in sources(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")) {
+            let text = std::fs::read_to_string(&file).expect("a source file");
+            for character in text.chars().filter(|c| !c.is_ascii()) {
+                for (family, covered) in &coverage {
+                    assert!(
+                        covered.contains(&(character as u32)),
+                        "{} carries U+{:04X} ({character}), which {family} cannot draw: a hollow box",
+                        file.display(),
+                        character as u32,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every `.rs` file under a directory.
+    fn sources(root: std::path::PathBuf) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![root];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir)
+                .expect("a source directory")
+                .flatten()
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// The code points a font's `cmap` maps, from the Unicode subtable Iced's
+    /// text shaper reads: format 4 for the basic plane, format 12 beyond it.
+    fn characters(bytes: &[u8]) -> std::collections::BTreeSet<u32> {
+        let be16 = |at: usize| u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize;
+        let be32 = |at: usize| {
+            u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize
+        };
+
+        let mut cmap = None;
+        for i in 0..be16(4) {
+            let entry = 12 + 16 * i;
+            if &bytes[entry..entry + 4] == b"cmap" {
+                cmap = Some(be32(entry + 8));
+            }
+        }
+        let cmap = cmap.expect("a font with no cmap table");
+
+        let mut subtable = None;
+        for i in 0..be16(cmap + 2) {
+            let record = cmap + 4 + 8 * i;
+            let (platform, encoding) = (be16(record), be16(record + 2));
+            if matches!((platform, encoding), (3, 1) | (3, 10) | (0, 3) | (0, 4)) {
+                subtable = Some(cmap + be32(record + 4));
+            }
+        }
+        let subtable = subtable.expect("a font with no Unicode cmap subtable");
+
+        let mut mapped = std::collections::BTreeSet::new();
+        match be16(subtable) {
+            4 => {
+                let segments = be16(subtable + 6) / 2;
+                let ends = subtable + 14;
+                let starts = ends + segments * 2 + 2;
+                for segment in 0..segments {
+                    let start = be16(starts + segment * 2) as u32;
+                    let end = be16(ends + segment * 2) as u32;
+                    // The last segment ends at U+FFFF by specification and
+                    // maps nothing; it is not coverage.
+                    mapped.extend((start..=end).take_while(|c| *c < 0xFFFF));
+                }
+            }
+            12 => {
+                for group in 0..be32(subtable + 12) {
+                    let record = subtable + 16 + 12 * group;
+                    mapped.extend(be32(record) as u32..=be32(record + 4) as u32);
+                }
+            }
+            other => panic!("cmap subtable format {other} is not one this test reads"),
+        }
+        mapped
+    }
+
     fn weight_class(weight: Weight) -> u16 {
         match weight {
             Weight::Normal => 400,

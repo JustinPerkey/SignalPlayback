@@ -33,6 +33,7 @@ use crate::typography;
 use crate::ui::{
     cell, column_label, dim, heading, heading_aligned, rule, selectable, spec, value, warned,
 };
+use crate::widgets::glyph;
 
 /// Pulse rows shown in the detail table before the user needs the Inspector.
 const PULSE_PREVIEW_ROWS: u64 = 200;
@@ -603,9 +604,7 @@ impl State {
                         row![
                             button(
                                 row![
-                                    text(if collapsed { "▸" } else { "▾" })
-                                        .size(typography::LABEL_SIZE)
-                                        .style(dim),
+                                    glyph::disclosure(collapsed),
                                     text(dataset.name.to_uppercase())
                                         .size(typography::LABEL_SIZE)
                                         .font(typography::LABEL),
@@ -661,9 +660,7 @@ impl State {
                             button(
                                 row![
                                     Space::with_width(Length::Fixed(10.0)),
-                                    text(if folded { "▸" } else { "▾" })
-                                        .size(typography::LABEL_SIZE)
-                                        .style(dim),
+                                    glyph::disclosure(folded),
                                     text(train.display_name()).size(typography::BODY_SIZE),
                                     Space::with_width(Length::Fill),
                                     // The counts are the train's, across every
@@ -992,17 +989,22 @@ fn signal_table(signals: &[Signal], sort: Option<(usize, bool)>) -> Element<'_, 
     for (index, (label, width)) in labels.iter().zip(COLUMN_WIDTHS).enumerate() {
         // The heading is the control: clicking it sorts, clicking it again
         // turns the order over.
-        let marker = match sort {
-            Some((column, true)) if column == index => " ▲",
-            Some((column, false)) if column == index => " ▼",
-            _ => "",
-        };
+        let sorted = matches!(sort, Some((column, _)) if column == index);
+        // The marker is a drawn triangle rather than a character appended to
+        // the label: the faces this application ships carry no triangle, and
+        // a heading that grows by two characters when it is sorted shifts the
+        // column under it.
         head = head.push(
             button(
-                container(column_label(
-                    format!("{label}{marker}"),
-                    matches!(sort, Some((column, _)) if column == index),
-                ))
+                container(
+                    row![column_label(label.to_string(), sorted)]
+                        .push_maybe(
+                            sort.filter(|(column, _)| *column == index)
+                                .map(|(_, ascending)| glyph::sort_marker(ascending)),
+                        )
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                )
                 .width(Length::Fill)
                 .align_x(if NUMERIC_COLUMNS.contains(&index) {
                     Alignment::End

@@ -1082,7 +1082,7 @@ impl State {
 
         if !preview.layout.preamble.is_empty() {
             body = body.push(
-                text(format!("Preamble: {}", preview.layout.preamble.join(" ⏎ ")))
+                text(format!("Preamble: {}", preview.layout.preamble.join(" ¶ ")))
                     .size(typography::LABEL_SIZE)
                     .style(ui::dim),
             );

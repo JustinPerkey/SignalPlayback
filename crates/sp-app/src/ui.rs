@@ -15,10 +15,11 @@
 //! Runs screen is the same caption as one on Generate and neither should have
 //! to be written twice.
 
-use iced::widget::{button, column, container, horizontal_rule, rule, text};
+use iced::widget::{button, column, container, horizontal_rule, row, rule, text};
 use iced::{Alignment, Element, Length, Theme};
 
 use crate::typography;
+use crate::widgets::glyph;
 
 // ---------------------------------------------------------------- text styles
 
@@ -244,5 +245,43 @@ pub fn empty<'a, Message: 'a>(
     ]
     .spacing(4)
     .max_width(460)
+    .into()
+}
+
+// ----------------------------------------------------------------- transport
+
+/// The face of the play/pause button.
+///
+/// The mark and the word together, not one or the other: the triangle is what
+/// the hand goes for after the first hour and the word is what makes the
+/// control legible in the first minute. The pause mark is drawn on the same
+/// width as the play mark, so the label beside it does not step sideways as
+/// the transport is toggled.
+pub fn transport_label<'a, Message: 'a>(playing: bool) -> Element<'a, Message> {
+    row![
+        glyph::mark(
+            if playing {
+                glyph::Mark::Pause
+            } else {
+                glyph::Mark::Play
+            },
+            glyph::MEDIUM,
+            glyph::Ink::OnPrimary,
+        ),
+        text(if playing { "Pause" } else { "Play" }).size(typography::BODY_SIZE),
+    ]
+    .spacing(7)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The face of the stop button: the same pairing, one step quieter.
+pub fn transport_stop<'a, Message: 'a>() -> Element<'a, Message> {
+    row![
+        glyph::mark(glyph::Mark::Stop, glyph::MEDIUM, glyph::Ink::OnSecondary),
+        text("Stop").size(typography::BODY_SIZE),
+    ]
+    .spacing(7)
+    .align_y(Alignment::Center)
     .into()
 }

@@ -34,6 +34,7 @@ use crate::jobs;
 use crate::screens::library::{fmt_num, fmt_rate};
 use crate::typography;
 use crate::ui;
+use crate::widgets::glyph;
 use crate::widgets::histogram::HistogramView;
 
 /// Rows of the value table shown at once. The table is a window on the
@@ -777,16 +778,22 @@ impl State {
             // Paging is movement through the same table, not an action on it,
             // so the arrows are quiet and the index box beside them is where
             // the reader actually goes when they know the row they want.
-            button(text("◀").size(typography::BODY_SIZE))
-                .padding([3, 10])
-                .style(button::text)
-                .on_press_maybe((self.page_start > 0).then_some(Message::Page(-1))),
-            button(text("▶").size(typography::BODY_SIZE))
-                .padding([3, 10])
-                .style(button::text)
-                .on_press_maybe(
-                    (self.page_start < self.last_page_start()).then_some(Message::Page(1))
-                ),
+            button(glyph::mark(
+                glyph::Mark::Left,
+                glyph::MEDIUM,
+                glyph::Ink::Text
+            ))
+            .padding([3, 10])
+            .style(button::text)
+            .on_press_maybe((self.page_start > 0).then_some(Message::Page(-1))),
+            button(glyph::mark(
+                glyph::Mark::Right,
+                glyph::MEDIUM,
+                glyph::Ink::Text
+            ))
+            .padding([3, 10])
+            .style(button::text)
+            .on_press_maybe((self.page_start < self.last_page_start()).then_some(Message::Page(1))),
             text_input("index", &self.jump_draft)
                 .on_input(Message::JumpChanged)
                 .on_submit(Message::Jump)
