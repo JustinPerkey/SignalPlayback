@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, pick_list, progress_bar, row, scrollable,
-    text, text_input, Space,
+    button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
+    text_input, Space,
 };
 use iced::{mouse, Alignment, Element, Length, Point, Rectangle, Subscription, Task, Theme};
 use serde_json::Value;
@@ -37,6 +37,8 @@ use sp_gen::{
 use sp_store::Store;
 
 use crate::jobs;
+use crate::typography;
+use crate::ui;
 
 /// Columns the preview strip reduces the rendered window to. One per two
 /// pixels at a typical pane width, which is as fine as a min/max trace needs.
@@ -1216,13 +1218,7 @@ impl State {
         let left = container(scrollable(self.tree_pane()).height(Length::Fill))
             .width(Length::Fixed(330.0))
             .height(Length::Fill)
-            .style(|theme: &Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    background: Some(palette.background.weak.color.scale_alpha(0.5).into()),
-                    ..container::Style::default()
-                }
-            });
+            .style(ui::panel);
 
         row![left, self.detail_pane()].height(Length::Fill).into()
     }
@@ -1237,32 +1233,30 @@ impl State {
             presets = presets.push(
                 button(
                     column![
-                        text(&preset.name).size(13),
-                        text(&preset.description).size(10).style(text::secondary),
+                        text(&preset.name)
+                            .size(typography::BODY_SIZE)
+                            .font(if active {
+                                typography::BODY_STRONG
+                            } else {
+                                typography::BODY
+                            }),
+                        text(&preset.description)
+                            .size(typography::LABEL_SIZE)
+                            .style(ui::dim),
                     ]
                     .spacing(1),
                 )
                 .width(Length::Fill)
                 .padding([5, 8])
-                .style(if active {
-                    button::primary
-                } else {
-                    button::text
-                })
+                .style(ui::selectable(active))
                 .on_press(Message::PresetPicked(index)),
             );
         }
         pane = pane.push(presets);
         pane = pane.push(
             row![
-                button(text("Open…").size(12))
-                    .padding([5, 9])
-                    .style(button::secondary)
-                    .on_press(Message::BrowsePreset),
-                button(text("Save as…").size(12))
-                    .padding([5, 9])
-                    .style(button::secondary)
-                    .on_press(Message::SavePreset),
+                command("Open…", Some(Message::BrowsePreset)),
+                command("Save as…", Some(Message::SavePreset)),
             ]
             .spacing(6),
         );
@@ -1270,14 +1264,11 @@ impl State {
         if self.mode == Mode::PulseTrain {
             // The node tree and the presets are waveform machinery; a train is
             // described entirely by its parameter form.
-            pane = pane.push(
-                text(
-                    "A pulse train has no node tree: its intervals and fields are the whole \
-                     description. Presets above load a waveform and switch back to that mode.",
-                )
-                .size(11)
-                .style(text::secondary),
-            );
+            pane = pane.push(ui::empty(
+                "A pulse train has no node tree.",
+                "Its intervals and its fields are the whole description, and they are on \
+                 the right. A preset above loads a waveform and switches back to that mode.",
+            ));
             return pane.into();
         }
 
@@ -1295,7 +1286,12 @@ impl State {
                 node_ref.kind.label(),
                 node_ref.summary
             );
-            let mut label = text(label).size(12);
+            // The tree is indented with spaces, so the whole outline has to be
+            // set monospaced or the depths do not line up. That rules out
+            // saying "selected" with weight here; the band says it instead.
+            let mut label = text(label)
+                .size(typography::BODY_SIZE)
+                .font(typography::READOUT);
             if broken {
                 label = label.style(text::danger);
             }
@@ -1308,18 +1304,15 @@ impl State {
                             "    ".repeat(node_ref.depth),
                             node_ref.slot
                         ))
-                        .size(10)
-                        .style(text::secondary),
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::READOUT)
+                        .style(ui::dim),
                     ]
                     .spacing(1),
                 )
                 .width(Length::Fill)
                 .padding([4, 6])
-                .style(if selected {
-                    button::primary
-                } else {
-                    button::text
-                })
+                .style(ui::selectable(selected))
                 .on_press(Message::SelectNode(node_ref.pointer.clone())),
             );
         }
@@ -1334,29 +1327,30 @@ impl State {
         let can_add = kind.is_some_and(NodeKind::has_variable_arity);
         let removable = tree::parent_pointer(&selected).is_some();
 
-        let mut add = button(text("Add child").size(12))
-            .padding([5, 9])
-            .style(button::secondary);
-        if can_add {
-            add = add.on_press(Message::AddChild(selected.clone()));
-        }
+        // Four commands that edit the tree. None of them is the thing this
+        // screen is for — that is Generate, on the right — so none of them is
+        // filled. Remove keeps the danger colour on its text, because it is
+        // the one that destroys work.
+        let add = command(
+            "Add child",
+            can_add.then(|| Message::AddChild(selected.clone())),
+        );
+        let remove = button(
+            text("Remove")
+                .size(typography::LABEL_SIZE)
+                .font(typography::LABEL)
+                .style(text::danger),
+        )
+        .padding([4, 8])
+        .style(button::text)
+        .on_press_maybe(removable.then(|| Message::RemoveNode(selected.clone())));
+        let up = command(
+            "Up",
+            removable.then(|| Message::MoveNode(selected.clone(), -1)),
+        );
+        let down = command("Down", removable.then_some(Message::MoveNode(selected, 1)));
 
-        let mut remove = button(text("Remove").size(12))
-            .padding([5, 9])
-            .style(button::danger);
-        let mut up = button(text("Up").size(12))
-            .padding([5, 9])
-            .style(button::text);
-        let mut down = button(text("Down").size(12))
-            .padding([5, 9])
-            .style(button::text);
-        if removable {
-            remove = remove.on_press(Message::RemoveNode(selected.clone()));
-            up = up.on_press(Message::MoveNode(selected.clone(), -1));
-            down = down.on_press(Message::MoveNode(selected, 1));
-        }
-
-        row![add, remove, up, down].spacing(6).into()
+        row![add, remove, up, down].spacing(4).into()
     }
 
     fn detail_pane(&self) -> Element<'_, Message> {
@@ -1364,10 +1358,10 @@ impl State {
 
         pane = pane.push(self.action_row());
         if let Some(error) = &self.error {
-            pane = pane.push(text(error).size(13).style(text::danger));
+            pane = pane.push(text(error).size(typography::BODY_SIZE).style(text::danger));
         }
         if let Some(notice) = &self.notice {
-            pane = pane.push(text(notice).size(12).style(text::secondary));
+            pane = pane.push(text(notice).size(typography::BODY_SIZE).style(ui::dim));
         }
         if self.job.is_some() {
             pane = pane.push(self.progress_row());
@@ -1394,7 +1388,7 @@ impl State {
             }
         };
 
-        pane = pane.push(horizontal_rule(1));
+        pane = pane.push(ui::rule());
         pane = pane.push(scrollable(body).height(Length::Fill));
         pane.into()
     }
@@ -1412,7 +1406,7 @@ impl State {
             },
         };
 
-        let mut generate = button(text(label).size(13))
+        let mut generate = button(text(label).size(typography::BODY_SIZE))
             .padding([6, 14])
             .style(button::primary);
         if ready {
@@ -1422,7 +1416,7 @@ impl State {
         let mut actions = row![generate].spacing(8).align_y(Alignment::Center);
         if self.job.is_some() {
             actions = actions.push(
-                button(text("Cancel").size(13))
+                button(text("Cancel").size(typography::BODY_SIZE))
                     .padding([6, 14])
                     .style(button::danger)
                     .on_press(Message::Cancel),
@@ -1444,7 +1438,14 @@ impl State {
                 format_number(self.train.pri.mean_s()),
             ),
         };
-        actions = actions.push(text(extent).size(11).style(text::secondary));
+        // What pressing Generate will actually produce, in the units it will
+        // be produced in. It sits at the far end of the row the button is on.
+        actions = actions.push(
+            text(extent)
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim),
+        );
         actions.into()
     }
 
@@ -1455,20 +1456,22 @@ impl State {
             None => Space::with_height(Length::Fixed(6.0)).into(),
         };
         let (items, values) = match self.mode {
-            Mode::Waveform => ("signal", "samples"),
-            Mode::PulseTrain => ("group", "pulses"),
+            Mode::Waveform => ("Signals", "Samples"),
+            Mode::PulseTrain => ("Groups", "Pulses"),
         };
         column![
             bar,
-            text(format!(
-                "{} of {} {items}(s) · {} of {} {values}",
-                progress.items_done,
-                progress.items_total,
-                progress.values_done,
-                progress.values_total,
-            ))
-            .size(11)
-            .style(text::secondary),
+            row![
+                ui::fact(
+                    items,
+                    format!("{} / {}", progress.items_done, progress.items_total),
+                ),
+                ui::fact(
+                    values,
+                    format!("{} / {}", progress.values_done, progress.values_total),
+                ),
+            ]
+            .spacing(20),
         ]
         .spacing(4)
         .into()
@@ -1476,19 +1479,23 @@ impl State {
 
     fn preview_strip(&self) -> Element<'_, Message> {
         let caption: Element<'_, Message> = match (&self.preview, &self.preview_error) {
-            (_, Some(error)) => text(error).size(11).style(text::danger).into(),
+            (_, Some(error)) => text(error)
+                .size(typography::LABEL_SIZE)
+                .style(text::danger)
+                .into(),
             (Some(preview), None) => text(format!(
                 "{} · {} to {}",
                 preview.caption,
                 format_number(preview.min),
                 format_number(preview.max),
             ))
-            .size(11)
-            .style(text::secondary)
+            .size(typography::LABEL_SIZE)
+            .font(typography::READOUT)
+            .style(ui::dim)
             .into(),
             (None, None) => text("Rendering the preview…")
-                .size(11)
-                .style(text::secondary)
+                .size(typography::LABEL_SIZE)
+                .style(ui::dim)
                 .into(),
         };
 
@@ -1500,11 +1507,17 @@ impl State {
                 .width(Length::Fill)
                 .height(Length::Fixed(130.0)),
             )
+            // The preview is a small instrument face, so it is framed the same
+            // way the scope is: a hairline, square.
             .style(|theme: &Theme| {
                 let palette = theme.extended_palette();
                 container::Style {
-                    background: Some(palette.background.weak.color.scale_alpha(0.4).into()),
-                    border: iced::border::rounded(4),
+                    background: Some(palette.background.weak.color.into()),
+                    border: iced::Border {
+                        color: crate::theme::tokens(theme).rule,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
                     ..container::Style::default()
                 }
             }),
@@ -1525,21 +1538,21 @@ impl State {
             labelled(
                 "Generates",
                 pick_list(Mode::ALL.to_vec(), Some(self.mode), Message::ModePicked)
-                    .text_size(13)
+                    .text_size(typography::BODY_SIZE)
                     .into(),
             ),
             labelled(
                 "Dataset name",
                 text_input("From the name below", &self.dataset_name)
                     .on_input(Message::DatasetNameChanged)
-                    .size(13)
+                    .size(typography::BODY_SIZE)
                     .into(),
             ),
             labelled(
                 name_label,
                 text_input("Generated", &self.signal_name)
                     .on_input(Message::SignalNameChanged)
-                    .size(13)
+                    .size(typography::BODY_SIZE)
                     .into(),
             ),
         ]
@@ -1560,10 +1573,7 @@ impl State {
                 "Seed",
                 row![
                     self.number_input("/seed", "0"),
-                    button(text("New").size(12))
-                        .padding([5, 9])
-                        .style(button::secondary)
-                        .on_press(Message::RandomiseSeed),
+                    command("New", Some(Message::RandomiseSeed)),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center)
@@ -1576,7 +1586,7 @@ impl State {
                     Some(DTypeChoice(self.spec.dtype)),
                     Message::DTypePicked,
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .into(),
             ),
             labelled(
@@ -1586,7 +1596,7 @@ impl State {
                     Some(DomainChoice(self.spec.domain)),
                     Message::DomainPicked,
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .into(),
             ),
         ]
@@ -1601,9 +1611,11 @@ impl State {
         let Some(node) = tree::node_at(&self.spec, &pointer) else {
             return column![
                 section("Parameters"),
-                text("Select a node in the tree.")
-                    .size(12)
-                    .style(text::secondary),
+                ui::empty(
+                    "No node is selected.",
+                    "Pick one in the tree on the left. The form here is generated from what \
+                     the node stores, so it is always the node as it will be serialised.",
+                ),
             ]
             .spacing(6)
             .into();
@@ -1616,7 +1628,7 @@ impl State {
                 let pointer = pointer.clone();
                 move |kind| Message::NodeKindPicked(pointer.clone(), kind)
             })
-            .text_size(13)
+            .text_size(typography::BODY_SIZE)
             .into(),
         ));
 
@@ -1657,7 +1669,7 @@ impl State {
             Value::Bool(flag) => form.push(
                 checkbox(humanise(field), *flag)
                     .size(15)
-                    .text_size(12)
+                    .text_size(typography::BODY_SIZE)
                     .on_toggle({
                         let pointer = pointer.clone();
                         move |on| Message::FlagToggled(pointer.clone(), on)
@@ -1674,7 +1686,7 @@ impl State {
                             move |variant| Message::VariantPicked(pointer.clone(), variant)
                         },
                     )
-                    .text_size(13)
+                    .text_size(typography::BODY_SIZE)
                     .into(),
                 )),
                 None => form.push(labelled(humanise(field), self.text_input(&pointer, ""))),
@@ -1705,11 +1717,14 @@ impl State {
         let owned = pointer.to_owned();
         let input = text_input(placeholder, &self.field_text(pointer))
             .on_input(move |raw| Message::FieldEdited(owned.clone(), raw))
-            .size(13);
+            .size(typography::BODY_SIZE);
         match self.draft_errors.get(pointer) {
-            Some(error) => column![input, text(error).size(10).style(text::danger)]
-                .spacing(2)
-                .into(),
+            Some(error) => column![
+                input,
+                text(error).size(typography::LABEL_SIZE).style(text::danger),
+            ]
+            .spacing(2)
+            .into(),
             None => input.into(),
         }
     }
@@ -1731,10 +1746,7 @@ impl State {
             "Seed",
             row![
                 self.number_input("/seed", "0"),
-                button(text("New").size(12))
-                    .padding([5, 9])
-                    .style(button::secondary)
-                    .on_press(Message::RandomiseSeed),
+                command("New", Some(Message::RandomiseSeed)),
             ]
             .spacing(6)
             .align_y(Alignment::Center)
@@ -1759,18 +1771,13 @@ impl State {
         form = form.push(section("Fields"));
         form = form.push(
             text("One column per field, exactly as an imported file carries them.")
-                .size(11)
-                .style(text::secondary),
+                .size(typography::LABEL_SIZE)
+                .style(ui::dim),
         );
         for index in 0..self.train.fields.len() {
             form = form.push(self.field_block(index));
         }
-        form = form.push(
-            button(text("Add field").size(12))
-                .padding([5, 9])
-                .style(button::secondary)
-                .on_press(Message::AddField),
-        );
+        form = form.push(command("Add field", Some(Message::AddField)));
         form.into()
     }
 
@@ -1778,15 +1785,20 @@ impl State {
     fn field_block(&self, index: usize) -> Element<'_, Message> {
         let base = format!("/fields/{index}");
         let mut block = column![
-            horizontal_rule(1),
+            ui::rule(),
             row![
                 self.text_input(&format!("{base}/name"), "pulse width"),
                 container(self.text_input(&format!("{base}/unit"), "unit"))
                     .width(Length::Fixed(110.0)),
-                button(text("Remove").size(12))
-                    .padding([5, 9])
-                    .style(button::danger)
-                    .on_press(Message::RemoveField(index)),
+                button(
+                    text("Remove")
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::LABEL)
+                        .style(text::danger),
+                )
+                .padding([4, 8])
+                .style(button::text)
+                .on_press(Message::RemoveField(index)),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
@@ -1821,7 +1833,7 @@ impl State {
             pick_list(variants.to_vec(), current, move |variant| {
                 Message::VariantPicked(owned.clone(), variant)
             })
-            .text_size(13)
+            .text_size(typography::BODY_SIZE)
             .into(),
         )
     }
@@ -1846,7 +1858,7 @@ impl State {
         panel = panel.push(
             checkbox("Emit one signal per value of a parameter", self.sweep_on)
                 .size(15)
-                .text_size(12)
+                .text_size(typography::BODY_SIZE)
                 .on_toggle(Message::SweepToggled),
         );
         if !self.sweep_on {
@@ -1855,8 +1867,8 @@ impl State {
                     "A sweep becomes one group with the swept value stored as a property on \
                      every signal — the shape a pipeline wants as test input.",
                 )
-                .size(11)
-                .style(text::secondary),
+                .size(typography::LABEL_SIZE)
+                .style(ui::dim),
             );
             return panel.into();
         }
@@ -1876,7 +1888,7 @@ impl State {
         panel = panel.push(labelled(
             "Parameter",
             pick_list(targets, selected, Message::SweepTargetPicked)
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .into(),
         ));
         panel = panel.push(labelled(
@@ -1886,7 +1898,7 @@ impl State {
                 Some(self.sweep_mode),
                 Message::SweepModePicked,
             )
-            .text_size(13)
+            .text_size(typography::BODY_SIZE)
             .into(),
         ));
 
@@ -1896,21 +1908,21 @@ impl State {
                     "Start",
                     text_input("100", &self.sweep_start)
                         .on_input(Message::SweepStartChanged)
-                        .size(13)
+                        .size(typography::BODY_SIZE)
                         .into(),
                 ));
                 panel = panel.push(labelled(
                     "Stop",
                     text_input("2000", &self.sweep_stop)
                         .on_input(Message::SweepStopChanged)
-                        .size(13)
+                        .size(typography::BODY_SIZE)
                         .into(),
                 ));
                 panel = panel.push(labelled(
                     "Step",
                     text_input("100", &self.sweep_step)
                         .on_input(Message::SweepStepChanged)
-                        .size(13)
+                        .size(typography::BODY_SIZE)
                         .into(),
                 ));
             }
@@ -1919,7 +1931,7 @@ impl State {
                     "Values",
                     text_input("100, 250, 1000", &self.sweep_list)
                         .on_input(Message::SweepListChanged)
-                        .size(13)
+                        .size(typography::BODY_SIZE)
                         .into(),
                 ));
             }
@@ -1929,22 +1941,27 @@ impl State {
             "Stored as",
             text_input("freq_hz", &self.sweep_property)
                 .on_input(Message::SweepPropertyChanged)
-                .size(13)
+                .size(typography::BODY_SIZE)
                 .into(),
         ));
 
         let status: Element<'_, Message> = match self.sweep() {
             Some(Ok(sweep)) => match sweep.values.count() {
                 Some(rungs) => text(format!(
-                    "{rungs} signal(s), stored under '{}'.",
+                    "{rungs} signal{}, stored under {}.",
+                    if rungs == 1 { "" } else { "s" },
                     sweep.property_key
                 ))
-                .size(11)
-                .style(text::secondary)
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim)
                 .into(),
                 None => Space::with_height(Length::Fixed(0.0)).into(),
             },
-            Some(Err(error)) => text(error).size(11).style(text::danger).into(),
+            Some(Err(error)) => text(error)
+                .size(typography::LABEL_SIZE)
+                .style(text::danger)
+                .into(),
             None => Space::with_height(Length::Fixed(0.0)).into(),
         };
         panel.push(status).into()
@@ -1970,17 +1987,26 @@ fn issue_row(issue: &Issue) -> Element<'static, Message> {
         Some(field) => format!("{} · {field}", issue.pointer),
         None => issue.pointer.clone(),
     };
+    // A warning was set in the dim, which is the colour of things that do not
+    // matter; it now takes the warning colour, which is what it is.
     let headline = text(issue.message.clone())
-        .size(12)
+        .size(typography::BODY_SIZE)
         .style(match issue.severity {
             Severity::Error => text::danger,
-            Severity::Warning => text::secondary,
+            Severity::Warning => ui::warned,
         });
     button(
         column![
             headline,
-            text(issue.fix.clone()).size(11).style(text::secondary),
-            text(where_).size(10).style(text::secondary),
+            text(issue.fix.clone())
+                .size(typography::LABEL_SIZE)
+                .style(ui::dim),
+            // The pointer is where in the spec the problem is, which is what
+            // pressing this row navigates to, so it is shown as written.
+            text(where_)
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim),
         ]
         .spacing(1),
     )
@@ -2297,13 +2323,32 @@ fn fresh_seed() -> u64 {
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+/// A group of settings, announced by a caption over a hairline, with more air
+/// above the caption than below the rule — so the rule belongs to the fields
+/// under it rather than floating between two groups.
 fn section(title: &str) -> Element<'_, Message> {
     column![
-        Space::with_height(Length::Fixed(4.0)),
-        text(title).size(12).style(text::secondary),
-        horizontal_rule(1),
+        Space::with_height(Length::Fixed(8.0)),
+        ui::caption(title),
+        ui::rule(),
     ]
-    .spacing(3)
+    .spacing(4)
+    .into()
+}
+
+/// A command that edits the spec rather than producing anything from it.
+///
+/// This screen has exactly one loud control and it is Generate. Everything
+/// else — open, save, add, move — is quiet until it is reached for.
+fn command(label: &str, on_press: Option<Message>) -> Element<'_, Message> {
+    button(
+        text(label)
+            .size(typography::LABEL_SIZE)
+            .font(typography::LABEL),
+    )
+    .padding([4, 8])
+    .style(button::text)
+    .on_press_maybe(on_press)
     .into()
 }
 
@@ -2312,10 +2357,10 @@ fn section(title: &str) -> Element<'_, Message> {
 /// not literals.
 fn labelled<'a>(label: impl Into<String>, control: Element<'a, Message>) -> Element<'a, Message> {
     row![
-        container(text(label.into()).size(12)).width(Length::Fixed(140.0)),
+        container(ui::caption(label.into())).width(Length::Fixed(140.0)),
         control,
     ]
-    .spacing(6)
+    .spacing(8)
     .align_y(Alignment::Center)
     .into()
 }

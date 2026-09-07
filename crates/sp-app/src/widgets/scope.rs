@@ -55,16 +55,11 @@ impl std::fmt::Display for Layout {
 }
 
 /// The eight trace colours, in the order traces take them.
-pub const PALETTE: [Color; 8] = [
-    Color::from_rgb(0.30, 0.69, 0.96),
-    Color::from_rgb(0.98, 0.62, 0.24),
-    Color::from_rgb(0.45, 0.83, 0.44),
-    Color::from_rgb(0.93, 0.42, 0.51),
-    Color::from_rgb(0.68, 0.55, 0.95),
-    Color::from_rgb(0.36, 0.83, 0.80),
-    Color::from_rgb(0.95, 0.83, 0.35),
-    Color::from_rgb(0.80, 0.56, 0.42),
-];
+///
+/// They live in [`crate::theme`] with the rest of the application's colour;
+/// this name stays because every caller of it is here or on a screen that
+/// draws a scope.
+pub use crate::theme::TRACES as PALETTE;
 
 /// One trace as the canvas sees it.
 #[derive(Debug, Clone, Copy)]
@@ -327,11 +322,12 @@ impl canvas::Program<Action> for Scope<'_> {
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let palette = theme.extended_palette();
+        let tokens = crate::theme::tokens(theme);
         let size = bounds.size();
         let scale = self.x_scale(bounds);
 
         let grid = self.caches.grid.draw(renderer, size, |frame| {
-            draw_grid(frame, self.viewport, palette, size);
+            draw_grid(frame, self.viewport, tokens, size);
         });
 
         let traces = self.caches.traces.draw(renderer, size, |frame| {
@@ -348,7 +344,8 @@ impl canvas::Program<Action> for Scope<'_> {
                         content: trace.name.to_owned(),
                         position: Point::new(6.0, top + 4.0),
                         color: trace.colour,
-                        size: 10.0.into(),
+                        size: crate::typography::LABEL_SIZE,
+                        font: crate::typography::READOUT,
                         shaping: Shaping::Basic,
                         ..Text::default()
                     });
@@ -380,12 +377,12 @@ impl canvas::Program<Action> for Scope<'_> {
                 &mut overlay,
                 Point::new(x, 0.0),
                 Point::new(x, size.height),
-                palette.danger.base.color,
+                tokens.playhead,
                 1.5,
             );
         }
         if let Some(point) = cursor.position_in(bounds) {
-            draw_cursor(&mut overlay, self.viewport, point, palette, size);
+            draw_cursor(&mut overlay, self.viewport, point, palette, tokens, size);
         }
 
         vec![grid, traces, artifacts, overlay.into_geometry()]
@@ -418,12 +415,13 @@ fn stroke_line(frame: &mut Frame, from: Point, to: Point, colour: Color, width: 
     );
 }
 
-fn draw_grid(frame: &mut Frame, viewport: &Viewport, palette: Palette<'_>, size: Size) {
-    let line = Color {
-        a: 0.35,
-        ..palette.background.strong.color
-    };
-    let label = palette.background.base.text;
+fn draw_grid(frame: &mut Frame, viewport: &Viewport, tokens: &crate::theme::Tokens, size: Size) {
+    // The graticule is the quietest thing on the face by design: it is there
+    // to be measured against, not to be looked at. Its loudness is fixed by
+    // the theme and held inside bounds the theme's own tests enforce, rather
+    // than being an alpha guessed at here.
+    let line = tokens.grid;
+    let label = tokens.text_dim;
 
     let time = viewport.time();
     let step = nice_step(time.duration_s(), 10.0);
@@ -442,7 +440,8 @@ fn draw_grid(frame: &mut Frame, viewport: &Viewport, palette: Palette<'_>, size:
                 content: format_time(t),
                 position: Point::new(x + 3.0, size.height - 14.0),
                 color: label,
-                size: 10.0.into(),
+                size: crate::typography::LABEL_SIZE,
+                font: crate::typography::READOUT,
                 shaping: Shaping::Basic,
                 ..Text::default()
             });
@@ -461,21 +460,15 @@ fn draw_grid(frame: &mut Frame, viewport: &Viewport, palette: Palette<'_>, size:
                 frame,
                 Point::new(0.0, y),
                 Point::new(size.width, y),
-                if zero {
-                    Color {
-                        a: 0.8,
-                        ..palette.background.strong.color
-                    }
-                } else {
-                    line
-                },
+                if zero { tokens.rule } else { line },
                 if zero { 1.5 } else { 1.0 },
             );
             frame.fill_text(Text {
                 content: format_value(v),
                 position: Point::new(3.0, y - 12.0),
                 color: label,
-                size: 10.0.into(),
+                size: crate::typography::LABEL_SIZE,
+                font: crate::typography::READOUT,
                 shaping: Shaping::Basic,
                 ..Text::default()
             });
@@ -575,7 +568,8 @@ fn draw_overlay(frame: &mut Frame, viewport: &Viewport, overlay: &OverlayView, s
                 content: item.label.clone(),
                 position: Point::new(x0 + 4.0, 4.0),
                 color: overlay.colour,
-                size: 10.0.into(),
+                size: crate::typography::LABEL_SIZE,
+                font: crate::typography::READOUT,
                 shaping: Shaping::Basic,
                 ..Text::default()
             });
@@ -618,11 +612,15 @@ fn draw_cursor(
     viewport: &Viewport,
     point: Point,
     palette: Palette<'_>,
+    tokens: &crate::theme::Tokens,
     size: Size,
 ) {
+    // The crosshair is brighter than the graticule and quieter than the
+    // playhead: it follows the pointer, so it has to be findable without
+    // becoming the thing the eye settles on.
     let hair = Color {
-        a: 0.6,
-        ..palette.background.strong.color
+        a: 0.75,
+        ..tokens.rule
     };
     stroke_line(
         frame,
@@ -661,7 +659,8 @@ fn draw_cursor(
         content: readout,
         position: anchor + Vector::new(4.0, 2.0),
         color: palette.background.base.text,
-        size: 10.0.into(),
+        size: crate::typography::LABEL_SIZE,
+        font: crate::typography::READOUT,
         shaping: Shaping::Basic,
         ..Text::default()
     });

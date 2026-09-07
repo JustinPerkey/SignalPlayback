@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, pick_list, progress_bar, row, scrollable,
-    text, text_input, Column, Space,
+    button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
+    text_input, Column, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task};
 use sp_core::run::Retention;
@@ -32,6 +32,8 @@ use sp_store::runs::{self, NewPipeline, PipelineRow};
 use sp_store::{library, Store};
 
 use crate::jobs;
+use crate::typography;
+use crate::ui;
 
 /// A running pipeline, and the two things the UI reaches into it for.
 #[derive(Debug)]
@@ -766,22 +768,25 @@ impl State {
 
     #[must_use]
     pub fn view(&self) -> Element<'_, Message> {
+        // What is available, what has been built, and what it will be run
+        // over. The two rails sit on their own surface; the pipeline itself is
+        // on the window, because it is the subject.
         let palette = container(scrollable(self.palette()).height(Length::Fill))
             .width(Length::Fixed(215.0))
             .height(Length::Fill)
             .padding([12, 12])
-            .style(container::bordered_box);
+            .style(ui::panel);
 
         let middle = container(scrollable(self.stage_list()).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding([12, 16]);
+            .padding([16, 20]);
 
         let right = container(scrollable(self.side_panel()).height(Length::Fill))
             .width(Length::Fixed(370.0))
             .height(Length::Fill)
-            .padding([12, 14])
-            .style(container::bordered_box);
+            .padding([16, 16])
+            .style(ui::panel);
 
         row![palette, middle, right].height(Length::Fill).into()
     }
@@ -790,34 +795,41 @@ impl State {
     /// `dsp.filter.biquad` sits under "filter" without the palette having to
     /// know what a filter is.
     fn palette(&self) -> Element<'_, Message> {
-        let mut list = column![text("Stages").size(16)].spacing(4);
+        let mut list = column![text("Stages")
+            .size(typography::HEADING_SIZE)
+            .font(typography::HEADING)]
+        .spacing(4);
         let mut family = String::new();
         for descriptor in self.registry.descriptors() {
             let this = family_of(descriptor.kind);
             if this != family {
                 family = this.to_owned();
                 list = list
-                    .push(Space::with_height(Length::Fixed(6.0)))
-                    .push(text(title_case(&family)).size(11).style(text::secondary));
+                    .push(Space::with_height(Length::Fixed(12.0)))
+                    .push(ui::caption(title_case(&family)));
             }
             list = list.push(
                 button(
                     column![
-                        text(descriptor.label).size(13),
-                        text(descriptor.summary).size(10).style(text::secondary),
+                        text(descriptor.label).size(typography::BODY_SIZE),
+                        text(descriptor.summary)
+                            .size(typography::LABEL_SIZE)
+                            .style(ui::dim),
                     ]
                     .spacing(1),
                 )
                 .width(Length::Fill)
                 .padding([6.0, 8.0])
-                .style(button::text)
+                .style(ui::selectable(false))
                 .on_press(Message::AddStage(descriptor.kind)),
             );
         }
         if self.registry.is_empty() {
+            // A build with no registered stages cannot do anything, which is a
+            // fault in the build rather than in what the user did.
             list = list.push(
-                text("No stages are registered.")
-                    .size(12)
+                text("No stages are registered in this build.")
+                    .size(typography::BODY_SIZE)
                     .style(text::danger),
             );
         }
@@ -831,9 +843,9 @@ impl State {
             text_input("Pipeline name", &self.pipeline.name)
                 .on_input(Message::NameChanged)
                 .padding(6)
-                .size(14)
+                .size(typography::BODY_SIZE)
                 .width(Length::Fixed(260.0)),
-            button(text("Save").size(12))
+            button(text("Save").size(typography::BODY_SIZE))
                 .padding([5.0, 12.0])
                 .style(button::secondary)
                 .on_press_maybe((!self.busy).then_some(Message::Save)),
@@ -850,7 +862,7 @@ impl State {
                 Message::LoadPipeline,
             )
             .placeholder("Load saved…")
-            .text_size(12)
+            .text_size(typography::BODY_SIZE)
             .padding(5),
         ]
         .spacing(8)
@@ -858,24 +870,31 @@ impl State {
         .spacing(8);
 
         if let Some(error) = &self.error {
-            body = body.push(text(error).size(13).style(text::danger));
+            body = body.push(text(error).size(typography::BODY_SIZE).style(text::danger));
         }
         if let Some(notice) = &self.notice {
-            body = body.push(text(notice).size(13).style(text::success));
+            body = body.push(
+                text(notice)
+                    .size(typography::BODY_SIZE)
+                    .style(text::success),
+            );
         }
 
         if self.pipeline.stages.is_empty() {
-            body = body.push(
-                text(
-                    "Add a stage from the palette. Stages run top to bottom, one group at a time.",
-                )
-                .size(13)
-                .style(text::secondary),
-            );
+            body = body.push(Space::with_height(Length::Fixed(8.0))).push(ui::empty(
+                "This pipeline has no stages.",
+                "Add one from the palette on the left. Stages run top to bottom, one group                  at a time, and the order is the algorithm.",
+            ));
             return body.into();
         }
 
+        // A hairline between stages, not a box around each: the pipeline is
+        // one list read top to bottom, and eleven cards would say it is eleven
+        // separate things.
         for (index, stage) in self.pipeline.stages.iter().enumerate() {
+            if index > 0 {
+                body = body.push(ui::rule());
+            }
             body = body.push(self.stage_row(index, stage, &issues));
         }
 
@@ -886,10 +905,15 @@ impl State {
         if !issues.is_empty() {
             body = body
                 .push(Space::with_height(Length::Fixed(8.0)))
-                .push(horizontal_rule(1))
-                .push(text("Problems").size(12).style(text::secondary));
+                .push(ui::rule())
+                .push(Space::with_height(Length::Fixed(6.0)))
+                .push(ui::caption("Problems"));
             for issue in &issues {
-                body = body.push(text(issue.to_string()).size(12).style(text::danger));
+                body = body.push(
+                    text(issue.to_string())
+                        .size(typography::BODY_SIZE)
+                        .style(text::danger),
+                );
             }
         }
         body.into()
@@ -900,7 +924,7 @@ impl State {
     /// than only when a run refuses to start.
     fn assertions(&self) -> Element<'_, Message> {
         let mut list = column![row![
-            text("Assertions").size(14),
+            ui::caption("Assertions"),
             Space::with_width(Length::Fill),
             small_button("Add", Some(Message::AddAssertion)),
         ]
@@ -915,8 +939,9 @@ impl State {
                          after the last stage. Try `metrics.snr_db > 12` or \
                          `signals[\"rf\"].rms within 5% of baseline`.",
                     )
-                    .size(12)
-                    .style(text::secondary),
+                    .size(typography::BODY_SIZE)
+                    .style(ui::dim)
+                    .width(Length::Fixed(560.0)),
                 )
                 .into();
         }
@@ -927,10 +952,13 @@ impl State {
                 checkbox("", assertion.enabled)
                     .size(14)
                     .on_toggle(move |on| Message::AssertionEnabled(index, on)),
+                // An assertion is a small program, so the box it is typed into
+                // is set in the face the rest of the machine output uses.
                 text_input("metrics.snr_db > 12", &assertion.source)
                     .on_input(move |text| Message::AssertionChanged(index, text))
                     .padding(5)
-                    .size(13)
+                    .size(typography::BODY_SIZE)
+                    .font(typography::READOUT)
                     .width(Length::Fill),
                 small_button("Remove", Some(Message::RemoveAssertion(index))),
             ]
@@ -941,14 +969,14 @@ impl State {
             if failing {
                 line = line.push(
                     text(assertion.error().expect("just checked").to_string())
-                        .size(11)
+                        .size(typography::LABEL_SIZE)
                         .style(text::danger),
                 );
             } else if assertion.needs_baseline() {
                 line = line.push(
                     text("compares against the run panel's baseline")
-                        .size(11)
-                        .style(text::secondary),
+                        .size(typography::LABEL_SIZE)
+                        .style(ui::dim),
                 );
             }
             list = list.push(line);
@@ -978,28 +1006,40 @@ impl State {
             },
         );
 
+        // The ordinal is what the stage is called in an issue report and in
+        // the rail on Results, so it is a reading rather than a decoration.
         let heading = row![
-            text(format!("{}.", index + 1))
-                .size(12)
-                .style(text::secondary),
-            text(stage.display_name(&self.registry)).size(14),
+            text(format!("{:>2}", index + 1))
+                .size(typography::BODY_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim),
+            text(stage.display_name(&self.registry))
+                .size(typography::BODY_SIZE)
+                .font(if selected {
+                    typography::BODY_STRONG
+                } else {
+                    typography::BODY
+                }),
             Space::with_width(Length::Fixed(6.0)),
-            text(stage.kind.as_str()).size(10).style(text::secondary),
+            text(stage.kind.as_str())
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim),
         ]
-        .spacing(6)
+        .spacing(8)
         .align_y(Alignment::Center);
 
         let controls = row![
             checkbox("On", stage.enabled)
                 .size(14)
-                .text_size(11)
+                .text_size(typography::LABEL_SIZE)
                 .on_toggle(move |value| Message::StageEnabled(index, value)),
             pick_list(
                 RetentionChoice::ALL.to_vec(),
                 Some(RetentionChoice(stage.retention)),
                 move |choice| Message::RetentionPicked(index, choice),
             )
-            .text_size(11)
+            .text_size(typography::LABEL_SIZE)
             .padding(3),
             Space::with_width(Length::Fill),
             small_button("↑", (index > 0).then_some(Message::MoveStage(index, -1))),
@@ -1012,13 +1052,16 @@ impl State {
         .spacing(6)
         .align_y(Alignment::Center);
 
+        // The line under the name is what the stage will actually do, with
+        // the parameters that were set, so it is set as machine output — and
+        // in the danger colour when the stage is the reason the pipeline will
+        // not run.
         let body = column![
             heading,
-            text(summary).size(11).style(if flagged {
-                text::danger
-            } else {
-                text::secondary
-            }),
+            text(summary)
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(if flagged { text::danger } else { ui::dim }),
             controls,
         ]
         .spacing(4);
@@ -1026,11 +1069,7 @@ impl State {
         button(body)
             .width(Length::Fill)
             .padding([8.0, 10.0])
-            .style(if selected {
-                button::primary
-            } else {
-                button::secondary
-            })
+            .style(ui::selectable(selected))
             .on_press(Message::SelectStage(index))
             .into()
     }
@@ -1040,7 +1079,7 @@ impl State {
         column![
             self.param_form(),
             Space::with_height(Length::Fixed(14.0)),
-            horizontal_rule(1),
+            ui::rule(),
             Space::with_height(Length::Fixed(10.0)),
             self.run_panel(),
         ]
@@ -1053,20 +1092,25 @@ impl State {
             .and_then(|index| self.pipeline.stages.get(index).map(|stage| (index, stage)))
         else {
             return column![
-                text("Parameters").size(16),
-                text("Select a stage to edit what it does.")
-                    .size(12)
-                    .style(text::secondary),
+                text("Parameters")
+                    .size(typography::HEADING_SIZE)
+                    .font(typography::HEADING),
+                ui::empty(
+                    "No stage is selected.",
+                    "Pick one in the middle column. Its form is generated from what the                      stage declares it takes, so it is always what this build accepts.",
+                ),
             ]
-            .spacing(6)
+            .spacing(8)
             .into();
         };
 
         let Some(descriptor) = self.descriptor_at(index) else {
             return column![
-                text("Parameters").size(16),
+                text("Parameters")
+                    .size(typography::HEADING_SIZE)
+                    .font(typography::HEADING),
                 text(format!("'{}' is not registered in this build.", stage.kind))
-                    .size(12)
+                    .size(typography::BODY_SIZE)
                     .style(text::danger),
             ]
             .spacing(6)
@@ -1074,20 +1118,27 @@ impl State {
         };
 
         let mut form = column![
-            text(descriptor.label).size(16),
-            text(descriptor.summary).size(11).style(text::secondary),
+            text(descriptor.label)
+                .size(typography::HEADING_SIZE)
+                .font(typography::HEADING),
+            text(descriptor.summary)
+                .size(typography::BODY_SIZE)
+                .style(ui::dim),
+            // The kind and its version are what the run record will name, so
+            // they are shown exactly as they will be recorded.
             text(format!("{} · v{}", descriptor.kind, descriptor.version))
-                .size(10)
-                .style(text::secondary),
-            Space::with_height(Length::Fixed(4.0)),
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(ui::dim),
+            Space::with_height(Length::Fixed(6.0)),
         ]
         .spacing(3);
 
         if descriptor.params.is_empty() {
             form = form.push(
                 text("This stage takes no parameters.")
-                    .size(12)
-                    .style(text::secondary),
+                    .size(typography::BODY_SIZE)
+                    .style(ui::dim),
             );
         }
         for spec in descriptor.params {
@@ -1099,24 +1150,28 @@ impl State {
         if !descriptor.inputs.is_empty() || !descriptor.outputs.is_empty() {
             form = form
                 .push(Space::with_height(Length::Fixed(8.0)))
-                .push(text("Ports").size(11).style(text::secondary));
+                .push(ui::caption("Ports"));
+            // A port is a name and a type, and both are the pipeline's own
+            // vocabulary rather than prose, so the whole line is a reading.
             for port in descriptor.inputs {
                 form = form.push(
                     text(format!(
-                        "in · {} ({}){}",
+                        "in   {} ({}){}",
                         port.name,
                         port.kind.describe(),
-                        if port.required { "" } else { ", optional" }
+                        if port.required { "" } else { "  optional" }
                     ))
-                    .size(11)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
                 );
             }
             for port in descriptor.outputs {
                 form = form.push(
-                    text(format!("out · {} ({})", port.name, port.kind.describe()))
-                        .size(11)
-                        .style(text::secondary),
+                    text(format!("out  {} ({})", port.name, port.kind.describe()))
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::READOUT)
+                        .style(ui::dim),
                 );
             }
         }
@@ -1146,7 +1201,7 @@ impl State {
                     .unwrap_or(matches!(spec.default, sp_proc::ParamDefault::Bool(true))),
             )
             .size(15)
-            .text_size(12)
+            .text_size(typography::BODY_SIZE)
             .on_toggle(|value| Message::ParamToggled(spec.name, value))
             .into(),
             ParamKind::Enum { variants } => pick_list(
@@ -1162,7 +1217,7 @@ impl State {
                 |choice| Message::ParamPicked(spec.name, choice),
             )
             .placeholder("Choose…")
-            .text_size(12)
+            .text_size(typography::BODY_SIZE)
             .padding(5)
             .width(Length::Fill)
             .into(),
@@ -1176,23 +1231,28 @@ impl State {
             )
             .on_input(|value| Message::ParamText(spec.name, value))
             .padding(5)
-            .size(13)
+            .size(typography::BODY_SIZE)
             .into(),
         };
 
-        let mut field = column![].spacing(2);
+        // The label over a field is a caption for a control, which is the
+        // same job the caption over a reading does.
+        let mut field = column![].spacing(3);
         if !matches!(spec.kind, ParamKind::Bool) {
-            field = field.push(text(label).size(12));
+            field = field.push(ui::caption(label));
         }
         field = field.push(input);
         if !spec.help.is_empty() {
-            field = field.push(text(spec.help).size(10).style(text::secondary));
+            field = field.push(text(spec.help).size(typography::LABEL_SIZE).style(ui::dim));
         }
-        container(field).padding([4, 0]).into()
+        container(field).padding([5, 0]).into()
     }
 
     fn run_panel(&self) -> Element<'_, Message> {
-        let mut panel = column![text("Run").size(16)].spacing(6);
+        let mut panel = column![text("Run")
+            .size(typography::HEADING_SIZE)
+            .font(typography::HEADING)]
+        .spacing(6);
 
         panel = panel.push(
             pick_list(
@@ -1215,7 +1275,7 @@ impl State {
                 Message::DatasetPicked,
             )
             .placeholder("Dataset…")
-            .text_size(12)
+            .text_size(typography::BODY_SIZE)
             .padding(5)
             .width(Length::Fill),
         );
@@ -1227,19 +1287,24 @@ impl State {
                 } else {
                     "Choose a dataset to run over."
                 })
-                .size(12)
-                .style(text::secondary),
+                .size(typography::BODY_SIZE)
+                .style(ui::dim),
             );
         } else {
             panel = panel.push(
                 row![
                     text(format!(
-                        "{} of {} group(s)",
+                        "{} of {} groups",
                         self.chosen.len(),
                         self.groups.len()
                     ))
-                    .size(11)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(if self.chosen.is_empty() {
+                        ui::warned
+                    } else {
+                        ui::dim
+                    }),
                     Space::with_width(Length::Fill),
                     small_button("All", Some(Message::AllGroups(true))),
                     small_button("None", Some(Message::AllGroups(false))),
@@ -1254,7 +1319,7 @@ impl State {
                 list = list.push(
                     checkbox(group.display_name(), self.chosen.contains(&id))
                         .size(14)
-                        .text_size(12)
+                        .text_size(typography::BODY_SIZE)
                         .on_toggle(move |on| Message::GroupToggled(id, on)),
                 );
             }
@@ -1284,15 +1349,15 @@ impl State {
                     Some(BaselineChoice(self.baseline.clone())),
                     Message::BaselinePicked,
                 )
-                .text_size(12)
+                .text_size(typography::BODY_SIZE)
                 .padding(5)
                 .width(Length::Fill),
             );
             if self.baselines.is_empty() {
                 panel = panel.push(
                     text("Promote a run on the Results screen to compare against it.")
-                        .size(11)
-                        .style(text::secondary),
+                        .size(typography::LABEL_SIZE)
+                        .style(ui::dim),
                 );
             }
         }
@@ -1308,12 +1373,12 @@ impl State {
                     } else {
                         "Run"
                     })
-                    .size(13)
+                    .size(typography::BODY_SIZE)
                 )
                 .padding([6.0, 16.0])
                 .style(button::primary)
                 .on_press_maybe(runnable.then_some(Message::Run)),
-                button(text("Cancel").size(12))
+                button(text("Cancel").size(typography::BODY_SIZE))
                     .padding([6.0, 12.0])
                     .style(button::danger)
                     .on_press_maybe(self.job.is_some().then_some(Message::Cancel)),
@@ -1333,22 +1398,21 @@ impl State {
                         ),
                         None => "Starting…".to_owned(),
                     })
-                    .size(11)
-                    .style(text::secondary),
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::READOUT)
+                    .style(ui::dim),
                 );
         }
 
         if let Some(summary) = &self.summary {
             panel = panel
-                .push(Space::with_height(Length::Fixed(4.0)))
-                .push(text(summary.describe()).size(12))
+                .push(Space::with_height(Length::Fixed(6.0)))
+                .push(text(summary.describe()).size(typography::BODY_SIZE))
+                .push(ui::fact("Run", summary.run))
                 .push(
-                    text(format!(
-                        "Run {} · open the Results screen (M6) to inspect it.",
-                        summary.run
-                    ))
-                    .size(11)
-                    .style(text::secondary),
+                    text("Open the Results screen to inspect it.")
+                        .size(typography::LABEL_SIZE)
+                        .style(ui::dim),
                 );
         }
 
@@ -1356,13 +1420,22 @@ impl State {
     }
 }
 
-/// A short button used in the stage rows and the group list.
+/// A short command used in the stage rows and the group list: reorder,
+/// remove, select all.
+///
+/// These were filled buttons, which put a dozen solid rectangles on a screen
+/// whose one loud control is Run. A command that acts on a row belongs to the
+/// row, so it is quiet until it is reached for.
 fn small_button(label: &str, on_press: Option<Message>) -> Element<'_, Message> {
-    button(text(label).size(11))
-        .padding([3.0, 8.0])
-        .style(button::secondary)
-        .on_press_maybe(on_press)
-        .into()
+    button(
+        text(label)
+            .size(typography::LABEL_SIZE)
+            .font(typography::LABEL),
+    )
+    .padding([3.0, 8.0])
+    .style(button::text)
+    .on_press_maybe(on_press)
+    .into()
 }
 
 /// The family segment of a stage kind: `dsp.filter.biquad` → `filter`.

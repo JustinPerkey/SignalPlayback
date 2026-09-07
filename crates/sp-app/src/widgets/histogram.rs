@@ -36,14 +36,18 @@ impl<Message> canvas::Program<Message> for HistogramView<'_> {
     ) -> Vec<Geometry> {
         let size = bounds.size();
         let palette = theme.extended_palette();
+        let tokens = crate::theme::tokens(theme);
         let bars = self.cache.draw(renderer, size, |frame| {
             draw(
                 frame,
                 self.histogram,
                 size,
                 palette.primary.base.color,
-                palette.background.strong.color,
-                palette.background.base.text,
+                // The axis is a rule and the numbers under it are captions, so
+                // both come from the same tokens the rest of the application
+                // draws its rules and its quiet text with.
+                tokens.rule,
+                tokens.text_dim,
                 self.format,
             );
         });
@@ -73,7 +77,8 @@ fn draw(
             content: "no values in range".to_owned(),
             position: Point::new(6.0, plot_h / 2.0 - 6.0),
             color: label,
-            size: 11.0.into(),
+            size: crate::typography::LABEL_SIZE,
+            font: crate::typography::READOUT,
             ..Text::default()
         });
         return;
@@ -110,7 +115,8 @@ fn draw(
             content,
             position,
             color: label,
-            size: 10.0.into(),
+            size: crate::typography::LABEL_SIZE,
+            font: crate::typography::READOUT,
             ..Text::default()
         });
     }

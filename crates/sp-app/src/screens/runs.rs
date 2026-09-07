@@ -12,15 +12,15 @@
 
 use std::collections::BTreeMap;
 
-use iced::widget::{
-    button, column, container, horizontal_rule, row, scrollable, text, text_input, Space,
-};
-use iced::{Alignment, Element, Length, Task, Theme};
+use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use iced::{Alignment, Element, Length, Task};
 use sp_core::run::{AssertStatus, RunStatus};
 use sp_core::{RunId, Tolerances};
 use sp_store::{regress, runs, AssertionResultRow, BaselineRow, RunRow, Store};
 
 use crate::jobs;
+use crate::typography;
+use crate::ui;
 
 /// One row of the history, with everything the table shows.
 #[derive(Debug, Clone)]
@@ -256,11 +256,13 @@ impl State {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding([12, 16]);
+        // The detail sits on its own surface with a hairline between it and
+        // the history, rather than in a bordered box floating over it.
         let panel = container(scrollable(self.panel()))
             .width(Length::Fixed(340.0))
             .height(Length::Fill)
-            .padding([12, 14])
-            .style(container::bordered_box);
+            .padding([16, 16])
+            .style(ui::panel);
         row![table, panel].height(Length::Fill).into()
     }
 
@@ -271,67 +273,91 @@ impl State {
             .filter(|entry| entry.is_failure())
             .count();
         let mut list = column![row![
-            text("Runs").size(22),
+            text("Runs")
+                .size(typography::TITLE_SIZE)
+                .font(typography::TITLE),
             Space::with_width(Length::Fixed(12.0)),
+            // How many ran and how many of those failed are two different
+            // readings, and the failing one is the reason anyone opens this
+            // screen, so it takes the warning colour when it is not zero.
             text(format!(
-                "{} run{} · {failures} failing",
+                "{} run{}",
                 self.entries.len(),
                 if self.entries.len() == 1 { "" } else { "s" },
             ))
-            .size(12)
-            .style(text::secondary),
+            .size(typography::BODY_SIZE)
+            .font(typography::READOUT)
+            .style(ui::dim),
+            text(format!("{failures} failing"))
+                .size(typography::BODY_SIZE)
+                .font(typography::READOUT)
+                .style(if failures == 0 { ui::dim } else { ui::warned }),
             Space::with_width(Length::Fill),
             iced::widget::checkbox("Failures only", self.filter_failures)
-                .text_size(12)
+                .text_size(typography::BODY_SIZE)
                 .on_toggle(Message::ToggleFailuresOnly),
-            button(text("Refresh").size(11))
-                .padding([3, 8])
-                .style(button::text)
-                .on_press(Message::Refresh),
+            button(
+                text("Refresh")
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::LABEL)
+                    .style(ui::dim),
+            )
+            .padding([3, 8])
+            .style(button::text)
+            .on_press(Message::Refresh),
         ]
-        .spacing(8)
+        .spacing(10)
         .align_y(Alignment::Center)]
-        .spacing(6);
+        .spacing(8);
 
         if let Some(error) = &self.error {
-            list = list.push(text(error).size(12).style(text::danger));
+            list = list.push(text(error).size(typography::BODY_SIZE).style(text::danger));
         }
         if let Some(notice) = &self.notice {
-            list = list.push(text(notice).size(12).style(text::success));
+            list = list.push(
+                text(notice)
+                    .size(typography::BODY_SIZE)
+                    .style(text::success),
+            );
         }
         if self.entries.is_empty() {
-            let message = if self.loading {
-                "Loading…"
+            let state = if self.loading {
+                ui::empty(
+                    "Reading the history…",
+                    "Every run this application has made is kept, whatever it returned.",
+                )
             } else {
-                "Nothing has been run yet. Build a pipeline and run it over a dataset."
+                ui::empty(
+                    "Nothing has been run yet.",
+                    "Build a pipeline, run it over a dataset, and it appears here with                      the algorithm hash that produced it.",
+                )
             };
-            return list
-                .push(text(message).size(13).style(text::secondary))
-                .into();
+            return list.push(state).into();
         }
 
         let widths = [60.0, 150.0, 110.0, 165.0, 95.0, 80.0, 110.0, 120.0];
+        // A pipeline and a baseline have names, which are read; everything
+        // else in this table is a quantity or an identifier, which is scanned.
+        // The two want opposite alignments, and the heading goes wherever its
+        // column went.
+        let columns: [(&str, Alignment); 8] = [
+            ("Run", Alignment::End),
+            ("Pipeline", Alignment::Start),
+            ("Algorithm", Alignment::Start),
+            ("Started", Alignment::Start),
+            ("Duration", Alignment::End),
+            ("Groups", Alignment::End),
+            ("Assertions", Alignment::End),
+            ("Baseline", Alignment::Start),
+        ];
         let mut head = row![];
-        for (label, width) in [
-            "Run",
-            "Pipeline",
-            "Algorithm",
-            "Started",
-            "Duration",
-            "Groups",
-            "Assertions",
-            "Baseline",
-        ]
-        .into_iter()
-        .zip(widths)
-        {
-            head = head.push(
-                container(text(label).size(11).style(text::secondary))
-                    .width(Length::Fixed(width))
-                    .padding([3, 6]),
-            );
+        for ((label, align), width) in columns.into_iter().zip(widths) {
+            head = head.push(ui::heading_aligned(label, width, align));
         }
-        list = list.push(head).push(horizontal_rule(1));
+        list = list
+            .push(Space::with_height(Length::Fixed(4.0)))
+            .push(head)
+            .push(ui::rule());
 
         for entry in self.visible() {
             let run = &entry.run;
@@ -361,40 +387,53 @@ impl State {
             ];
 
             let mut line = row![].align_y(Alignment::Center);
-            for (index, (value, width)) in cells.into_iter().zip(widths).enumerate() {
-                let cell = text(value).size(12);
+            for (index, ((value, (_, align)), width)) in
+                cells.into_iter().zip(columns).zip(widths).enumerate()
+            {
+                let cell = text(value).size(typography::BODY_SIZE);
+                // A name is set in the prose face; the id, the hash, the clock
+                // time and the counts are all machine output and are set
+                // monospaced, so the column reads as a column.
+                let cell = if matches!(index, 1 | 7) {
+                    cell
+                } else {
+                    cell.font(typography::READOUT)
+                };
                 // The status colours the run's own number and its counts.
                 let cell = if entry.is_failure() && matches!(index, 0 | 5 | 6) {
                     cell.style(text::danger)
                 } else {
                     cell
                 };
-                line = line.push(container(cell).width(Length::Fixed(width)).padding([3, 6]));
+                line = line.push(
+                    container(cell)
+                        .width(Length::Fixed(width))
+                        .align_x(align)
+                        .padding([3, 6]),
+                );
             }
+            // Marking is a selection, not an action, so it takes the same band
+            // the selected row takes rather than a fill of the accent.
             line = line.push(
-                button(text(if marked { "Marked" } else { "Mark" }).size(11))
-                    .padding([2, 8])
-                    .style(if marked {
-                        button::primary
-                    } else {
-                        button::text
-                    })
-                    .on_press(if marked {
-                        Message::ClearAgainst
-                    } else {
-                        Message::MarkAgainst(run.id)
-                    }),
+                button(
+                    text(if marked { "Marked" } else { "Mark" })
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::LABEL),
+                )
+                .padding([2, 8])
+                .style(ui::selectable(marked))
+                .on_press(if marked {
+                    Message::ClearAgainst
+                } else {
+                    Message::MarkAgainst(run.id)
+                }),
             );
 
             list = list.push(
                 button(line)
                     .width(Length::Fill)
                     .padding(0)
-                    .style(if selected {
-                        button::secondary
-                    } else {
-                        button::text
-                    })
+                    .style(ui::selectable(selected))
                     .on_press(Message::Select(run.id)),
             );
         }
@@ -406,44 +445,56 @@ impl State {
             .selected
             .and_then(|id| self.entries.iter().find(|entry| entry.run.id == id))
         else {
-            return text("Select a run to see what it did.")
-                .size(13)
-                .style(text::secondary)
-                .into();
+            return ui::empty(
+                "Pick a run on the left.",
+                "A run records the pipeline, the algorithm hash it resolved to, and                  what every assertion returned.",
+            );
         };
         let run = &entry.run;
 
+        // The four facts under the heading were four sentences, three of
+        // which began with a word the reader had to skip to reach the value.
+        // As a strip, the caption is the word and the value is what is left.
         let mut panel = column![
-            text(format!("Run {}", run.id.get())).size(18),
-            text(format!(
-                "{} · {} · {}",
-                entry.pipeline,
-                run.status.label(),
-                format_timestamp(run.started_utc),
-            ))
-            .size(11)
-            .style(text::secondary),
-            text(format!("Algorithm {}", run.pipeline_hash))
-                .size(11)
-                .style(text::secondary),
-            text(format!("Built by {}", run.app_version))
-                .size(11)
-                .style(text::secondary),
+            text(format!("Run {}", run.id.get()))
+                .size(typography::HEADING_SIZE)
+                .font(typography::HEADING),
+            row![
+                ui::spec(
+                    "Status",
+                    run.status.label(),
+                    if entry.is_failure() {
+                        ui::warned
+                    } else {
+                        text::base
+                    },
+                ),
+                ui::fact("Pipeline", &entry.pipeline),
+                ui::fact("Started", format_timestamp(run.started_utc)),
+            ]
+            .spacing(20)
+            .wrap(),
+            row![
+                ui::fact("Algorithm", &run.pipeline_hash),
+                ui::fact("Built by", &run.app_version),
+            ]
+            .spacing(20)
+            .wrap(),
         ]
-        .spacing(3);
+        .spacing(10);
 
         if let Some(notes) = &run.notes {
-            panel = panel.push(text(notes).size(12));
+            panel = panel.push(text(notes).size(typography::BODY_SIZE));
         }
 
         let against = self.against.filter(|id| *id != run.id);
-        panel = panel.push(Space::with_height(Length::Fixed(8.0))).push(
+        panel = panel.push(Space::with_height(Length::Fixed(6.0))).push(
             row![
-                button(text("Open in Results").size(12))
+                button(text("Open in Results").size(typography::BODY_SIZE))
                     .padding([5, 10])
                     .style(button::primary)
                     .on_press(Message::Open(run.id)),
-                button(text("Diff").size(12))
+                button(text("Diff").size(typography::BODY_SIZE))
                     .padding([5, 10])
                     .style(button::secondary)
                     .on_press_maybe(against.map(|_| Message::Diff(run.id))),
@@ -455,20 +506,20 @@ impl State {
                 Some(other) => format!("Diffs against run {}.", other.get()),
                 None => "Mark another run to diff against it.".to_owned(),
             })
-            .size(11)
-            .style(text::secondary),
+            .size(typography::LABEL_SIZE)
+            .style(ui::dim),
         );
 
         panel = panel
             .push(Space::with_height(Length::Fixed(10.0)))
-            .push(text("Baseline").size(12).style(text::secondary))
+            .push(ui::caption("Baseline"))
             .push(
                 row![
                     text_input("name", &self.promote_as)
                         .on_input(Message::PromoteAs)
                         .on_submit(Message::Promote(run.id))
-                        .size(12),
-                    button(text("Promote").size(12))
+                        .size(typography::BODY_SIZE),
+                    button(text("Promote").size(typography::BODY_SIZE))
                         .padding([4, 10])
                         .style(button::secondary)
                         .on_press(Message::Promote(run.id)),
@@ -481,13 +532,13 @@ impl State {
                     "Named by {}. Deleting it is refused while a baseline points at it.",
                     entry.baselines.join(", ")
                 ))
-                .size(11)
-                .style(text::secondary),
+                .size(typography::LABEL_SIZE)
+                .style(ui::dim),
             );
         }
 
         panel = panel.push(Space::with_height(Length::Fixed(10.0))).push(
-            button(text("Delete this run").size(12))
+            button(text("Delete this run").size(typography::BODY_SIZE))
                 .padding([4, 10])
                 .style(button::danger)
                 .on_press(Message::Delete(run.id)),
@@ -499,7 +550,7 @@ impl State {
             if *id == run.id && !detail.assertions.is_empty() {
                 panel = panel
                     .push(Space::with_height(Length::Fixed(12.0)))
-                    .push(text("Assertions").size(12).style(text::secondary));
+                    .push(ui::caption("Assertions"));
                 let mut rows: Vec<&AssertionResultRow> = detail.assertions.iter().collect();
                 rows.sort_by_key(|row| match row.status {
                     AssertStatus::Fail | AssertStatus::Error => 0,
@@ -515,11 +566,14 @@ impl State {
                     let style = match outcome.status {
                         AssertStatus::Fail | AssertStatus::Error => text::danger,
                         AssertStatus::Pass => text::success,
-                        AssertStatus::NotApplicable => text::secondary,
+                        AssertStatus::NotApplicable => ui::dim,
                     };
                     panel = panel.push(
                         column![
-                            text(outcome.expression.clone()).size(11).style(style),
+                            text(outcome.expression.clone())
+                                .size(typography::BODY_SIZE)
+                                .font(typography::READOUT)
+                                .style(style),
                             text(format!(
                                 "{group} · {}{}",
                                 outcome.status.label(),
@@ -528,18 +582,17 @@ impl State {
                                     .as_ref()
                                     .map_or_else(String::new, |m| format!(" · {m}")),
                             ))
-                            .size(10)
-                            .style(text::secondary),
+                            .size(typography::LABEL_SIZE)
+                            .style(ui::dim),
                         ]
-                        .spacing(1),
+                        .spacing(1)
+                        .padding([2, 0]),
                     );
                 }
             }
         }
 
-        container(panel)
-            .style(|_: &Theme| container::Style::default())
-            .into()
+        panel.into()
     }
 }
 

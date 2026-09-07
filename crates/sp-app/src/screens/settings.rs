@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use iced::widget::{
-    button, column, container, horizontal_rule, pick_list, row, scrollable, text, text_input, Space,
+    button, column, container, pick_list, row, scrollable, text, text_input, Space,
 };
 use iced::{Alignment, Element, Length, Task};
 use sp_csv::profile::CountMode;
@@ -24,6 +24,8 @@ use sp_store::{LibrarySummary, Store};
 
 use crate::jobs;
 use crate::settings::{Retention, Settings, ThemeChoice, MAX_BINS, MIN_BINS};
+use crate::typography;
+use crate::ui;
 
 /// A pick-list entry that knows how to print itself.
 macro_rules! choice {
@@ -248,7 +250,9 @@ impl State {
     #[must_use]
     pub fn view(&self) -> Element<'_, Message> {
         let body = column![
-            text("Settings").size(22),
+            text("Settings")
+                .size(typography::TITLE_SIZE)
+                .font(typography::TITLE),
             text(match &self.path {
                 Some(path) => format!("Saved to {}", path.display()),
                 None =>
@@ -256,9 +260,10 @@ impl State {
                      this session."
                         .to_owned(),
             })
-            .size(11)
-            .style(text::secondary),
-            Space::with_height(Length::Fixed(14.0)),
+            .size(typography::LABEL_SIZE)
+            .font(typography::READOUT)
+            .style(ui::dim),
+            Space::with_height(Length::Fixed(18.0)),
             self.library_section(),
             section_rule(),
             self.appearance_section(),
@@ -269,7 +274,7 @@ impl State {
             section_rule(),
             keyboard_section(),
         ]
-        .spacing(8)
+        .spacing(10)
         .max_width(760);
 
         container(scrollable(body))
@@ -287,31 +292,27 @@ impl State {
             .or_else(|| self.default_library.clone())
             .map_or_else(|| "none".to_owned(), |path| path.display().to_string());
 
+        // Where the library is, is a path, so it is set as one: a path in the
+        // prose face wraps in the wrong places and cannot be compared by eye
+        // against another.
         let mut section = column![
             heading("Library"),
-            text(current).size(13),
+            text(current)
+                .size(typography::BODY_SIZE)
+                .font(typography::READOUT),
             text(if self.settings.library_file.is_some() {
                 "Chosen library."
             } else {
                 "The default location for this machine."
             })
-            .size(11)
-            .style(text::secondary),
+            .size(typography::LABEL_SIZE)
+            .style(ui::dim),
         ]
         .spacing(4);
 
-        let mut actions = row![button(text("Open a library…").size(12))
-            .padding([5, 10])
-            .style(button::secondary)
-            .on_press(Message::ChooseLibrary)]
-        .spacing(8);
+        let mut actions = row![command("Open a library…", Message::ChooseLibrary)].spacing(6);
         if self.settings.library_file.is_some() {
-            actions = actions.push(
-                button(text("Use the default").size(12))
-                    .padding([5, 10])
-                    .style(button::text)
-                    .on_press(Message::UseDefaultLibrary),
-            );
+            actions = actions.push(command("Use the default", Message::UseDefaultLibrary));
         }
         section = section.push(actions);
         section.into()
@@ -327,13 +328,13 @@ impl State {
                     Some(ThemeEntry(self.settings.theme)),
                     Message::ThemePicked,
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .width(Length::Fixed(220.0))
                 .into(),
             ),
             text("Ctrl+T switches theme from any screen.")
-                .size(11)
-                .style(text::secondary),
+                .size(typography::LABEL_SIZE)
+                .style(ui::dim),
         ]
         .spacing(6)
         .into()
@@ -343,26 +344,30 @@ impl State {
         let mut rate_field = column![text_input("48000", &self.rate_draft)
             .on_input(Message::RateChanged)
             .on_submit(Message::RateCommitted)
-            .size(13)
+            .size(typography::BODY_SIZE)
             .width(Length::Fixed(220.0))]
         .spacing(3);
         if let Some(error) = &self.rate_error {
-            rate_field = rate_field.push(text(error).size(11).style(text::danger));
+            rate_field =
+                rate_field.push(text(error).size(typography::LABEL_SIZE).style(text::danger));
         }
 
         let bins = self.settings.histogram_bins;
         let bin_buttons = row([16_usize, 32, 64, 128]
             .into_iter()
             .map(|choice| {
-                button(text(choice.to_string()).size(12))
-                    .padding([4, 10])
-                    .style(if choice == bins {
-                        button::primary
-                    } else {
-                        button::secondary
-                    })
-                    .on_press(Message::UseHistogramBins(choice))
-                    .into()
+                // Four values of one setting, one of which is on. That is a
+                // selection, so it is drawn as one — not as four filled
+                // buttons with the chosen one filled louder.
+                button(
+                    text(choice.to_string())
+                        .size(typography::BODY_SIZE)
+                        .font(typography::READOUT),
+                )
+                .padding([4, 12])
+                .style(ui::selectable(choice == bins))
+                .on_press(Message::UseHistogramBins(choice))
+                .into()
             })
             .collect::<Vec<Element<'_, Message>>>())
         .spacing(6);
@@ -377,7 +382,7 @@ impl State {
                     Some(ModeEntry(self.settings.import_mode)),
                     Message::ModePicked,
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .width(Length::Fixed(300.0))
                 .into(),
             ),
@@ -388,7 +393,7 @@ impl State {
                     Some(QualityEntry(self.settings.decimation)),
                     Message::QualityPicked,
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .width(Length::Fixed(300.0))
                 .into(),
             ),
@@ -402,13 +407,13 @@ impl State {
                     Some(RetentionEntry(self.settings.retention)),
                     Message::RetentionPicked,
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .width(Length::Fixed(300.0))
                 .into(),
             ),
             text("A run a baseline names is never deleted, whatever the limit.")
-                .size(11)
-                .style(text::secondary),
+                .size(typography::LABEL_SIZE)
+                .style(ui::dim),
             labelled("Inspector histogram bins", bin_buttons.into()),
         ]
         .spacing(8)
@@ -419,29 +424,30 @@ impl State {
         let mut section = column![row![
             heading("This library"),
             Space::with_width(Length::Fill),
-            button(text("Refresh").size(11))
-                .padding([3, 8])
-                .style(button::text)
-                .on_press(Message::Refresh),
-            button(text("Reclaim unused blobs").size(11))
-                .padding([3, 8])
-                .style(button::secondary)
-                .on_press(Message::Sweep),
+            command("Refresh", Message::Refresh),
+            command("Reclaim unused blobs", Message::Sweep),
         ]
         .spacing(6)
         .align_y(Alignment::Center)]
         .spacing(6);
 
         if let Some(notice) = &self.notice {
-            section = section.push(text(notice).size(12).style(text::success));
+            section = section.push(
+                text(notice)
+                    .size(typography::BODY_SIZE)
+                    .style(text::success),
+            );
         }
         if let Some(error) = self.error.as_ref().or(self.storage_error.as_ref()) {
-            section = section.push(text(error).size(12).style(text::danger));
+            section = section.push(text(error).size(typography::BODY_SIZE).style(text::danger));
         }
 
         let Some((summary, storage)) = &self.storage else {
             return section
-                .push(text("No figures yet.").size(12).style(text::secondary))
+                .push(ui::empty(
+                    "No figures yet.",
+                    "These are counted from the open library; Refresh reads them again.",
+                ))
                 .into();
         };
 
@@ -463,12 +469,14 @@ impl State {
             ("Unreferenced", fmt_bytes(storage.unreferenced_bytes)),
             ("File on disk", fmt_bytes(storage.file_bytes)),
         ];
+        // Sixteen counts, read down a column. A caption on the left and a
+        // flush-right reading on the right lets the eye run down either the
+        // names or the figures without tracking across the pair.
         for (label, value) in rows {
             section = section.push(
                 row![
-                    container(text(label).size(12).style(text::secondary))
-                        .width(Length::Fixed(240.0)),
-                    text(value).size(12),
+                    container(ui::caption(label)).width(Length::Fixed(240.0)),
+                    ui::value(value, 140.0),
                 ]
                 .align_y(Alignment::Center),
             );
@@ -479,8 +487,8 @@ impl State {
                     "Render pyramids are rebuilt on demand, so reclaiming them costs only the \
                      time to draw a signal again.",
                 )
-                .size(11)
-                .style(text::secondary),
+                .size(typography::LABEL_SIZE)
+                .style(ui::dim),
             )
             .into()
     }
@@ -490,8 +498,8 @@ fn keyboard_section<'a>() -> Element<'a, Message> {
     let mut section = column![
         heading("Keyboard"),
         text("Fixed in this version; a configurable map is a later milestone (§15.11).")
-            .size(11)
-            .style(text::secondary),
+            .size(typography::LABEL_SIZE)
+            .style(ui::dim),
     ]
     .spacing(4);
     for (keys, action) in [
@@ -502,10 +510,17 @@ fn keyboard_section<'a>() -> Element<'a, Message> {
         ("[ / ]", "Set the loop points (Scope)"),
         ("← / →", "Step through the stage rail (Results)"),
     ] {
+        // The keys are keys on a keyboard, so they are set as keys; what
+        // they do is prose, so it is set as prose.
         section = section.push(
             row![
-                container(text(keys).size(12)).width(Length::Fixed(240.0)),
-                text(action).size(12).style(text::secondary),
+                container(
+                    text(keys)
+                        .size(typography::BODY_SIZE)
+                        .font(typography::READOUT),
+                )
+                .width(Length::Fixed(240.0)),
+                text(action).size(typography::BODY_SIZE).style(ui::dim),
             ]
             .align_y(Alignment::Center),
         );
@@ -514,20 +529,39 @@ fn keyboard_section<'a>() -> Element<'a, Message> {
 }
 
 fn heading(label: &str) -> Element<'_, Message> {
-    text(label).size(16).into()
-}
-
-fn labelled<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
-    column![text(label).size(12).style(text::secondary), control]
-        .spacing(3)
+    text(label)
+        .size(typography::HEADING_SIZE)
+        .font(typography::HEADING)
         .into()
 }
 
+fn labelled<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
+    column![ui::caption(label), control].spacing(4).into()
+}
+
+/// A command on this screen. None of them is what the screen is for — the
+/// screen is for the settings themselves — so none of them is filled.
+fn command(label: &str, message: Message) -> Element<'_, Message> {
+    button(
+        text(label)
+            .size(typography::LABEL_SIZE)
+            .font(typography::LABEL),
+    )
+    .padding([4, 10])
+    .style(button::text)
+    .on_press(message)
+    .into()
+}
+
+/// The break between two groups of settings.
+///
+/// More air above the rule than below it, so the rule belongs to the heading
+/// that follows rather than sitting in no-man's-land between two groups.
 fn section_rule<'a>() -> Element<'a, Message> {
     column![
-        Space::with_height(Length::Fixed(8.0)),
-        horizontal_rule(1),
-        Space::with_height(Length::Fixed(8.0)),
+        Space::with_height(Length::Fixed(16.0)),
+        ui::rule(),
+        Space::with_height(Length::Fixed(10.0)),
     ]
     .into()
 }

@@ -15,6 +15,9 @@ mod paths;
 mod screens;
 mod settings;
 mod state;
+mod theme;
+mod typography;
+mod ui;
 mod widgets;
 
 use iced::{Size, Task};
@@ -35,9 +38,18 @@ fn main() -> iced::Result {
         std::process::exit(code);
     }
 
-    let result = iced::application(App::title, App::update, App::view)
+    // The application carries its own fonts rather than taking whatever the
+    // platform offers, so a column of samples lays out the same on every
+    // machine (`src/typography.rs`).
+    let mut application = iced::application(App::title, App::update, App::view)
         .subscription(App::subscription)
         .theme(App::theme)
+        .default_font(typography::BODY);
+    for face in typography::FACES {
+        application = application.font(face);
+    }
+
+    let result = application
         .window(iced::window::Settings {
             size: Size::new(1440.0, 900.0),
             min_size: Some(Size::new(960.0, 600.0)),

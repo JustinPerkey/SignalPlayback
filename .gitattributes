@@ -4,3 +4,8 @@
 # what they test, so they are stored byte for byte.
 crates/sp-csv/tests/fixtures/*.csv -text
 sample/*.csv -text
+
+# The embedded fonts are binary. Git detects that on its own, but a font
+# whose line endings were rewritten fails to parse at run time rather than at
+# check-in, so the rule is stated rather than inferred.
+crates/sp-app/assets/fonts/*.ttf binary

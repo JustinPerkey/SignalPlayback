@@ -4,8 +4,8 @@
 use std::fmt;
 
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, pick_list, row, scrollable, text,
-    text_input, Column, Space,
+    button, checkbox, column, container, pick_list, row, scrollable, text, text_input, Column,
+    Space,
 };
 use iced::{Alignment, Element, Length, Task};
 use sp_core::pulse::normalise_key;
@@ -13,6 +13,8 @@ use sp_core::{PropKind, PropScope, PropertyDef};
 use sp_store::{props, Store};
 
 use crate::jobs;
+use crate::typography;
+use crate::ui;
 
 /// The kinds a user can pick in the form; each maps onto a [`PropKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -336,28 +338,35 @@ impl State {
         let form = container(self.form_view())
             .width(Length::Fixed(360.0))
             .height(Length::Fill)
-            .padding([12, 16])
-            .style(container::bordered_box);
+            .padding([16, 16])
+            .style(ui::panel);
         row![list, form].height(Length::Fill).into()
     }
 
     fn definition_list(&self) -> Element<'_, Message> {
-        let mut list = column![text("Property definitions").size(22)].spacing(6);
+        let mut list = column![text("Property definitions")
+            .size(typography::TITLE_SIZE)
+            .font(typography::TITLE)]
+        .spacing(6);
         if let Some(error) = &self.error {
-            list = list.push(text(error).size(13).style(text::danger));
+            list = list.push(text(error).size(typography::BODY_SIZE).style(text::danger));
         }
         if let Some(notice) = &self.notice {
-            list = list.push(text(notice).size(13).style(text::success));
+            list = list.push(
+                text(notice)
+                    .size(typography::BODY_SIZE)
+                    .style(text::success),
+            );
         }
         if self.defs.is_empty() {
-            list = list.push(
-                text(
-                    "No properties declared yet. Declare one on the right; imported columns \
-                      can then be bound to it.",
-                )
-                .size(13)
-                .style(text::secondary),
-            );
+            list = list
+                .push(Space::with_height(Length::Fixed(8.0)))
+                .push(ui::empty(
+                    "No properties are declared yet.",
+                    "Declare one on the right and an imported column can be bound to it — that \
+                 is what turns a header the file happened to carry into a field the whole \
+                 library can be searched on.",
+                ));
             return list.into();
         }
 
@@ -369,13 +378,12 @@ impl State {
         .into_iter()
         .zip(widths)
         {
-            head = head.push(
-                container(text(label).size(11).style(text::secondary))
-                    .width(Length::Fixed(width))
-                    .padding([3, 6]),
-            );
+            head = head.push(ui::heading(label, width));
         }
-        list = list.push(head).push(horizontal_rule(1));
+        list = list
+            .push(Space::with_height(Length::Fixed(6.0)))
+            .push(head)
+            .push(ui::rule());
 
         for def in &self.defs {
             let cells = [
@@ -387,19 +395,37 @@ impl State {
                 def.section.clone().unwrap_or_default(),
                 if def.required { "yes" } else { "" }.to_owned(),
             ];
+            // The key and the type are the identifiers this table exists to
+            // list, so they are set as identifiers; the label, the unit and
+            // the section are words a person wrote.
             let mut line = row![].align_y(Alignment::Center);
-            for (value, width) in cells.into_iter().zip(widths) {
-                line = line.push(
-                    container(text(value).size(12))
-                        .width(Length::Fixed(width))
-                        .padding([3, 6]),
-                );
+            for (index, (value, width)) in cells.into_iter().zip(widths).enumerate() {
+                line = line.push(if matches!(index, 1 | 3) {
+                    container(
+                        text(value)
+                            .size(typography::BODY_SIZE)
+                            .font(typography::READOUT),
+                    )
+                    .width(Length::Fixed(width))
+                    .padding([3, 6])
+                    .into()
+                } else {
+                    ui::cell(value, width)
+                });
             }
+            // Removing a definition is destructive, so it says so in colour —
+            // but a filled red button on every row would make the table read
+            // as a list of things to delete.
             line = line.push(
-                button(text("Remove").size(11))
-                    .padding([2, 8])
-                    .style(button::danger)
-                    .on_press(Message::Delete(def.scope, def.key.clone())),
+                button(
+                    text("Remove")
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::LABEL)
+                        .style(text::danger),
+                )
+                .padding([2, 8])
+                .style(button::text)
+                .on_press(Message::Delete(def.scope, def.key.clone())),
             );
             list = list.push(line);
         }
@@ -409,23 +435,28 @@ impl State {
     fn form_view(&self) -> Element<'_, Message> {
         let form = &self.form;
         fn field<'a>(label: &'static str, input: Element<'a, Message>) -> Column<'a, Message> {
-            column![text(label).size(12).style(text::secondary), input].spacing(3)
+            column![ui::caption(label), input].spacing(4)
         }
 
         let mut form_col = column![
-            text("New property").size(16),
+            text("New property")
+                .size(typography::HEADING_SIZE)
+                .font(typography::HEADING),
             field(
                 "Label",
                 text_input("PRF", &form.label)
                     .on_input(Message::LabelChanged)
-                    .size(13)
+                    .size(typography::BODY_SIZE)
                     .into()
             ),
             field(
                 "Key (snake_case; derived from the label if blank)",
+                // A key is an identifier the store will hold verbatim, so it
+                // is typed in the face identifiers are shown in.
                 text_input("prf_hz", &form.key)
                     .on_input(Message::KeyChanged)
-                    .size(13)
+                    .size(typography::BODY_SIZE)
+                    .font(typography::READOUT)
                     .into()
             ),
             field(
@@ -435,14 +466,14 @@ impl State {
                     Some(ScopeChoice(form.scope)),
                     Message::ScopePicked
                 )
-                .text_size(13)
+                .text_size(typography::BODY_SIZE)
                 .width(Length::Fill)
                 .into()
             ),
             field(
                 "Type",
                 pick_list(KindChoice::ALL, Some(form.kind), Message::KindPicked)
-                    .text_size(13)
+                    .text_size(typography::BODY_SIZE)
                     .width(Length::Fill)
                     .into()
             ),
@@ -454,7 +485,7 @@ impl State {
                 "Choices (comma separated)",
                 text_input("nrz, manchester", &form.variants)
                     .on_input(Message::VariantsChanged)
-                    .size(13)
+                    .size(typography::BODY_SIZE)
                     .into(),
             ));
         }
@@ -464,20 +495,20 @@ impl State {
                 "Unit",
                 text_input("Hz", &form.unit)
                     .on_input(Message::UnitChanged)
-                    .size(13)
+                    .size(typography::BODY_SIZE)
                     .into(),
             ))
             .push(field(
                 "Section (groups fields in the editor)",
                 text_input("Timing", &form.section)
                     .on_input(Message::SectionChanged)
-                    .size(13)
+                    .size(typography::BODY_SIZE)
                     .into(),
             ))
             .push(
                 checkbox("Required", form.required)
                     .on_toggle(Message::RequiredToggled)
-                    .text_size(13),
+                    .text_size(typography::BODY_SIZE),
             )
             .push(Space::with_height(Length::Fixed(4.0)))
             .push(
@@ -487,7 +518,7 @@ impl State {
                     } else {
                         "Add property"
                     })
-                    .size(13),
+                    .size(typography::BODY_SIZE),
                 )
                 .padding([7, 14])
                 .style(button::primary)
