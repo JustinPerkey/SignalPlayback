@@ -120,6 +120,10 @@ pub struct Settings {
     pub decimation: Quality,
     /// Bins in the Inspector's histogram.
     pub histogram_bins: usize,
+    /// Native libraries this installation may load as external stages
+    /// (§9.9). Loading one runs its code in this process, so the list is
+    /// consent: a library is here because the user added this file.
+    pub external_libraries: Vec<PathBuf>,
 }
 
 impl Default for Settings {
@@ -132,6 +136,7 @@ impl Default for Settings {
             retention: Retention::default(),
             decimation: Quality::default(),
             histogram_bins: DEFAULT_BINS,
+            external_libraries: Vec::new(),
         }
     }
 }
@@ -188,6 +193,10 @@ impl Settings {
             self.default_sample_rate_hz = DEFAULT_SAMPLE_RATE_HZ;
         }
         self.histogram_bins = self.histogram_bins.clamp(MIN_BINS, MAX_BINS);
+        // A path listed twice would load one library and then fail to
+        // register it a second time, reported as an error against a list the
+        // user did not knowingly write.
+        self.external_libraries.dedup();
         if let Retention::Keep(0) = self.retention {
             // Keeping nothing would delete a run the moment it finished, which
             // no user means by "retention".
@@ -227,6 +236,7 @@ mod tests {
             retention: Retention::Keep(5),
             decimation: Quality::Fine,
             histogram_bins: 128,
+            external_libraries: vec![PathBuf::from("/opt/vendor/libeq.so")],
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);

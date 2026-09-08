@@ -3648,6 +3648,7 @@ dependencies = [
  "sp-csv",
  "sp-dsp",
  "sp-engine",
+ "sp-ext",
  "sp-gen",
  "sp-proc",
  "sp-store",
@@ -3705,6 +3706,31 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
+]
+
+[[package]]
+name = "sp-ext"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "libloading 0.8.9",
+ "serde",
+ "serde_json",
+ "sp-core",
+ "sp-dsp",
+ "sp-ext-sample",
+ "sp-proc",
+ "sp-store",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "sp-ext-sample"
+version = "1.0.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

@@ -248,7 +248,7 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        let (artifacts, stages) = registries();
+        let (artifacts, stages) = registries(&[]);
         Self {
             artifacts,
             stages,
@@ -294,15 +294,15 @@ impl Default for State {
 /// The registries the screen reads schemas and stage labels out of. A
 /// mis-declared built-in is a bug in `sp-dsp`, so it is logged and the screen
 /// falls back to showing kinds rather than labels.
-fn registries() -> (ArtifactRegistry, StageRegistry) {
+fn registries(libraries: &[std::path::PathBuf]) -> (ArtifactRegistry, StageRegistry) {
     let artifacts = sp_dsp::artifact_registry().unwrap_or_else(|error| {
         tracing::error!(%error, "a built-in artifact is mis-declared");
         ArtifactRegistry::new()
     });
-    let stages = sp_dsp::registry().unwrap_or_else(|error| {
-        tracing::error!(%error, "a built-in stage is mis-declared");
-        StageRegistry::new()
-    });
+    // A library that will not load is reported on the Settings screen; here
+    // it only means a recorded external stage shows by kind rather than by
+    // label, which is the right degradation for a screen about old runs.
+    let (stages, _) = crate::stages::registry(libraries);
     (artifacts, stages)
 }
 
@@ -360,6 +360,14 @@ impl State {
     /// reduction uses it.
     pub fn set_quality(&mut self, quality: Quality) {
         self.quality = quality;
+    }
+
+    /// Adopts the external stage libraries from Settings, so a run that used
+    /// one shows its stage by label rather than by kind (§9.9).
+    pub fn set_libraries(&mut self, libraries: &[std::path::PathBuf]) {
+        let (artifacts, stages) = registries(libraries);
+        self.artifacts = artifacts;
+        self.stages = stages;
     }
 
     /// Opens `run`, and diffs it against `against` when one is given — what

@@ -132,6 +132,8 @@ impl App {
         self.import.set_default_mode(settings.import_mode);
         self.scope.set_quality(settings.decimation);
         self.results.set_quality(settings.decimation);
+        self.pipeline.set_libraries(&settings.external_libraries);
+        self.results.set_libraries(&settings.external_libraries);
         self.inspector
             .set_bins(settings.histogram_bins, self.store.as_ref())
             .map(Message::Inspector)

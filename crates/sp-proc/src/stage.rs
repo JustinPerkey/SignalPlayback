@@ -532,6 +532,17 @@ pub trait Stage: Send + Sync {
     /// processed, so a typo costs nothing but the error.
     fn configure(&mut self, params: &ParamSet) -> Result<(), ConfigError>;
 
+    /// Extra identity this instance contributes to its cache key, beyond the
+    /// kind, version and parameters the descriptor already accounts for.
+    ///
+    /// A compiled stage has none: its behaviour is pinned by the version it
+    /// declares. An external stage returns the hash of the library file, so
+    /// recompiling the library invalidates its cached output and nothing
+    /// else's (§9.9).
+    fn cache_salt(&self) -> Option<String> {
+        None
+    }
+
     /// Called once before this instance's first group.
     fn begin_run(&mut self, _ctx: &RunCtx) -> Result<(), StageError> {
         Ok(())
