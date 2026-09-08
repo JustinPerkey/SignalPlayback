@@ -11,6 +11,7 @@
 
 use crate::typography;
 use crate::ui;
+use crate::widgets::glyph;
 use iced::advanced::text::Shaping;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Text};
@@ -210,25 +211,26 @@ fn draw_table<'a, M: Clone + 'a>(
 
     let mut header_row = row![].spacing(4);
     for (field, header, _) in &headers {
-        let marker = match pane.sort {
-            Some(sort) if sort.field == *field => {
-                if sort.ascending {
-                    " ▲"
-                } else {
-                    " ▼"
-                }
-            }
-            _ => "",
-        };
         // The column the table is sorted on is the one piece of state the
-        // header carries, so it is the one heading in the full text colour.
+        // header carries, so it is the one heading in the full text colour,
+        // and the one that carries a marker. The marker is drawn rather than
+        // set: no face this application ships has a triangle in it.
         let sorted = matches!(pane.sort, Some(sort) if sort.field == *field);
         header_row = header_row.push(
-            button(ui::column_label(format!("{header}{marker}"), sorted))
-                .padding([2.0, 4.0])
-                .style(button::text)
-                .width(Length::Fill)
-                .on_press(on_sort(field.clone())),
+            button(
+                row![ui::column_label(header.clone(), sorted)]
+                    .push_maybe(
+                        pane.sort
+                            .filter(|sort| sort.field == *field)
+                            .map(|sort| glyph::sort_marker(sort.ascending)),
+                    )
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+            )
+            .padding([2.0, 4.0])
+            .style(button::text)
+            .width(Length::Fill)
+            .on_press(on_sort(field.clone())),
         );
     }
 
@@ -328,7 +330,7 @@ fn diff_summary<'a, M: 'a>(diff: &[FieldDiff]) -> Element<'a, M> {
             .map_or_else(String::new, |row| format!(", first at row {row}"));
         list = list.push(
             text(format!(
-                "{}: {} row{} differ, max |Δ| {:.6}{first}",
+                "{}: {} row{} differ, max |error| {:.6}{first}",
                 field.field,
                 field.mismatches,
                 if field.mismatches == 1 { "" } else { "s" },

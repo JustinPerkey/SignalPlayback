@@ -30,6 +30,7 @@ use sp_store::{library, Store};
 use crate::jobs;
 use crate::typography;
 use crate::ui;
+use crate::widgets::glyph;
 use crate::widgets::scope::{self as canvas_scope, Action, Caches, Layout, TraceView, PALETTE};
 
 /// Traces the scope will hold at once. Past this the palette repeats and the
@@ -821,12 +822,13 @@ impl State {
             let colour = PALETTE[trace.colour_index % PALETTE.len()];
             let header =
                 row![
-                    container(
-                        text("■")
-                            .size(typography::BODY_SIZE)
-                            .style(move |_: &Theme| text::Style {
-                                color: Some(colour)
-                            })
+                    // The swatch is the trace's own colour, so it is the
+                    // one mark on the screen that does not take a theme
+                    // token: it stands for the line it is drawn beside.
+                    glyph::mark(
+                        glyph::Mark::Swatch,
+                        glyph::MEDIUM,
+                        glyph::Ink::Fixed(colour)
                     ),
                     button(text(&trace.signal.name).size(typography::BODY_SIZE).font(
                         if selected {
@@ -842,7 +844,7 @@ impl State {
                     checkbox("", trace.visible)
                         .size(14)
                         .on_toggle(move |_| Message::ToggleVisible(index)),
-                    button(text("✕").size(typography::LABEL_SIZE))
+                    button(text("×").size(typography::LABEL_SIZE))
                         .padding([1.0, 5.0])
                         .style(button::text)
                         .on_press(Message::Remove(index)),
@@ -947,16 +949,15 @@ impl State {
         let playing = self.is_playing();
         let has_content = !self.transport.range().is_empty();
 
-        let play: Element<'_, Message> =
-            button(text(if playing { "❚❚ Pause" } else { "▶ Play" }).size(typography::BODY_SIZE))
-                .padding([4.0, 12.0])
-                .style(button::primary)
-                .on_press_maybe(has_content.then_some(if playing {
-                    Message::Pause
-                } else {
-                    Message::Play
-                }))
-                .into();
+        let play: Element<'_, Message> = button(ui::transport_label(playing))
+            .padding([4.0, 12.0])
+            .style(button::primary)
+            .on_press_maybe(has_content.then_some(if playing {
+                Message::Pause
+            } else {
+                Message::Play
+            }))
+            .into();
 
         let scrub = slider(
             0.0..=1.0,
@@ -970,7 +971,7 @@ impl State {
             column![
                 row![
                     play,
-                    button(text("■ Stop").size(typography::BODY_SIZE))
+                    button(ui::transport_stop())
                         .padding([4.0, 10.0])
                         .style(button::secondary)
                         .on_press_maybe(has_content.then_some(Message::Stop)),

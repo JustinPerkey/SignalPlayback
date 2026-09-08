@@ -516,7 +516,7 @@ impl App {
             Space::with_width(Length::Fill),
         ]
         .push_maybe(screen.shortcut().map(|digit| {
-            text(format!("⌃{digit}"))
+            text(format!("Ctrl {digit}"))
                 .size(typography::LABEL_SIZE)
                 .font(typography::READOUT)
                 .style(ui::dim)

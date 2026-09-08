@@ -855,7 +855,7 @@ fn draw_logic(
     );
 }
 
-/// A 1, 2 or 5 × 10ⁿ step that puts roughly `target` gridlines across `span`.
+/// A 1, 2 or 5 x 10^n step that puts roughly `target` gridlines across `span`.
 #[must_use]
 pub fn nice_step(span: f64, target: f64) -> f64 {
     if !(span.is_finite() && span > 0.0) || target <= 0.0 {

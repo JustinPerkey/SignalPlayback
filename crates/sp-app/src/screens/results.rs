@@ -1519,17 +1519,15 @@ impl State {
 
         container(
             row![
-                button(
-                    text(if playing { "❚❚ Pause" } else { "▶ Play" }).size(typography::BODY_SIZE)
-                )
-                .padding([4.0, 12.0])
-                .style(button::primary)
-                .on_press_maybe(has_content.then_some(if playing {
-                    Message::Pause
-                } else {
-                    Message::Play
-                })),
-                button(text("■ Stop").size(typography::BODY_SIZE))
+                button(ui::transport_label(playing))
+                    .padding([4.0, 12.0])
+                    .style(button::primary)
+                    .on_press_maybe(has_content.then_some(if playing {
+                        Message::Pause
+                    } else {
+                        Message::Play
+                    })),
+                button(ui::transport_stop())
                     .padding([4.0, 10.0])
                     .style(button::secondary)
                     .on_press_maybe(has_content.then_some(Message::Stop)),
