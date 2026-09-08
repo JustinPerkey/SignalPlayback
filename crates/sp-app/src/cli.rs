@@ -300,7 +300,15 @@ fn usage(message: &str) -> i32 {
 /// happened and failed returns [`FAILED`].
 fn run_headless(options: &Args) -> Result<i32, String> {
     let store = open(&options.library)?;
-    let registry = sp_dsp::registry().map_err(|error| error.to_string())?;
+    // A headless run loads the same external stages the app would: the
+    // settings file is where the user's consent to load them lives (§9.9).
+    let settings = crate::paths::settings_file()
+        .map(|path| crate::settings::Settings::load(&path))
+        .unwrap_or_default();
+    let (registry, errors) = crate::stages::registry(&settings.external_libraries);
+    for error in &errors {
+        eprintln!("signalplayback: {error}");
+    }
 
     let name = options
         .pipeline

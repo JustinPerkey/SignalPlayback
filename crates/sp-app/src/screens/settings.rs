@@ -96,6 +96,9 @@ pub enum Message {
     Sweep,
     Swept(Result<usize, String>),
     UseHistogramBins(usize),
+    AddExternalLibrary,
+    ExternalLibraryChosen(Option<PathBuf>),
+    RemoveExternalLibrary(PathBuf),
 }
 
 impl State {
@@ -208,6 +211,57 @@ impl State {
                 self.library_request = Some(None);
                 Task::none()
             }
+            Message::AddExternalLibrary => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Allow a native stage library")
+                        .add_filter("Native library", &["dll", "so", "dylib"])
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                Message::ExternalLibraryChosen,
+            ),
+            Message::ExternalLibraryChosen(path) => {
+                let Some(path) = path else {
+                    return Task::none();
+                };
+                if self.settings.external_libraries.contains(&path) {
+                    self.notice = Some("That library is already allowed.".to_owned());
+                    return Task::none();
+                }
+                // Loading is attempted now, in front of the user who chose the
+                // file, rather than silently at the next run (§9.9).
+                let mut allowed = self.settings.external_libraries.clone();
+                allowed.push(path.clone());
+                match crate::stages::open(&path, &allowed) {
+                    Ok(library) => {
+                        self.settings.external_libraries = allowed;
+                        self.changed = true;
+                        self.error = None;
+                        self.notice = Some(format!(
+                            "Loaded {} — it is now in the stage palette.",
+                            library.descriptor().label
+                        ));
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                Task::none()
+            }
+            Message::RemoveExternalLibrary(path) => {
+                self.settings
+                    .external_libraries
+                    .retain(|entry| entry != &path);
+                self.changed = true;
+                // The library stays mapped into this process until it exits;
+                // what changes now is that nothing new will use it, and the
+                // next start will not load it at all.
+                self.notice = Some(
+                    "Removed. The stage disappears from the palette when the app restarts."
+                        .to_owned(),
+                );
+                Task::none()
+            }
             Message::Refresh => store.map_or_else(Task::none, |store| self.load(store)),
             Message::Storage(result) => {
                 match result {
@@ -272,6 +326,8 @@ impl State {
             section_rule(),
             self.storage_section(),
             section_rule(),
+            self.external_section(),
+            section_rule(),
             keyboard_section(),
         ]
         .spacing(10)
@@ -316,6 +372,48 @@ impl State {
         }
         section = section.push(actions);
         section.into()
+    }
+
+    /// The libraries this installation may load as external stages (§9.9).
+    ///
+    /// Worded as consent rather than configuration, because that is what it
+    /// is: a library listed here runs its own code inside this process.
+    fn external_section(&self) -> Element<'_, Message> {
+        let mut section = column![
+            heading("External stages"),
+            text(
+                "A native library listed here is loaded as a pipeline stage. Its code runs                  inside SignalPlayback, so add only libraries you trust."
+            )
+            .size(typography::LABEL_SIZE)
+            .style(ui::dim),
+        ]
+        .spacing(6);
+
+        if self.settings.external_libraries.is_empty() {
+            section = section.push(
+                text("No external libraries are allowed.")
+                    .size(typography::BODY_SIZE)
+                    .style(ui::dim),
+            );
+        } else {
+            for path in &self.settings.external_libraries {
+                section = section.push(
+                    row![
+                        text(path.display().to_string())
+                            .size(typography::BODY_SIZE)
+                            .font(typography::READOUT)
+                            .width(Length::Fill),
+                        command("Remove", Message::RemoveExternalLibrary(path.clone())),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+
+        section
+            .push(command("Allow a library…", Message::AddExternalLibrary))
+            .into()
     }
 
     fn appearance_section(&self) -> Element<'_, Message> {

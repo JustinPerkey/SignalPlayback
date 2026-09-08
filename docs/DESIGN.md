@@ -1,10 +1,17 @@
 # SignalPlayback — Design Document
 
-**Status:** v1.0
-**Date:** 2026-09-07
+**Status:** v1.1
+**Date:** 2026-09-08
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v1.1** — M9 is built, so §9.9 now describes what exists rather than what was
+> proposed: the disposition array is per input signal and `sp_output` carries its count,
+> the host lends `f64`, provenance is a per-stage diagnostic, and a `sequential` library
+> gets mutual exclusion rather than ordered delivery. §9.9 gains a "Settled during M9"
+> table, §4.1 the real `sp-ext` layout and `sp-ext-sample`, §12.4 the allowed-library
+> setting, and open question 8 is no longer a blocker.
+>
 > **Changes in v1.0** — First non-draft revision. M0–M8 are built, so the **[MVP]** scope in
 > §15.3 is what v1 ships and the milestone table in §16 is closed; work from here is the
 > **[V1.x]** track, tracked as post-v1 milestones in §16.1. §9.9 added: an **external
@@ -178,9 +185,13 @@ SignalPlayback/
     │   ├── cache.rs           #   Content-hash keyed stage-output reuse
     │   └── compare.rs         #   Run-vs-baseline diffing, assertions
     ├── sp-ext/                # External stages: native-library loading over the §9.9 C ABI.
-    │   ├── abi.rs            #   Flat C structs, version negotiation
-    │   ├── library.rs        #   Load, describe, marshal a group in / output out
-    │   └── isolated.rs       #   Out-of-process host for suspect libraries
+    │   ├── abi.rs             #   Flat C structs, symbol names, version negotiation
+    │   ├── descriptor.rs      #   The library's published JSON -> StageDescriptor
+    │   ├── allow.rs           #   The paths this installation may load
+    │   ├── library.rs         #   Load, resolve, hash; one loaded file
+    │   └── stage.rs           #   Marshal a group in, read an output back
+    ├── sp-ext-sample/         # A conforming library, built as a cdylib: the ABI's
+    │                          # reference implementation, and what sp-ext's tests load.
     ├── sp-dsp/                # Built-in Stage implementations. Depends on sp-proc.
     │   ├── condition.rs       #   Detrend, DC block, normalise, resample, window
     │   ├── filter.rs          #   FIR/IIR low/high/band/notch
@@ -1357,7 +1368,7 @@ const char* sp_describe(void);
 
 typedef struct {                     /* one signal, borrowed from the host */
     const char* name;
-    uint8_t     dtype;               /* f32 | f64 | i16 | i32 | c64 | c128 | u8 */
+    uint8_t     dtype;               /* the host lends f64; a library returns f32 or f64 */
     uint8_t     domain;
     const void* data;                /* host-owned, valid for this call only */
     uint64_t    len;
@@ -1375,9 +1386,13 @@ typedef struct {                     /* one group = the unit of work */
 } sp_group;
 
 typedef struct {                     /* what the library produced */
-    sp_signal*  signals;             /* library-owned until sp_free_output */
+    sp_signal*  signals;             /* library-owned until sp_free_output:
+                                        the replacements first, in input order,
+                                        then any added signals */
     uint32_t    signal_count;
-    const uint8_t* dispositions;     /* replaced | added | passthrough | dropped */
+    const uint8_t* dispositions;     /* one per INPUT signal, in input order:
+                                        0 replaced | 1 passthrough | 2 dropped */
+    uint32_t    disposition_count;   /* must equal the group's signal_count */
     const char* artifacts_json;      /* typed outputs, §9.4 */
     const char* metrics_json;
     const char* diagnostics_json;
@@ -1403,18 +1418,24 @@ A non-zero return is a `StageError` carrying the message the library wrote into 
 - **One group per call, in pipeline order.** Nothing about the group-at-a-time model
   changes: the loop in §9.5 calls `sp_process` where it would call `Stage::process`.
 - **Concurrency is declared, not assumed.** The descriptor says `thread_safe` (host may run
-  groups in parallel against separate handles), `sequential` (one handle, groups in order —
-  the case that carries adaptive state between segments of a train, open question 7), or
-  `process_isolated`. Default is `sequential`, the safe reading of an unknown library.
+  groups in parallel against separate handles), `sequential` (one call at a time), or
+  `process_isolated`. Default is `sequential`, the safe reading of an unknown library. What
+  a `sequential` library gets is mutual exclusion, not ordering: a library-wide lock is
+  taken around every call, so it sees one group at a time but not necessarily in group
+  order. Ordered delivery is the cross-group state question of §17.7 and waits for it.
 - **Isolation is opt-in.** In-process is the fast path and the default; a segfault there
   takes the app with it. `process_isolated` runs the library inside a small host binary
   (`sp-stage-host`) that speaks the same ABI over shared memory, so a crash fails one group
-  with a diagnostic instead of losing the run. Use it while a library is still suspect.
-- **Caching.** The cache key folds the library's file hash and its declared version
-  alongside the usual stage kind and params, so recompiling the DLL invalidates its outputs
-  and nothing else. A library that declares itself impure opts out entirely.
-- **Reproducibility.** `run_stage.metrics_json` records the resolved library path, its
-  BLAKE3 hash and its declared version, so a run says exactly which build produced it (G8).
+  with a diagnostic instead of losing the run — that is M14. Until then the mode is
+  accepted and recorded, and runs in process like the others.
+- **Caching.** `Stage::cache_salt` is the seam: a compiled stage adds nothing, an external
+  one returns its library file's BLAKE3 hash, and the key folds it in alongside the usual
+  kind, version and params. Recompiling the DLL therefore invalidates its outputs and
+  nothing else. A library that declares itself impure opts out entirely.
+- **Reproducibility.** Every group's `run_stage` row carries a diagnostic naming the stage
+  kind, the declared version, the resolved path and the file hash, so a run says exactly
+  which build produced it (G8). A diagnostic rather than a metric, because a path is not a
+  number and diagnostics are already the per-stage text the results screen shows.
 
 #### Limits
 
@@ -1423,6 +1444,17 @@ against the declared ports, output disposition count against input signal count 
 trusts the rest. Loading a native library is running arbitrary code in the app's address
 space; the settings screen keeps an explicit list of allowed library paths, and loading is
 a deliberate user action rather than a scan of a plugin directory.
+
+#### Settled during M9
+
+| Question | Answer | Reasoning |
+|----------|--------|-----------|
+| How does an output say what happened to each input? | `dispositions` is one byte per **input** signal, in input order; `signals` carries the replacement buffers first, in that same order, then any additions | The §9.4 rule that every input is accounted for then holds by construction rather than by trusting the library, and `sp_signal` needs no ordinal field |
+| What dtype crosses the boundary? | The host lends `f64`; a library may return `f32` or `f64`, and any other dtype is refused by name rather than reinterpreted | §17.10 has stages doing their arithmetic in `f64` anyway. The dtype byte stays in the struct, so lending native buffers later is a host change rather than an ABI break |
+| What may an external stage be called? | Every external kind must start with `ext.`, checked at load time | A library then cannot shadow a built-in, and a recorded run says at a glance that its stage came from outside this build |
+| How does a loaded stage reach the registry? | `StageRegistry::register_loaded`, which takes a descriptor and a closure rather than a `fn` pointer | An external stage's factory has to carry its library along with it; the compiled path is untouched |
+| Who owns a descriptor, which must be `'static`? | The strings and slices parsed from the library's JSON are leaked, once per library per process | A descriptor genuinely lives as long as the library it describes, and a library is never unloaded once a run has referenced it |
+| Is a library loaded per screen, or per run? | Once per process, cached by path, shared by every registry | Loading maps code in and leaks a descriptor; doing it per registry would do both repeatedly for one file |
 
 ---
 
@@ -1718,6 +1750,7 @@ logs:
 | Retention | Finished runs kept per pipeline; the oldest go first. A run a baseline names is never deleted, and neither is one still going. Enforced in the window only: a headless run keeps everything it records, because CI is not the place to lose evidence |
 | Decimation quality | Shifts the reducer's automatic level choice by one either way (§5.4). It never promotes a level to a raw read: that bound is what keeps a frame inside its budget, not a preference |
 | Histogram bins | Resolution of the Inspector's histogram |
+| Allowed external libraries | The native libraries this installation may load as stages (§9.9). The list is consent rather than configuration: a library is on it because the user picked that file, and the load is attempted there and then, so a failure is reported beside the path that caused it. A headless run reads the same list, so CI loads what the window would |
 
 Every control writes the file as it changes — there is nothing here that is only
 half-decided, so there is no Save button. A settings file that will not parse, or a field
@@ -1986,7 +2019,7 @@ not by section number.
 
 | Phase | Deliverable | Exit criteria |
 |-------|-------------|---------------|
-| **M9 — External stages** | `sp-ext`, the §9.9 C ABI, library allow-list in settings, sample conforming DLL | A sample DLL runs as a stage over one group at a time; its path, hash and version are recorded in `run_stage` (G8) |
+| **M9 — External stages** (done) | `sp-ext`, the §9.9 C ABI, library allow-list in settings, sample conforming DLL | A sample DLL runs as a stage over one group at a time; its path, hash and version are recorded in `run_stage` (G8) |
 | **M10 — Stage cache** | Content-hash stage cache, per-stage retention policy | Editing stage *n* re-runs only *n…end*; a cached run and a cold run produce identical outputs |
 | **M11 — Stage families** | Detection, symbol-decode and measurement stages; stage conformance harness | Each family has a stage that runs end-to-end and passes the conformance harness |
 | **M12 — Generation** | Chirps, AM/FM/PM, `f(t)` expression node, PRBS, impairment ladders | A ladder produces one group per SNR rung, deterministically (G3) |
@@ -2037,11 +2070,12 @@ noted.
    `sequential` flag in `StageDescriptor`, plus a scope that runs a stage over a whole
    train, covers it cheaply, but only if it goes in before the scheduler is written
    (**decide at M5**).
-8. ⚠ **External-stage ABI shape (§9.9).** The C ABI assumes one group per call with
+8. **External-stage ABI shape (§9.9).** The C ABI assumes one group per call with
    borrowed input buffers and library-allocated outputs. If the libraries to be tested are
    really stream-oriented (fed pulse by pulse, holding state across calls) or expect the
-   host to allocate output buffers up front, the ABI changes shape rather than extends —
-   worth confirming against one real library before **M9**.
+   host to allocate output buffers up front, the ABI changes shape rather than extends. M9
+   built the one-group-per-call shape and a conforming sample library against it, so the
+   question is now what a real vendor library makes of it rather than what to build.
 9. **Stage output signal count.** Assumed a stage may add and drop signals freely within a
    group. If downstream stages must see a fixed signal count matching the group's declared
    `count`, that is a validation rule worth stating now.

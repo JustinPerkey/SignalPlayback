@@ -1,0 +1,21 @@
+[package]
+name = "sp-ext-sample"
+description = "A sample conforming external stage: the reference the §9.9 ABI is tested against."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Both: `cdylib` is the artifact a real external stage ships as, and `rlib`
+# lets the sp-ext tests link the same symbols in-process, so the ABI is
+# exercised without a build step in the middle.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

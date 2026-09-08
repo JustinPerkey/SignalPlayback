@@ -123,6 +123,9 @@ pub struct State {
     /// Every stage this build can run. Empty only if a built-in is
     /// mis-declared, which is a bug rather than a user error.
     registry: StageRegistry,
+    /// External stage libraries from Settings, kept so a run rebuilds the
+    /// same registry the editor validated against (§9.9).
+    libraries: Vec<std::path::PathBuf>,
     pipeline: Pipeline,
     /// The row this pipeline is saved as, once it has been saved.
     saved_id: Option<PipelineId>,
@@ -154,15 +157,10 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        let (registry, error) = match sp_dsp::registry() {
-            Ok(registry) => (registry, None),
-            Err(error) => {
-                tracing::error!(%error, "a built-in stage is mis-declared");
-                (StageRegistry::new(), Some(error.to_string()))
-            }
-        };
+        let (registry, errors) = crate::stages::registry(&[]);
         Self {
             registry,
+            libraries: Vec::new(),
             pipeline: Pipeline::new("New pipeline"),
             saved_id: None,
             saved: Vec::new(),
@@ -177,10 +175,27 @@ impl Default for State {
             job: None,
             shown: None,
             summary: None,
-            error,
+            error: errors.first().cloned(),
             notice: None,
             busy: false,
             completed: false,
+        }
+    }
+}
+
+impl State {
+    /// Adopts the external stage libraries from Settings, rebuilding the
+    /// registry so the palette lists their stages and a saved pipeline naming
+    /// one validates (§9.9).
+    pub fn set_libraries(&mut self, libraries: &[std::path::PathBuf]) {
+        if self.libraries == libraries {
+            return;
+        }
+        self.libraries = libraries.to_vec();
+        let (registry, errors) = crate::stages::registry(libraries);
+        self.registry = registry;
+        if let Some(error) = errors.first() {
+            self.error = Some(error.clone());
         }
     }
 }
@@ -715,6 +730,7 @@ impl State {
         let name = self.pipeline.name.trim().to_owned();
         let rows = self.pipeline.to_rows();
         let assertions = self.pipeline.to_assertion_rows();
+        let libraries = self.libraries.clone();
         let store = store.clone();
 
         self.job = Some(Job { progress, cancel });
@@ -735,7 +751,7 @@ impl State {
         // from inside it.
         Task::perform(
             async move {
-                let registry = sp_dsp::registry().map_err(|error| error.to_string())?;
+                let (registry, _) = crate::stages::registry(&libraries);
                 jobs::blocking(move || {
                     let id = store
                         .write(move |conn| {

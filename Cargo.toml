@@ -18,6 +18,8 @@ sp-csv = { path = "crates/sp-csv" }
 sp-gen = { path = "crates/sp-gen" }
 sp-proc = { path = "crates/sp-proc" }
 sp-dsp = { path = "crates/sp-dsp" }
+sp-ext = { path = "crates/sp-ext" }
+sp-ext-sample = { path = "crates/sp-ext-sample" }
 sp-engine = { path = "crates/sp-engine" }
 
 # GUI. Pinned to a minor version: Iced churns between releases (§18) and all
@@ -30,6 +32,10 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "blob", "cache"] }
 blake3 = "1.8"
+
+# Dynamic library loading for external stages (§9.9). Platform detail — the
+# unsafe surface is confined to sp-ext.
+libloading = "0.8"
 
 # Generation. `ChaCha12Rng` is seekable, so a noise stream is addressable by
 # sample index and a chunk renders the same as the whole range (G3).

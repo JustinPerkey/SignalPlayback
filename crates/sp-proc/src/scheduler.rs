@@ -4,7 +4,7 @@
 //! for each group  (parallel, bounded by in_flight_cap):
 //!     frame ← load(group)
 //!     for stage in pipeline:                # strictly ordered
-//!         key ← blake3(kind, version, params, input_hash)
+//!         key ← blake3(kind, version, params, salt, input_hash)
 //!         output ← cache.get(key)  or  stage.process(ctx, frame)
 //!         record(run, group, stage, output)
 //!         frame ← frame.apply(output)
@@ -445,10 +445,12 @@ fn run_group(ctx: &RunEnv<'_>, group_id: GroupId) -> Result<GroupOutcome> {
         let descriptor = instance.descriptor();
 
         let input_hash = cache::input_hash(&frame);
+        let salt = instance.cache_salt();
         let key = cache::stage_key(
             descriptor.kind,
             descriptor.version,
             &params.to_json(),
+            salt.as_deref(),
             &input_hash,
         );
 

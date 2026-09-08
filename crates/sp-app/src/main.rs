@@ -14,6 +14,7 @@ mod logging;
 mod paths;
 mod screens;
 mod settings;
+mod stages;
 mod state;
 mod theme;
 mod typography;

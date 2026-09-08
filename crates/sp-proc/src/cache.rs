@@ -44,12 +44,23 @@ pub fn input_hash(frame: &GroupFrame) -> String {
 /// The group is deliberately *not* part of the key: two groups whose signals
 /// hash the same genuinely produce the same output, and reusing it is the
 /// point of content addressing.
+///
+/// `salt` is whatever identity the stage instance adds beyond its declaration
+/// — for a compiled stage nothing, for an external one the hash of the
+/// library file behind it (`Stage::cache_salt`, §9.9).
 #[must_use]
-pub fn stage_key(kind: &str, version: u32, params_json: &str, input_hash: &str) -> String {
+pub fn stage_key(
+    kind: &str,
+    version: u32,
+    params_json: &str,
+    salt: Option<&str>,
+    input_hash: &str,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(kind.as_bytes());
     hasher.update(&version.to_le_bytes());
     hasher.update(params_json.as_bytes());
+    hasher.update(salt.unwrap_or_default().as_bytes());
     hasher.update(input_hash.as_bytes());
     hasher.finalize().to_hex().to_string()
 }
@@ -137,8 +148,8 @@ mod tests {
         // reused (§9.2).
         let inputs = input_hash(&frame(&[1.0]));
         assert_ne!(
-            stage_key("dsp.gain", 1, "{}", &inputs),
-            stage_key("dsp.gain", 2, "{}", &inputs)
+            stage_key("dsp.gain", 1, "{}", None, &inputs),
+            stage_key("dsp.gain", 2, "{}", None, &inputs)
         );
     }
 
@@ -146,12 +157,27 @@ mod tests {
     fn parameters_are_part_of_the_key() {
         let inputs = input_hash(&frame(&[1.0]));
         assert_ne!(
-            stage_key("dsp.gain", 1, r#"{"gain":2.0}"#, &inputs),
-            stage_key("dsp.gain", 1, r#"{"gain":3.0}"#, &inputs)
+            stage_key("dsp.gain", 1, r#"{"gain":2.0}"#, None, &inputs),
+            stage_key("dsp.gain", 1, r#"{"gain":3.0}"#, None, &inputs)
         );
         assert_eq!(
-            stage_key("dsp.gain", 1, r#"{"gain":2.0}"#, &inputs),
-            stage_key("dsp.gain", 1, r#"{"gain":2.0}"#, &inputs)
+            stage_key("dsp.gain", 1, r#"{"gain":2.0}"#, None, &inputs),
+            stage_key("dsp.gain", 1, r#"{"gain":2.0}"#, None, &inputs)
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_external_library_gets_a_different_key() {
+        // The stage kind, version and parameters are all unchanged when a DLL
+        // is recompiled; only the file hash moves (§9.9).
+        let inputs = input_hash(&frame(&[1.0]));
+        assert_ne!(
+            stage_key("ext.vendor.eq", 1, "{}", Some("aaaa"), &inputs),
+            stage_key("ext.vendor.eq", 1, "{}", Some("bbbb"), &inputs)
+        );
+        assert_eq!(
+            stage_key("ext.vendor.eq", 1, "{}", Some("aaaa"), &inputs),
+            stage_key("ext.vendor.eq", 1, "{}", Some("aaaa"), &inputs)
         );
     }
 

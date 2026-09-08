@@ -1,0 +1,28 @@
+[package]
+name = "sp-ext"
+description = "External stages: native libraries loaded over the §9.9 C ABI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+sp-core.workspace = true
+sp-proc.workspace = true
+blake3.workspace = true
+libloading.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+sp-ext-sample.workspace = true
+sp-dsp.workspace = true
+sp-store.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

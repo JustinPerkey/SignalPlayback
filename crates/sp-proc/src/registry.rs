@@ -11,17 +11,58 @@
 //! scheduler having to serialise groups behind it.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::stage::{Stage, StageDescriptor};
 
 /// Builds a fresh instance of one stage.
 pub type StageFactory = fn() -> Box<dyn Stage>;
 
+/// Builds a fresh instance of a stage that was not compiled into this build —
+/// an external library's stage, which has to carry the library along with it
+/// and so cannot be a bare function pointer (§9.9).
+pub type DynStageFactory = Arc<dyn Fn() -> Box<dyn Stage> + Send + Sync>;
+
+/// What makes instances of a registered kind.
+#[derive(Clone)]
+enum Maker {
+    Compiled(StageFactory),
+    Loaded(DynStageFactory),
+}
+
+impl std::fmt::Debug for Maker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Compiled(_) => "compiled",
+            Self::Loaded(_) => "loaded",
+        })
+    }
+}
+
 /// A registered stage kind.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Registration {
     pub descriptor: &'static StageDescriptor,
-    pub factory: StageFactory,
+    maker: Maker,
+}
+
+impl Registration {
+    /// A fresh instance. Every group gets its own, so a stage may keep state
+    /// across the groups it sees.
+    #[must_use]
+    pub fn create(&self) -> Box<dyn Stage> {
+        match &self.maker {
+            Maker::Compiled(factory) => factory(),
+            Maker::Loaded(factory) => factory(),
+        }
+    }
+
+    /// Whether this kind came from a loaded library rather than this build,
+    /// which is what the palette marks and what a run records.
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        matches!(self.maker, Maker::Loaded(_))
+    }
 }
 
 /// A stage was declared in a way the rest of the system cannot work with.
@@ -51,19 +92,36 @@ impl StageRegistry {
     /// the kind can never disagree with the instance it makes.
     pub fn register(&mut self, factory: StageFactory) -> Result<(), RegistryError> {
         let descriptor = factory().descriptor();
+        self.insert(descriptor, Maker::Compiled(factory))
+    }
+
+    /// Registers a stage that was loaded at run time rather than compiled in
+    /// — what `sp-ext` calls once per external library (§9.9).
+    ///
+    /// The checks are the same ones a built-in gets: a library cannot register
+    /// an inconsistent descriptor, and it cannot take a kind that is already
+    /// taken.
+    pub fn register_loaded(
+        &mut self,
+        descriptor: &'static StageDescriptor,
+        factory: DynStageFactory,
+    ) -> Result<(), RegistryError> {
+        self.insert(descriptor, Maker::Loaded(factory))
+    }
+
+    fn insert(
+        &mut self,
+        descriptor: &'static StageDescriptor,
+        maker: Maker,
+    ) -> Result<(), RegistryError> {
         if !descriptor.is_consistent() {
             return Err(RegistryError::Inconsistent(descriptor.kind.to_owned()));
         }
         if self.entries.contains_key(descriptor.kind) {
             return Err(RegistryError::Duplicate(descriptor.kind.to_owned()));
         }
-        self.entries.insert(
-            descriptor.kind,
-            Registration {
-                descriptor,
-                factory,
-            },
-        );
+        self.entries
+            .insert(descriptor.kind, Registration { descriptor, maker });
         Ok(())
     }
 
@@ -79,8 +137,8 @@ impl StageRegistry {
     }
 
     #[must_use]
-    pub fn get(&self, kind: &str) -> Option<Registration> {
-        self.entries.get(kind).copied()
+    pub fn get(&self, kind: &str) -> Option<&Registration> {
+        self.entries.get(kind)
     }
 
     #[must_use]
@@ -91,7 +149,7 @@ impl StageRegistry {
     /// A fresh instance of one kind.
     #[must_use]
     pub fn create(&self, kind: &str) -> Option<Box<dyn Stage>> {
-        self.entries.get(kind).map(|entry| (entry.factory)())
+        self.entries.get(kind).map(Registration::create)
     }
 
     #[must_use]
