@@ -1,10 +1,17 @@
 # SignalPlayback — Design Document
 
-**Status:** Draft v0.6
-**Date:** 2026-09-06
+**Status:** v1.0
+**Date:** 2026-09-07
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v1.0** — First non-draft revision. M0–M8 are built, so the **[MVP]** scope in
+> §15.3 is what v1 ships and the milestone table in §16 is closed; work from here is the
+> **[V1.x]** track, tracked as post-v1 milestones in §16.1. §9.9 added: an **external
+> stage** that hands one group at a time to a native library over a flat C ABI and reads
+> its output back as an ordinary `StageOutput`. `sp-ext` added to §4.1, the feature listed
+> under V1.x in §15.3, and the ABI shape raised as open question 8.
+>
 > **Changes in v0.6** — Written while building M8. §12.4 added for the settings file and
 > what each setting does; §12.1 says what the Inspector computes and how the Runs screen
 > hands a run to Results; §7.5 covers the command-line export and why only an imported
@@ -170,6 +177,10 @@ SignalPlayback/
     │   ├── scheduler.rs       #   Group-at-a-time execution, cancellation, progress
     │   ├── cache.rs           #   Content-hash keyed stage-output reuse
     │   └── compare.rs         #   Run-vs-baseline diffing, assertions
+    ├── sp-ext/                # External stages: native-library loading over the §9.9 C ABI.
+    │   ├── abi.rs            #   Flat C structs, version negotiation
+    │   ├── library.rs        #   Load, describe, marshal a group in / output out
+    │   └── isolated.rs       #   Out-of-process host for suspect libraries
     ├── sp-dsp/                # Built-in Stage implementations. Depends on sp-proc.
     │   ├── condition.rs       #   Detrend, DC block, normalise, resample, window
     │   ├── filter.rs          #   FIR/IIR low/high/band/notch
@@ -1315,6 +1326,104 @@ same public trait a user's algorithm would use:
 | Measurement | Statistics, THD/SNR/SINAD, pulse metrics → `Metrics` |
 | Utility | Passthrough (a labelled inspection point), split, merge, tee-to-property |
 
+### 9.9 External Stages (Native Libraries)
+
+The algorithm under test often already exists as a compiled library — a C/C++ codebase, a
+vendor SDK, MATLAB Coder or Simulink output — and rewriting it in Rust to test it defeats
+the point of the harness. So one stage kind is **`ext.native`**: it loads a DLL (`.dll` /
+`.so` / `.dylib`), hands it **one group at a time**, and reads the output back into the
+same `StageOutput` every native stage produces. From the pipeline editor, the results
+screen and the run schema it is an ordinary stage — the same parameter form, the same
+per-stage recording, the same stage rail.
+
+**Where it lives.** A new crate `sp-ext`, depending on `sp-proc` only, sits beside `sp-dsp`
+in the dependency rule. All `unsafe` FFI, library loading and buffer marshalling is
+quarantined there; `sp-proc` still knows nothing about who implements a stage. This is the
+seam §4.1 predicted, made real for one consumer rather than opened as a general plugin API.
+
+#### The ABI
+
+Flat C, no Rust types across the boundary, so any toolchain can produce a conforming
+library. Every call takes an opaque handle; every buffer is caller-described and
+callee-allocated one way only. Structs are versioned by an explicit `abi_version` the host
+checks before anything else.
+
+```c
+/* Descriptor, fetched once at load time. JSON: kind, name, version, purity,
+   thread-safety, param schema (ParamSpec, §9.2), declared ports (§9.3).
+   The host generates the parameter form from this, exactly as for a Rust stage. */
+uint32_t sp_abi_version(void);
+const char* sp_describe(void);
+
+typedef struct {                     /* one signal, borrowed from the host */
+    const char* name;
+    uint8_t     dtype;               /* f32 | f64 | i16 | i32 | c64 | c128 | u8 */
+    uint8_t     domain;
+    const void* data;                /* host-owned, valid for this call only */
+    uint64_t    len;
+    double      sample_rate_hz;
+    double      t0_s;
+    const char* attrs_json;
+} sp_signal;
+
+typedef struct {                     /* one group = the unit of work */
+    uint64_t          group_id;
+    const sp_signal*  signals;
+    uint32_t          signal_count;
+    const char*       group_json;    /* group metadata + pulse records (§6.6) */
+    const char*       inbound_json;  /* upstream artifacts on the blackboard */
+} sp_group;
+
+typedef struct {                     /* what the library produced */
+    sp_signal*  signals;             /* library-owned until sp_free_output */
+    uint32_t    signal_count;
+    const uint8_t* dispositions;     /* replaced | added | passthrough | dropped */
+    const char* artifacts_json;      /* typed outputs, §9.4 */
+    const char* metrics_json;
+    const char* diagnostics_json;
+} sp_output;
+
+sp_handle sp_open(const char* params_json, char* err, size_t err_len);
+int32_t   sp_begin_run(sp_handle, const char* run_json);
+int32_t   sp_process(sp_handle, const sp_group* in, sp_output* out,
+                     char* err, size_t err_len);
+int32_t   sp_end_run(sp_handle, sp_output* out);          /* run-level artifacts */
+void      sp_free_output(sp_handle, sp_output*);
+void      sp_close(sp_handle);
+```
+
+`sp_process` maps one-to-one onto `Stage::process`. Input buffers are borrowed — the host
+lends the group's samples for the duration of the call and the library must not retain
+them. Output buffers are allocated by the library and freed by it through `sp_free_output`
+after the host has copied them into the store, so neither side frees the other's memory.
+A non-zero return is a `StageError` carrying the message the library wrote into `err`.
+
+#### Execution
+
+- **One group per call, in pipeline order.** Nothing about the group-at-a-time model
+  changes: the loop in §9.5 calls `sp_process` where it would call `Stage::process`.
+- **Concurrency is declared, not assumed.** The descriptor says `thread_safe` (host may run
+  groups in parallel against separate handles), `sequential` (one handle, groups in order —
+  the case that carries adaptive state between segments of a train, open question 7), or
+  `process_isolated`. Default is `sequential`, the safe reading of an unknown library.
+- **Isolation is opt-in.** In-process is the fast path and the default; a segfault there
+  takes the app with it. `process_isolated` runs the library inside a small host binary
+  (`sp-stage-host`) that speaks the same ABI over shared memory, so a crash fails one group
+  with a diagnostic instead of losing the run. Use it while a library is still suspect.
+- **Caching.** The cache key folds the library's file hash and its declared version
+  alongside the usual stage kind and params, so recompiling the DLL invalidates its outputs
+  and nothing else. A library that declares itself impure opts out entirely.
+- **Reproducibility.** `run_stage.metrics_json` records the resolved library path, its
+  BLAKE3 hash and its declared version, so a run says exactly which build produced it (G8).
+
+#### Limits
+
+The host validates what it can — ABI version, descriptor schema, buffer lengths and dtypes
+against the declared ports, output disposition count against input signal count — and
+trusts the rest. Loading a native library is running arbitrary code in the app's address
+space; the settings screen keeps an explicit list of allowed library paths, and loading is
+a deliberate user action rather than a scan of a plugin directory.
+
 ---
 
 ## 10. Results, Artifacts and Inspection
@@ -1740,7 +1849,10 @@ larger effort · **[Stretch]** speculative.
 - **[V2]** Branching pipelines (a real DAG) with a graph editor.
 - **[V2]** Per-stage breakpoints: pause a run at a stage and inspect before continuing.
 - **[V2]** Stage-level unit fixtures — pin one group's input as a stage's test case.
-- **[V2]** Plugin stages loaded from a dynamic library.
+- **[V1.x]** External stage: a native library (DLL/.so) fed one group at a time over a
+  flat C ABI, recorded like any other stage (§9.9).
+- **[V1.x]** Process-isolated external stages — a crashing library fails one group, not the run.
+- **[V2]** Plugin stages beyond the §9.9 ABI — custom artifact kinds and import formats.
 - **[V2]** Distributed / multi-process run execution for large datasets.
 - **[Stretch]** Stage authored in an embedded script for quick experiments.
 - **[Stretch]** Auto-tuning — search stage parameters against an objective metric.
@@ -1862,6 +1974,28 @@ larger effort · **[Stretch]** speculative.
 M2 and M3 are independent after M1 and can proceed in parallel. M5 depends on M1 (storage)
 and benefits from M3 (test inputs) but not from M4; M6 depends on both M4 and M5.
 
+**M0–M8 are delivered.** Every exit criterion above is met, which is what makes this
+revision v1.0 rather than another draft. The table is closed: nothing is added to it, and
+later work is a post-v1 milestone below.
+
+### 16.1 Post-v1 Track
+
+The **[V1.x]** entries in §15.3 are grouped into milestones the same way, each a
+self-contained deliverable off the v1 baseline. Order is by what unblocks the most work,
+not by section number.
+
+| Phase | Deliverable | Exit criteria |
+|-------|-------------|---------------|
+| **M9 — External stages** | `sp-ext`, the §9.9 C ABI, library allow-list in settings, sample conforming DLL | A sample DLL runs as a stage over one group at a time; its path, hash and version are recorded in `run_stage` (G8) |
+| **M10 — Stage cache** | Content-hash stage cache, per-stage retention policy | Editing stage *n* re-runs only *n…end*; a cached run and a cold run produce identical outputs |
+| **M11 — Stage families** | Detection, symbol-decode and measurement stages; stage conformance harness | Each family has a stage that runs end-to-end and passes the conformance harness |
+| **M12 — Generation** | Chirps, AM/FM/PM, `f(t)` expression node, PRBS, impairment ladders | A ladder produces one group per SNR rung, deterministically (G3) |
+| **M13 — Ingest & UX** | Drag-and-drop and multi-file import, watch folder, command palette, configurable shortcuts | A watched folder imports without user action; every action is reachable from the palette |
+| **M14 — Isolation** | `sp-stage-host`, shared-memory transport, `process_isolated` execution | A library that segfaults fails one group with a diagnostic and the run continues |
+
+M9 comes first because the external stage is the reason the harness exists for algorithms
+that are not written in Rust, and M14 only makes sense once M9 has a library to isolate.
+
 ---
 
 ## 17. Assumptions and Open Questions
@@ -1903,14 +2037,19 @@ noted.
    `sequential` flag in `StageDescriptor`, plus a scope that runs a stage over a whole
    train, covers it cheaply, but only if it goes in before the scheduler is written
    (**decide at M5**).
-8. **Stage output signal count.** Assumed a stage may add and drop signals freely within a
+8. ⚠ **External-stage ABI shape (§9.9).** The C ABI assumes one group per call with
+   borrowed input buffers and library-allocated outputs. If the libraries to be tested are
+   really stream-oriented (fed pulse by pulse, holding state across calls) or expect the
+   host to allocate output buffers up front, the ABI changes shape rather than extends —
+   worth confirming against one real library before **M9**.
+9. **Stage output signal count.** Assumed a stage may add and drop signals freely within a
    group. If downstream stages must see a fixed signal count matching the group's declared
    `count`, that is a validation rule worth stating now.
-9. **Retention default.** `Always` is assumed, since content addressing makes passthrough
+10. **Retention default.** `Always` is assumed, since content addressing makes passthrough
    free. A pipeline whose every stage rewrites every sample of a 100 M-sample signal will
    still cost ~400 MB per stage per group. Confirm whether the default should be
    `Always` with a size cap, or `OnFailure` with opt-in.
-10. **Artifact size ceiling.** 64 KB inline / blob beyond that is a guess. A per-group
+11. **Artifact size ceiling.** 64 KB inline / blob beyond that is a guess. A per-group
    spectrogram at fine resolution can reach hundreds of MB; if that is routine, the
    spectrogram artifact should store a decimated pyramid the way signals do.
 
