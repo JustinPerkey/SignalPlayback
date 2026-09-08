@@ -3637,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "sp-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "directories",
  "iced",
@@ -3660,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "sp-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3670,7 +3670,7 @@ dependencies = [
 
 [[package]]
 name = "sp-csv"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "serde",
@@ -3684,7 +3684,7 @@ dependencies = [
 
 [[package]]
 name = "sp-dsp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3696,7 +3696,7 @@ dependencies = [
 
 [[package]]
 name = "sp-engine"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "serde",
@@ -3709,7 +3709,7 @@ dependencies = [
 
 [[package]]
 name = "sp-gen"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "proptest",
@@ -3727,7 +3727,7 @@ dependencies = [
 
 [[package]]
 name = "sp-proc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "rayon",
@@ -3742,7 +3742,7 @@ dependencies = [
 
 [[package]]
 name = "sp-store"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "rusqlite",
