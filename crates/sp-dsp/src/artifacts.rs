@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use sp_core::artifact::{
-    Artifact, ArtifactSchema, ColumnSpec, FieldKind, FieldSpec, OverlayForm, ViewHint,
+    Artifact, ArtifactSchema, ColumnSpec, FieldKind, FieldRef, FieldSpec, OverlayForm, ViewHint,
 };
 
 /// Per-signal summary statistics for one group.
@@ -69,6 +69,88 @@ impl Artifact for Statistics {
         match self.names.len() {
             1 => format!("{}: rms {:.3}", self.names[0], self.rms[0]),
             n => format!("{n} signals summarised"),
+        }
+    }
+}
+
+/// The single-sided magnitude spectrum of one signal.
+///
+/// One trace, not one per signal: a port holds the nearest upstream value
+/// (§9.3), so publishing a spectrum per signal would leave only the last. The
+/// stage says which signal it transformed, and a group whose other signals
+/// matter gets a second FFT stage.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Spectrum {
+    /// The signal the spectrum came from.
+    pub signal: String,
+    /// Bin centres, DC to Nyquist inclusive.
+    pub freq_hz: Vec<f64>,
+    /// Amplitude in dB, referenced to an amplitude of 1.0 — so a full-scale
+    /// sine peaks at 0 dB whatever the transform length.
+    pub magnitude_db: Vec<f64>,
+}
+
+impl Spectrum {
+    #[must_use]
+    pub fn new(signal: impl Into<String>, freq_hz: Vec<f64>, magnitude_db: Vec<f64>) -> Self {
+        Self {
+            signal: signal.into(),
+            freq_hz,
+            magnitude_db,
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.freq_hz.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.freq_hz.is_empty()
+    }
+
+    /// The strongest bin, as `(frequency, dB)` — what the summary and the
+    /// across-groups metric both read.
+    #[must_use]
+    pub fn peak(&self) -> Option<(f64, f64)> {
+        let (index, db) = self.magnitude_db.iter().copied().enumerate().fold(
+            None,
+            |best: Option<(usize, f64)>, (index, db)| match best {
+                Some((_, top)) if top >= db => best,
+                _ => Some((index, db)),
+            },
+        )?;
+        Some((self.freq_hz[index], db))
+    }
+}
+
+impl Artifact for Spectrum {
+    const KIND: &'static str = "spectrum.v1";
+    const VERSION: u32 = 1;
+
+    fn schema() -> ArtifactSchema {
+        ArtifactSchema::new(
+            vec![
+                FieldSpec::new("signal", FieldKind::Text),
+                FieldSpec::new("freq_hz", FieldKind::FloatArray).with_unit("Hz"),
+                FieldSpec::new("magnitude_db", FieldKind::FloatArray).with_unit("dB"),
+            ],
+            // Its own axes rather than the scope's: a spectrum has no place on
+            // a time axis (§10.1).
+            ViewHint::Series {
+                x: FieldRef::new("freq_hz"),
+                y: vec![FieldRef::new("magnitude_db")],
+                x_log: false,
+                y_log: false,
+            },
+        )
+    }
+
+    fn summary(&self) -> String {
+        match self.peak() {
+            Some((hz, db)) => format!("{}: peak {hz:.1} Hz at {db:.1} dB", self.signal),
+            None => format!("{}: empty spectrum", self.signal),
         }
     }
 }
@@ -147,9 +229,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_schemas_are_self_consistent() {
+    fn every_schema_is_self_consistent() {
         assert!(Statistics::schema().is_consistent());
         assert!(Detections::schema().is_consistent());
+        assert!(Spectrum::schema().is_consistent());
     }
 
     #[test]
@@ -172,6 +255,29 @@ mod tests {
         let mut stats = Statistics::default();
         stats.push("rf", -1.0, 1.0, 0.0, 0.707);
         assert_eq!(stats.summary(), "rf: rms 0.707");
+    }
+
+    #[test]
+    fn a_spectrum_decodes_into_the_columns_the_chart_draws() {
+        // The viewer never sees the struct — it decodes the payload against
+        // the schema, so that path is what the test has to exercise (§10.1).
+        let spectrum = Spectrum::new("rf", vec![0.0, 10.0, 20.0], vec![-3.0, 0.0, -40.0]);
+        let payload = serde_json::to_string(&spectrum).unwrap();
+        let data = sp_core::artifact::ArtifactData::decode(Spectrum::schema(), &payload).unwrap();
+        assert_eq!(data.rows(), 3);
+        assert_eq!(
+            data.column("magnitude_db")
+                .map(sp_core::artifact::Column::len),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn the_peak_is_the_loudest_bin() {
+        let spectrum = Spectrum::new("rf", vec![0.0, 10.0, 20.0], vec![-3.0, 0.0, -40.0]);
+        assert_eq!(spectrum.peak(), Some((10.0, 0.0)));
+        assert_eq!(spectrum.summary(), "rf: peak 10.0 Hz at 0.0 dB");
+        assert_eq!(Spectrum::default().peak(), None);
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod condition;
 pub mod detect;
 pub mod filter;
 pub mod measure;
+pub mod transform;
 pub mod util;
 
 use sp_core::artifact::{ArtifactRegistry, RegistryError as ArtifactRegistryError};
@@ -23,11 +24,12 @@ use sp_proc::registry::{RegistryError, StageFactory, StageRegistry};
 use sp_proc::stage::{PortKind, PortSpec};
 use sp_proc::SignalRef;
 
-pub use artifacts::{Detections, Statistics};
+pub use artifacts::{Detections, Spectrum, Statistics};
 pub use condition::{Detrend, Gain, Normalise};
 pub use detect::Threshold;
 pub use filter::{Biquad, Coefficients, Response};
 pub use measure::StatisticsStage;
+pub use transform::{Fft, Window};
 pub use util::Passthrough;
 
 /// The signals port every conditioning stage reads.
@@ -47,6 +49,7 @@ pub fn builtins() -> Vec<StageFactory> {
         || Box::<Biquad>::default(),
         || Box::<StatisticsStage>::default(),
         || Box::<Threshold>::default(),
+        || Box::<Fft>::default(),
     ]
 }
 
@@ -69,6 +72,7 @@ pub fn artifact_registry() -> Result<ArtifactRegistry, ArtifactRegistryError> {
     let mut registry = ArtifactRegistry::new();
     registry.register::<Statistics>()?;
     registry.register::<Detections>()?;
+    registry.register::<Spectrum>()?;
     Ok(registry)
 }
 
@@ -198,7 +202,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts.len(), 3);
     }
 
     #[test]
