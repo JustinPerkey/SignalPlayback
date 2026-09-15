@@ -539,6 +539,14 @@ impl State {
         std::mem::take(&mut self.completed)
     }
 
+    /// The rate the spec on screen renders at. The root's tests read it to
+    /// prove a default changed in Settings reached this screen.
+    #[cfg(test)]
+    #[must_use]
+    pub fn sample_rate_hz(&self) -> f64 {
+        self.spec.sample_rate_hz()
+    }
+
     /// The rate a new spec starts at (Settings, §12.1).
     ///
     /// The spec on screen follows the setting only while it is still on the
@@ -2847,6 +2855,131 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
         });
         let _ = state.view();
+    }
+
+    #[test]
+    fn the_signal_settings_form_writes_the_spec_that_will_be_rendered() {
+        let mut state = state();
+        let _ = state.update(None, Message::DatasetNameChanged("Trial 3".into()));
+        let _ = state.update(None, Message::SignalNameChanged("chirp".into()));
+        let _ = state.update(None, Message::DTypePicked(DTypeChoice(DType::F32)));
+        let _ = state.update(
+            None,
+            Message::DomainPicked(DomainChoice(Domain::BasebandIq)),
+        );
+        assert_eq!(state.dataset_name, "Trial 3");
+        assert_eq!(state.signal_name, "chirp");
+        assert_eq!(state.spec.dtype, DType::F32);
+        assert_eq!(state.spec.domain, Domain::BasebandIq);
+    }
+
+    #[test]
+    fn the_seed_button_draws_a_new_seed_for_the_mode_it_is_pressed_in() {
+        let mut state = state();
+        let _ = state.update(None, Message::FieldEdited("/seed".into(), "42".into()));
+        assert_eq!(state.spec.seed, 42);
+        let _ = state.update(None, Message::RandomiseSeed);
+        assert_ne!(state.spec.seed, 42, "a fresh seed is drawn");
+        assert_eq!(
+            state.field_text("/seed"),
+            state.spec.seed.to_string(),
+            "the box shows the seed that will be used, not what was typed"
+        );
+
+        // The train keeps its own seed, and the same button draws that one.
+        let train_before = state.train.seed;
+        let _ = state.update(None, Message::ModePicked(Mode::PulseTrain));
+        let _ = state.update(None, Message::RandomiseSeed);
+        assert_ne!(state.train.seed, train_before);
+    }
+
+    #[test]
+    fn a_cancelled_preset_dialog_changes_nothing() {
+        let mut state = state();
+        let before = state.spec.clone();
+        let _ = state.update(None, Message::PresetFilePicked(None));
+        let _ = state.update(None, Message::SavePathPicked(None));
+        assert_eq!(state.spec, before);
+        assert!(state.error.is_none());
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn a_preset_file_round_trips_through_the_two_buttons_that_move_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chirp.json");
+
+        let mut saving = state();
+        let _ = saving.update(None, Message::SignalNameChanged("chirp".into()));
+        let _ = saving.update(
+            None,
+            Message::FieldEdited("/root/freq_hz".into(), "250".into()),
+        );
+        Preset::new(saving.preset_name(), String::new(), saving.spec.clone())
+            .save(&path)
+            .unwrap();
+        let _ = saving.update(None, Message::PresetSaved(Ok(path.display().to_string())));
+        assert!(saving.notice.as_deref().unwrap().contains("chirp.json"));
+
+        // And a fresh screen loads it back onto the tree.
+        let mut state = state();
+        let preset = Preset::load(&path).unwrap();
+        let _ = state.update(None, Message::PresetLoaded(Ok(Box::new(preset))));
+        assert_eq!(
+            tree::get_json(&state.spec, "/root/freq_hz"),
+            Some(Value::from(250.0))
+        );
+        assert_eq!(state.loaded_preset.as_deref(), Some("chirp"));
+        assert_eq!(state.selected, tree::ROOT);
+        assert!(state.notice.as_deref().unwrap().contains("chirp"));
+    }
+
+    #[test]
+    fn a_preset_that_will_not_read_is_reported_rather_than_applied() {
+        let mut state = state();
+        let before = state.spec.clone();
+        let _ = state.update(
+            None,
+            Message::PresetLoaded(Err("chirp.json: expected a spec".into())),
+        );
+        assert_eq!(state.error.as_deref(), Some("chirp.json: expected a spec"));
+        assert_eq!(state.spec, before);
+
+        let _ = state.update(None, Message::PresetSaved(Err("read-only volume".into())));
+        assert_eq!(state.error.as_deref(), Some("read-only volume"));
+    }
+
+    #[test]
+    fn cancelling_a_generation_asks_the_job_to_stop() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut state = state();
+        state.job = Some(Job {
+            progress: Arc::new(Mutex::new(GenProgress::default())),
+            cancel: cancel.clone(),
+        });
+        let _ = state.update(None, Message::Cancel);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(state.notice.as_deref(), Some("Cancelling…"));
+
+        // With nothing running there is nothing to cancel.
+        let mut idle = State::default();
+        let _ = idle.update(None, Message::Cancel);
+        assert!(idle.notice.is_none());
+    }
+
+    #[test]
+    fn a_failed_generation_is_reported_and_commits_nothing() {
+        let mut state = state();
+        state.job = Some(Job {
+            progress: Arc::new(Mutex::new(GenProgress::default())),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        state.notice = Some("Generating…".to_owned());
+        let _ = state.update(None, Message::Generated(Err("above Nyquist".into())));
+        assert!(state.job.is_none());
+        assert_eq!(state.error.as_deref(), Some("above Nyquist"));
+        assert!(state.notice.is_none());
+        assert!(!state.take_completed());
     }
 
     #[test]

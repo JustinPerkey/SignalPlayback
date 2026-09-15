@@ -674,7 +674,7 @@ fn format_timestamp(when: sp_core::time::Timestamp) -> String {
 #[cfg(test)]
 mod tests {
     use sp_core::run::RunStatus;
-    use sp_core::PipelineId;
+    use sp_core::{GroupId, PipelineId};
 
     use super::*;
 
@@ -774,6 +774,127 @@ mod tests {
         let mut state = state();
         let _ = state.update(None, Message::Promote(RunId::new(3)));
         assert!(state.error.is_some());
+    }
+
+    #[test]
+    fn a_promotion_needs_a_library_as_well_as_a_name() {
+        let mut state = state();
+        let _ = state.update(None, Message::PromoteAs("golden".into()));
+        let _ = state.update(None, Message::Promote(RunId::new(3)));
+        assert_eq!(state.error.as_deref(), Some("No library is open."));
+    }
+
+    #[test]
+    fn a_baseline_name_of_spaces_alone_is_not_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("library.db")).unwrap();
+        let mut state = state();
+        let _ = state.update(None, Message::PromoteAs("   ".into()));
+        let _ = state.update(Some(&store), Message::Promote(RunId::new(3)));
+        assert_eq!(state.error.as_deref(), Some("A baseline needs a name."));
+    }
+
+    #[test]
+    fn marking_a_run_to_diff_against_can_be_undone() {
+        let mut state = state();
+        let _ = state.update(None, Message::MarkAgainst(RunId::new(2)));
+        assert_eq!(state.against, Some(RunId::new(2)));
+        let _ = state.update(None, Message::ClearAgainst);
+        assert_eq!(state.against, None);
+
+        // And with nothing marked, Diff says which step is missing.
+        let _ = state.update(None, Message::Diff(RunId::new(3)));
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Mark a run to diff against first.")
+        );
+    }
+
+    #[test]
+    fn a_finished_action_shows_one_message_at_a_time() {
+        let mut state = state();
+        let _ = state.update(None, Message::Done(Ok("Deleted run 2.".into())));
+        assert_eq!(state.notice.as_deref(), Some("Deleted run 2."));
+        assert!(state.error.is_none());
+
+        let _ = state.update(None, Message::Done(Err("the run is a baseline".into())));
+        assert_eq!(state.error.as_deref(), Some("the run is a baseline"));
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn a_detail_for_a_run_that_is_no_longer_selected_is_ignored() {
+        let mut state = state();
+        let _ = state.update(None, Message::Select(RunId::new(3)));
+        let _ = state.update(None, Message::Select(RunId::new(2)));
+        let _ = state.update(
+            None,
+            Message::DetailLoaded(RunId::new(3), Ok(Detail::default())),
+        );
+        assert!(state.detail.is_none());
+        let _ = state.update(
+            None,
+            Message::DetailLoaded(RunId::new(2), Ok(Detail::default())),
+        );
+        assert!(matches!(state.detail, Some((id, _)) if id == RunId::new(2)));
+    }
+
+    #[test]
+    fn deleting_without_a_library_does_nothing() {
+        let mut state = state();
+        let _ = state.update(None, Message::Delete(RunId::new(3)));
+        assert!(state.error.is_none());
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn the_screen_builds_a_view_in_every_state_it_can_be_in() {
+        // No runs at all, then a load that failed.
+        let mut empty = State::default();
+        let _ = empty.view();
+        empty.loading = true;
+        let _ = empty.view();
+        let _ = empty.update(None, Message::Loaded(Err("the file is locked".into())));
+        assert!(!empty.loading);
+        let _ = empty.view();
+
+        // The history, a run selected with its assertions, and a run marked
+        // to diff against.
+        let mut state = state();
+        state.entries[0].baselines = vec!["golden".to_owned()];
+        let _ = state.update(None, Message::Select(RunId::new(3)));
+        let detail = Detail {
+            assertions: vec![
+                AssertionResultRow::new(
+                    GroupId::new(1),
+                    0,
+                    "metrics.snr_db > 4",
+                    AssertStatus::Pass,
+                )
+                .with_values(Some(6.0), Some(4.0)),
+                AssertionResultRow::new(
+                    GroupId::new(2),
+                    0,
+                    "metrics.snr_db > 4",
+                    AssertStatus::Fail,
+                )
+                .with_values(Some(3.0), Some(4.0))
+                .with_message("3 is not > 4"),
+            ],
+            group_names: [(1, "dwell 1".to_owned()), (2, "dwell 2".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let _ = state.update(None, Message::DetailLoaded(RunId::new(3), Ok(detail)));
+        let _ = state.update(None, Message::MarkAgainst(RunId::new(2)));
+        let _ = state.update(None, Message::PromoteAs("golden".into()));
+        state.notice = Some("Run 3 is now 'golden'.".to_owned());
+        let _ = state.view();
+
+        // And filtered down to the failures.
+        let _ = state.update(None, Message::ToggleFailuresOnly(true));
+        state.error = Some("boom".to_owned());
+        let _ = state.view();
     }
 
     #[test]

@@ -19,6 +19,14 @@ use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
 use sp_core::artifact::{ArtifactData, Column, FieldDiff, FieldKind, FieldRef, ViewHint};
 
+/// How tall a pane's rows area is.
+///
+/// A pane is docked in a scrolling rail (`screens::results::pane_column`), so
+/// its body is bounded rather than filling: content that fills the rail's
+/// scrolling axis cannot scroll, and one long table would push every pane
+/// under it off the rail. The charts bound themselves the same way.
+const BODY_HEIGHT: f32 = 220.0;
+
 /// How a table is ordered, by field name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sort {
@@ -264,10 +272,12 @@ fn draw_table<'a, M: Clone + 'a>(
         ));
     }
 
-    column![header_row, scrollable(body).height(Length::Fill)]
-        .spacing(4)
-        .height(Length::Fill)
-        .into()
+    column![
+        header_row,
+        scrollable(body).height(Length::Fixed(BODY_HEIGHT))
+    ]
+    .spacing(4)
+    .into()
 }
 
 fn scalars<'a, M: 'a>(pane: &Pane<'a>) -> Element<'a, M> {
@@ -290,7 +300,7 @@ fn scalars<'a, M: 'a>(pane: &Pane<'a>) -> Element<'a, M> {
     if pane.data.is_empty() {
         return empty("This artifact carries no values.");
     }
-    scrollable(list).height(Length::Fill).into()
+    scrollable(list).height(Length::Shrink).into()
 }
 
 fn tree<'a, M: 'a>(pane: &Pane<'a>) -> Element<'a, M> {
@@ -312,7 +322,7 @@ fn tree<'a, M: 'a>(pane: &Pane<'a>) -> Element<'a, M> {
             .font(typography::READOUT),
         );
     }
-    scrollable(list).height(Length::Fill).into()
+    scrollable(list).height(Length::Shrink).into()
 }
 
 fn diff_summary<'a, M: 'a>(diff: &[FieldDiff]) -> Element<'a, M> {
@@ -724,6 +734,79 @@ mod tests {
         assert_eq!(sort.field, "spans");
         assert!(sort.ascending);
         assert!(default_sort(&ArtifactSchema::opaque()).is_none());
+    }
+
+    /// Every hint, so each renderer is built and measured.
+    fn data_with(hint: ViewHint) -> ArtifactData {
+        let schema = ArtifactSchema::new(
+            vec![
+                FieldSpec::new("spans", FieldKind::SpanS),
+                FieldSpec::new("scores", FieldKind::Float),
+            ],
+            hint,
+        );
+        ArtifactData::decode(
+            schema,
+            r#"{"spans":[[0.0,1.0],[2.0,3.0],[4.0,5.0]],"scores":[0.7,0.1,0.4]}"#,
+        )
+        .unwrap()
+    }
+
+    fn pane_of(data: &ArtifactData) -> Pane<'_> {
+        Pane {
+            title: "detections",
+            summary: Some("3 detections"),
+            data,
+            current_row: Some(1),
+            sort: None,
+            diff: None,
+            colour: Color::WHITE,
+        }
+    }
+
+    #[test]
+    fn a_pane_is_bounded_so_the_rail_it_is_docked_in_can_scroll() {
+        // The panes stack inside one scrollable (§10.3). Content that fills
+        // that scrolling axis cannot scroll, and Iced asserts on it — so no
+        // renderer may hand back a body of unbounded height.
+        let hints = [
+            ViewHint::Table {
+                columns: vec![ColumnSpec::new("scores", "Score")],
+            },
+            ViewHint::Overlay {
+                form: sp_core::artifact::OverlayForm::Spans,
+            },
+            ViewHint::Scalars,
+            ViewHint::Tree,
+            ViewHint::Series {
+                x: FieldRef::new("spans"),
+                y: vec![FieldRef::new("scores")],
+                x_log: false,
+                y_log: false,
+            },
+        ];
+        for hint in hints {
+            let data = data_with(hint);
+            let pane = pane_of(&data);
+            let element: Element<'_, String> = view(&pane, |field| field);
+            assert!(
+                !element.as_widget().size_hint().height.is_fill(),
+                "a pane body fills the rail it is docked in: {:?}",
+                data.schema().view
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_artifact_draws_a_line_rather_than_an_empty_grid() {
+        let schema = ArtifactSchema::new(
+            vec![FieldSpec::new("scores", FieldKind::Float)],
+            ViewHint::Scalars,
+        );
+        let data = ArtifactData::decode(schema, r#"{"scores":[]}"#).unwrap();
+        let pane = pane_of(&data);
+        let element: Element<'_, String> = view(&pane, |field| field);
+        assert!(!element.as_widget().size_hint().height.is_fill());
     }
 
     #[test]

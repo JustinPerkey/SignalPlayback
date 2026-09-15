@@ -2521,6 +2521,169 @@ mod tests {
         assert!(state.diagnostics_pane().is_some());
     }
 
+    #[test]
+    fn the_transport_buttons_play_pause_stop_and_toggle() {
+        let mut state = opened();
+        let view = StageView {
+            signals: vec![signal("rf", 1, &[0.0; 4000])],
+            artifacts: Vec::new(),
+        };
+        let generation = state.generation;
+        let _ = state.update(
+            None,
+            Message::Loaded(generation, Ok((view, StageView::default()))),
+        );
+
+        let _ = state.update(None, Message::Play);
+        assert!(state.is_playing());
+        let _ = state.update(None, Message::Pause);
+        assert!(!state.is_playing());
+        let _ = state.update(None, Message::Toggle);
+        assert!(state.is_playing());
+
+        let _ = state.update(None, Message::Canvas(Action::Seek(1.0)));
+        let _ = state.update(None, Message::Stop);
+        assert!(!state.is_playing());
+        assert_eq!(state.transport.playhead_s(), 0.0);
+
+        // And the seek bar moves the playhead across the run's timeline.
+        let _ = state.update(None, Message::SeekFraction(0.5));
+        assert!(state.transport.playhead_s() > 0.0);
+    }
+
+    #[test]
+    fn fitting_puts_the_stage_output_back_in_the_window() {
+        let mut state = opened();
+        let view = StageView {
+            signals: vec![signal("rf", 1, &[0.0; 4000])],
+            artifacts: Vec::new(),
+        };
+        let generation = state.generation;
+        let _ = state.update(
+            None,
+            Message::Loaded(generation, Ok((view, StageView::default()))),
+        );
+        let fitted = state.viewport.time();
+
+        let _ = state.update(
+            None,
+            Message::Canvas(Action::ZoomTime {
+                at_s: 1.0,
+                factor: 0.2,
+            }),
+        );
+        assert_ne!(state.viewport.time(), fitted);
+        let _ = state.update(None, Message::FitAll);
+        assert_eq!(state.viewport.time(), fitted);
+    }
+
+    #[test]
+    fn a_pin_is_dropped_by_the_button_that_set_it() {
+        let mut state = opened();
+        let _ = state.update(None, Message::Pin(0));
+        assert_eq!(state.pinned, Some(0));
+        // Pinning the same stage again is how it is let go.
+        let _ = state.update(None, Message::Pin(0));
+        assert_eq!(state.pinned, None);
+
+        let _ = state.update(None, Message::Pin(0));
+        let _ = state.update(None, Message::Unpin);
+        assert_eq!(state.pinned, None);
+    }
+
+    #[test]
+    fn a_comparison_is_cleared_by_the_button_that_started_it() {
+        let mut state = opened();
+        state.against = Some(RunId::new(2));
+        let _ = state.update(None, Message::Compared(Err("run 2 is gone".into())));
+        assert_eq!(state.against, None, "a failed comparison is not held open");
+        assert_eq!(state.error.as_deref(), Some("run 2 is gone"));
+
+        state.against = Some(RunId::new(2));
+        let _ = state.update(None, Message::ClearComparison);
+        assert_eq!(state.against, None);
+        assert!(state.diff.is_none());
+    }
+
+    #[test]
+    fn a_promotion_reports_where_it_landed() {
+        let mut state = opened();
+        let _ = state.update(None, Message::Promoted(Ok("golden".into())));
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Promoted this run to the baseline 'golden'.")
+        );
+
+        let _ = state.update(None, Message::Promoted(Err("golden: read-only".into())));
+        assert_eq!(state.error.as_deref(), Some("golden: read-only"));
+    }
+
+    #[test]
+    fn promoting_needs_a_library_even_with_a_name_and_a_tolerance() {
+        let mut state = opened();
+        let _ = state.update(None, Message::PromoteAs("golden".into()));
+        let _ = state.update(None, Message::PromoteTolerance("1%".into()));
+        let _ = state.update(None, Message::Promote);
+        assert_eq!(state.error.as_deref(), Some("No library is open."));
+    }
+
+    #[test]
+    fn a_metric_picker_and_a_table_header_change_what_the_panes_show() {
+        let mut state = opened();
+        let _ = state.update(None, Message::MetricSelected("snr_db".into()));
+        assert_eq!(state.metric.as_deref(), Some("snr_db"));
+
+        // A column header sorts, and sorts the other way on a second press.
+        let _ = state.update(None, Message::SortBy("detections".into(), "peak".into()));
+        let first = state.sorts.get("detections").cloned().expect("a sort");
+        let _ = state.update(None, Message::SortBy("detections".into(), "peak".into()));
+        let second = state.sorts.get("detections").cloned().expect("a sort");
+        assert_ne!(first.ascending, second.ascending);
+    }
+
+    #[test]
+    fn the_screen_builds_a_view_in_every_state_it_can_be_in() {
+        // No run open at all, then one that would not load.
+        let mut state = State::default();
+        let _ = state.view();
+        state.loading = true;
+        let _ = state.view();
+        let _ = state.update(None, Message::Runs(Err("the file is locked".into())));
+        assert!(!state.loading);
+        let _ = state.view();
+
+        // A run open, with signals, an overlay artifact and a table, in both
+        // layouts and with a stage pinned beside the selected one.
+        let mut state = opened();
+        let view = StageView {
+            signals: vec![signal("rf", 1, &[0.0; 400]), signal("ref", 1, &[0.5; 400])],
+            artifacts: vec![detections(&[(0.05, 0.1), (0.2, 0.25)], &[0.4, 0.9])],
+        };
+        let pinned = StageView {
+            signals: vec![signal("rf", 0, &[0.1; 400])],
+            artifacts: vec![detections(&[(0.05, 0.1), (0.2, 0.25)], &[0.4, 0.5])],
+        };
+        let _ = state.update(None, Message::Pin(0));
+        let generation = state.generation;
+        let _ = state.update(None, Message::Loaded(generation, Ok((view, pinned))));
+        let _ = state.view();
+
+        let _ = state.update(None, Message::LayoutChanged(Layout::Stacked));
+        let _ = state.update(None, Message::Play);
+        let _ = state.update(None, Message::PromoteAs("golden".into()));
+        let _ = state.update(None, Message::MetricSelected("snr_db".into()));
+        let _ = state.view();
+
+        // The source stage, which has no chip of its own to select.
+        let _ = state.update(None, Message::SelectStage(SOURCE_STAGE));
+        let _ = state.view();
+
+        // And with both messages showing at once.
+        state.error = Some("boom".to_owned());
+        state.status = Some("reduced".to_owned());
+        let _ = state.view();
+    }
+
     /// The M6 exit criterion, end to end: run a pipeline, then read any
     /// (group, stage) back the way the screen does (§16).
     #[test]

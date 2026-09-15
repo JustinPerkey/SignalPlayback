@@ -585,4 +585,147 @@ mod tests {
         let _ = state.update(None, Message::Submit);
         assert!(state.error.is_some());
     }
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("library.db")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn every_control_in_the_form_lands_on_the_definition_it_describes() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::LabelChanged("Pulse width".into()));
+        let _ = state.update(None, Message::KeyChanged("pw_s".into()));
+        let _ = state.update(None, Message::UnitChanged("s".into()));
+        let _ = state.update(None, Message::SectionChanged("Timing".into()));
+        let _ = state.update(None, Message::KindPicked(KindChoice::DurationS));
+        let _ = state.update(None, Message::ScopePicked(ScopeChoice(PropScope::Group)));
+        let _ = state.update(None, Message::RequiredToggled(true));
+
+        let def = state.form.to_def().unwrap();
+        assert_eq!(def.key, "pw_s");
+        assert_eq!(def.label, "Pulse width");
+        assert_eq!(def.unit.as_deref(), Some("s"));
+        assert_eq!(def.section.as_deref(), Some("Timing"));
+        assert_eq!(def.scope, PropScope::Group);
+        assert!(def.required);
+        assert!(matches!(def.kind, PropKind::DurationS));
+
+        // The checkbox goes back off again.
+        let _ = state.update(None, Message::RequiredToggled(false));
+        assert!(!state.form.to_def().unwrap().required);
+    }
+
+    #[test]
+    fn submitting_an_incomplete_form_reports_it_without_writing_anything() {
+        let (_dir, store) = store();
+        let mut state = State::default();
+        // A choice property with no variants is the one form that can be
+        // filled in and still be wrong.
+        let _ = state.update(None, Message::LabelChanged("Coding".into()));
+        let _ = state.update(None, Message::KindPicked(KindChoice::Enum));
+        let _ = state.update(Some(&store), Message::Submit);
+        assert_eq!(
+            state.error.as_deref(),
+            Some("A choice property needs at least one variant.")
+        );
+        assert!(!state.busy, "nothing was sent to the store");
+        assert!(store
+            .read(|conn| props::list_property_defs(conn, None))
+            .unwrap()
+            .is_empty());
+
+        // Filling the missing field is all it takes.
+        let _ = state.update(None, Message::VariantsChanged("nrz, manchester".into()));
+        let _ = state.update(Some(&store), Message::Submit);
+        assert!(state.busy, "the write is in flight");
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn a_saved_definition_empties_the_form_for_the_next_one() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::LabelChanged("PRF".into()));
+        let _ = state.update(None, Message::KindPicked(KindChoice::FreqHz));
+        state.busy = true;
+
+        let _ = state.update(None, Message::Saved(Ok("prf_hz".into())));
+        assert_eq!(state.notice.as_deref(), Some("Added 'prf_hz'."));
+        assert!(!state.busy);
+        assert!(state.form.label.is_empty());
+        assert_eq!(state.form.kind, KindChoice::default());
+    }
+
+    #[test]
+    fn a_refused_save_keeps_what_was_typed() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::LabelChanged("PRF".into()));
+        state.busy = true;
+
+        let _ = state.update(None, Message::Saved(Err("prf_hz already exists".into())));
+        assert_eq!(state.error.as_deref(), Some("prf_hz already exists"));
+        assert!(!state.busy);
+        assert_eq!(
+            state.form.label, "PRF",
+            "the form is not cleared under a failed save"
+        );
+    }
+
+    #[test]
+    fn deleting_without_a_library_does_nothing() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::Delete(PropScope::Signal, "prf_hz".into()));
+        assert!(state.error.is_none());
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn a_deletion_says_what_happened_to_the_values_stored_under_it() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::Deleted(Ok("prf_hz".into())));
+        let notice = state.notice.clone().expect("a notice");
+        assert!(notice.contains("prf_hz"), "{notice}");
+        assert!(notice.contains("unrecognised attributes"), "{notice}");
+
+        let _ = state.update(None, Message::Deleted(Err("it is in use".into())));
+        assert_eq!(state.error.as_deref(), Some("it is in use"));
+    }
+
+    #[test]
+    fn the_screen_builds_a_view_in_every_state_it_can_be_in() {
+        let mut state = State::default();
+        let _ = state.view();
+
+        // A definition of every kind in the list, and the form set to each of
+        // them in turn — the variants box only appears for a choice.
+        let defs = KindChoice::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                PropertyDef::new(
+                    format!("key_{index}"),
+                    PropScope::Signal,
+                    kind.to_kind("nrz, manchester"),
+                )
+                .with_label(kind.label())
+                .with_unit("Hz")
+                .in_section("Radar")
+            })
+            .collect();
+        let _ = state.update(None, Message::Loaded(Ok(defs)));
+        for kind in KindChoice::ALL {
+            let _ = state.update(None, Message::KindPicked(kind));
+            let _ = state.view();
+        }
+
+        state.busy = true;
+        state.error = Some("boom".to_owned());
+        state.notice = Some("Added 'prf_hz'.".to_owned());
+        let _ = state.view();
+
+        let mut state = State::default();
+        let _ = state.update(None, Message::Loaded(Err("no library".into())));
+        let _ = state.view();
+    }
 }

@@ -1805,6 +1805,203 @@ mod tests {
     }
 
     #[test]
+    fn the_name_box_renames_the_pipeline_that_will_be_saved() {
+        let mut state = state();
+        let _ = state.update(None, Message::NameChanged("Detector v2".into()));
+        assert_eq!(state.pipeline.name, "Detector v2");
+    }
+
+    #[test]
+    fn saving_without_a_library_says_so_rather_than_doing_nothing() {
+        let mut state = state();
+        add(&mut state, "dsp.condition.gain");
+        let _ = state.update(None, Message::Save);
+        assert_eq!(state.error.as_deref(), Some("No library is open."));
+        assert!(!state.busy);
+    }
+
+    #[test]
+    fn a_saved_pipeline_is_the_one_the_next_save_overwrites() {
+        let mut state = state();
+        let _ = state.update(None, Message::NameChanged("Detector".into()));
+        state.busy = true;
+        let _ = state.update(None, Message::Saved(Ok(PipelineId::new(4))));
+        assert_eq!(state.saved_id(), Some(PipelineId::new(4)));
+        assert_eq!(state.notice.as_deref(), Some("Saved 'Detector'."));
+        assert!(!state.busy);
+
+        state.busy = true;
+        let _ = state.update(None, Message::Saved(Err("the name is taken".into())));
+        assert_eq!(state.error.as_deref(), Some("the name is taken"));
+        assert!(!state.busy);
+    }
+
+    #[test]
+    fn a_stage_switches_off_and_changes_what_it_keeps_without_losing_its_settings() {
+        let mut state = state();
+        add(&mut state, "dsp.condition.gain");
+        let _ = state.update(None, Message::ParamText("gain", "2.5".into()));
+
+        let _ = state.update(None, Message::StageEnabled(0, false));
+        assert!(!state.pipeline.stages[0].enabled);
+        assert_eq!(
+            state.pipeline.stages[0].params.get("gain"),
+            Some(&PropertyValue::from(2.5)),
+            "a stage that is off is still configured"
+        );
+
+        let _ = state.update(
+            None,
+            Message::RetentionPicked(0, RetentionChoice(Retention::Never)),
+        );
+        assert_eq!(state.pipeline.stages[0].retention, Retention::Never);
+
+        let _ = state.update(None, Message::StageEnabled(0, true));
+        assert!(state.pipeline.stages[0].enabled);
+    }
+
+    #[test]
+    fn a_control_for_a_stage_that_is_gone_is_ignored() {
+        // Every one of these is addressed by position, so a stale position
+        // must be a no-op rather than a panic.
+        let mut state = state();
+        add(&mut state, "dsp.condition.gain");
+        let _ = state.update(None, Message::RemoveStage(9));
+        let _ = state.update(None, Message::StageEnabled(9, false));
+        let _ = state.update(
+            None,
+            Message::RetentionPicked(9, RetentionChoice(Retention::Never)),
+        );
+        let _ = state.update(None, Message::MoveStage(9, 1));
+        let _ = state.update(None, Message::AssertionChanged(9, "x > 1".into()));
+        let _ = state.update(None, Message::AssertionEnabled(9, false));
+        let _ = state.update(None, Message::RemoveAssertion(9));
+        assert_eq!(state.pipeline.stages.len(), 1);
+        assert!(state.pipeline.assertions.is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_run_asks_it_to_stop() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut state = state();
+        state.job = Some(Job {
+            progress: Arc::new(Mutex::new(None)),
+            cancel: cancel.clone(),
+        });
+        let _ = state.update(None, Message::Cancel);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(state.notice.as_deref(), Some("Cancelling…"));
+
+        // With nothing running the button has nothing to cancel.
+        let mut state = State::default();
+        let _ = state.update(None, Message::Cancel);
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn a_finished_run_clears_the_job_whether_it_worked_or_not() {
+        let mut state = state();
+        state.job = Some(Job {
+            progress: Arc::new(Mutex::new(None)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        state.busy = true;
+        let _ = state.update(None, Message::Finished(Err("stage 2: no input".into())));
+        assert!(state.job.is_none());
+        assert!(!state.busy);
+        assert_eq!(state.error.as_deref(), Some("stage 2: no input"));
+        assert!(!state.take_completed(), "nothing was committed");
+
+        let summary = RunSummary {
+            run: sp_core::RunId::new(1),
+            status: sp_core::run::RunStatus::Ok,
+            groups_ok: 2,
+            groups_failed: 0,
+            stages_run: 4,
+            stages_cached: 0,
+            assertions_passed: 1,
+            assertions_failed: 0,
+            wall_ms: 12,
+        };
+        let _ = state.update(None, Message::Finished(Ok(summary.clone())));
+        assert_eq!(state.notice.as_deref(), Some(summary.describe().as_str()));
+        assert!(
+            state.take_completed(),
+            "the root reloads what the run wrote"
+        );
+        assert!(!state.take_completed(), "and only once");
+    }
+
+    #[test]
+    fn the_screen_builds_a_view_in_every_state_it_can_be_in() {
+        // The palette and the two empty rails.
+        let mut state = state();
+        let _ = state.view();
+
+        // Every registered stage, so every generated parameter form is built.
+        let kinds: Vec<&'static str> = state
+            .registry
+            .descriptors()
+            .map(|descriptor| descriptor.kind)
+            .collect();
+        for kind in kinds {
+            let _ = state.update(None, Message::AddStage(kind));
+            let _ = state.view();
+        }
+
+        // A stage with a problem, an assertion that will not parse, and both
+        // messages at once.
+        let _ = state.update(None, Message::AddAssertion);
+        let _ = state.update(None, Message::AssertionChanged(0, "metrics.snr".into()));
+        state.error = Some("boom".to_owned());
+        state.notice = Some("Saved 'Detector'.".to_owned());
+        let _ = state.view();
+
+        // A kind this build does not have is named rather than drawn blank.
+        let mut state = State::default();
+        let _ = state.update(
+            None,
+            Message::PipelineLoaded(Ok((
+                PipelineId::new(1),
+                "from another build".into(),
+                vec![sp_store::PipelineStageRow::new(0, "vendor.secret.stage")],
+                Vec::new(),
+            ))),
+        );
+        let _ = state.view();
+
+        // A dataset to run over, with its groups, and a run in flight.
+        let mut state = State::default();
+        add(&mut state, "dsp.condition.gain");
+        let _ = state.update(
+            None,
+            Message::GroupsLoaded(Ok(vec![SignalGroup {
+                id: GroupId::new(1),
+                train_id: sp_core::TrainId::new(1),
+                ordinal: 0,
+                name: Some("dwell 1".to_owned()),
+                declared_count: 2,
+                actual_count: 2,
+                toa_unit: None,
+                attributes: sp_core::Attributes::new(),
+            }])),
+        );
+        state.job = Some(Job {
+            progress: Arc::new(Mutex::new(Some(RunProgress {
+                run: sp_core::RunId::new(1),
+                groups_done: 1,
+                groups_total: 2,
+                group: GroupId::new(1),
+                stage_ordinal: 0,
+                status: sp_core::run::StageStatus::Ok,
+            }))),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        let _ = state.update(None, Message::Tick);
+        let _ = state.view();
+    }
+
+    #[test]
     fn a_configured_stage_summarises_what_was_set() {
         let mut state = state();
         add(&mut state, "dsp.condition.gain");

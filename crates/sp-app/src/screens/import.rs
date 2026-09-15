@@ -1501,6 +1501,195 @@ time, pulse width, power, band
     }
 
     #[test]
+    fn choosing_a_file_names_the_dataset_but_never_overwrites_a_typed_name() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::FilePicked(Some("/data/capture.csv".into())));
+        assert_eq!(
+            state.path,
+            PathBuf::from("/data/capture.csv").display().to_string()
+        );
+        assert_eq!(state.dataset_name, "capture");
+
+        // A name the user typed is theirs, and the next file does not take it.
+        let _ = state.update(None, Message::DatasetNameChanged("Trial 3".into()));
+        let _ = state.update(None, Message::FilePicked(Some("/data/other.csv".into())));
+        assert_eq!(state.dataset_name, "Trial 3");
+
+        // A cancelled dialog changes nothing at all.
+        let before = state.path.clone();
+        let _ = state.update(None, Message::FilePicked(None));
+        assert_eq!(state.path, before);
+    }
+
+    #[test]
+    fn the_mode_picker_writes_the_profile_the_import_will_use() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::ModePicked(ModeChoice(CountMode::Strict)));
+        assert_eq!(state.profile.mode, CountMode::Strict);
+        let _ = state.update(None, Message::UnitPicked(UnitChoice(TimeUnit::Nanoseconds)));
+        assert_eq!(state.profile.time_unit, TimeUnit::Nanoseconds);
+    }
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("library.db")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn a_profile_needs_a_name_before_it_can_be_saved() {
+        let (_dir, store) = store();
+        let mut state = previewed();
+        let _ = state.update(None, Message::SaveAsChanged("   ".into()));
+        let _ = state.update(Some(&store), Message::SaveProfile);
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Give the profile a name before saving it.")
+        );
+        assert!(store.read(profiles::list).unwrap().is_empty());
+
+        // With a name the profile is named after what was typed, trimmed.
+        let _ = state.update(None, Message::SaveAsChanged("  Radar A  ".into()));
+        let _ = state.update(Some(&store), Message::SaveProfile);
+        assert_eq!(state.profile.name, "Radar A");
+    }
+
+    #[test]
+    fn saving_a_profile_without_a_library_does_nothing() {
+        let mut state = previewed();
+        let _ = state.update(None, Message::SaveAsChanged("Radar A".into()));
+        let _ = state.update(None, Message::SaveProfile);
+        assert!(state.error.is_none());
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn a_saved_profile_is_reported_and_becomes_the_loaded_one() {
+        let mut state = previewed();
+        state.profile.name = "Radar A".to_owned();
+        let _ = state.update(None, Message::ProfileSaved(Ok(7)));
+        assert_eq!(state.loaded_profile, Some(7));
+        assert_eq!(state.notice.as_deref(), Some("Saved profile 'Radar A'."));
+
+        let _ = state.update(None, Message::ProfileSaved(Err("the name is taken".into())));
+        assert_eq!(state.error.as_deref(), Some("the name is taken"));
+    }
+
+    #[test]
+    fn a_saved_profile_loads_back_into_every_control() {
+        let mut state = previewed();
+        let _ = state.update(None, Message::TogglePulseColumn("power".into(), false));
+        let rules = state.profile.to_json().unwrap();
+        let mut state = State {
+            saved: vec![SavedProfile {
+                id: 3,
+                name: "Radar A".to_owned(),
+                rules_json: rules,
+                created_utc: sp_core::time::now_utc(),
+            }],
+            ..State::default()
+        };
+
+        let _ = state.update(None, Message::LoadProfile(3));
+        assert_eq!(
+            state.profile.pulse_rule("power").map(|rule| rule.include),
+            Some(false)
+        );
+        assert_eq!(state.loaded_profile, Some(3));
+        assert_eq!(state.save_as, "Radar A");
+        assert_eq!(state.notice.as_deref(), Some("Loaded profile 'Radar A'."));
+    }
+
+    #[test]
+    fn a_profile_row_that_will_not_parse_is_reported_rather_than_applied() {
+        let mut state = State {
+            saved: vec![SavedProfile {
+                id: 3,
+                name: "Radar A".to_owned(),
+                rules_json: "not json".to_owned(),
+                created_utc: sp_core::time::now_utc(),
+            }],
+            ..State::default()
+        };
+        let before = state.profile.clone();
+        let _ = state.update(None, Message::LoadProfile(3));
+        assert!(state.error.is_some());
+        assert_eq!(state.profile, before);
+
+        // A row that is not there at all is a no-op.
+        let _ = state.update(None, Message::LoadProfile(99));
+        assert_eq!(state.profile, before);
+    }
+
+    #[test]
+    fn deleting_the_profile_the_settings_came_from_forgets_it() {
+        let (_dir, store) = store();
+        let mut state = previewed();
+        state.loaded_profile = Some(3);
+        let _ = state.update(Some(&store), Message::DeleteProfile(3));
+        assert_eq!(state.loaded_profile, None);
+
+        // Deleting another row leaves the loaded one alone.
+        state.loaded_profile = Some(3);
+        let _ = state.update(Some(&store), Message::DeleteProfile(4));
+        assert_eq!(state.loaded_profile, Some(3));
+    }
+
+    #[test]
+    fn an_import_with_a_library_but_no_file_says_which_step_is_missing() {
+        let (_dir, store) = store();
+        let mut state = State::default();
+        let _ = state.update(Some(&store), Message::Start);
+        assert_eq!(state.error.as_deref(), Some("Choose a file to import."));
+        assert!(state.job.is_none());
+    }
+
+    #[test]
+    fn cancelling_a_running_import_asks_the_job_to_stop() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut state = State {
+            job: Some(Job {
+                progress: Arc::new(Mutex::new(ImportProgress::default())),
+                cancel: cancel.clone(),
+            }),
+            ..State::default()
+        };
+        let _ = state.update(None, Message::Cancel);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(state.notice.as_deref(), Some("Cancelling…"));
+
+        // With nothing running the button has nothing to do.
+        let mut state = State::default();
+        let _ = state.update(None, Message::Cancel);
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn a_failed_import_is_reported_and_leaves_no_report_behind() {
+        let mut state = State {
+            job: Some(Job {
+                progress: Arc::new(Mutex::new(ImportProgress::default())),
+                cancel: Arc::new(AtomicBool::new(false)),
+            }),
+            ..State::default()
+        };
+        let _ = state.update(None, Message::Imported(Err("row 12: no count".into())));
+        assert!(state.job.is_none(), "the run is over either way");
+        assert_eq!(state.error.as_deref(), Some("row 12: no count"));
+        assert!(state.report.is_none());
+        assert!(!state.take_completed(), "nothing was committed");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_reported_where_the_preview_would_be() {
+        let mut state = previewed();
+        let _ = state.update(None, Message::Sniffed(Err("no such file".into())));
+        assert!(state.preview.is_none());
+        assert_eq!(state.preview_error.as_deref(), Some("no such file"));
+        assert!(!state.sniffing);
+    }
+
+    #[test]
     fn there_is_no_tick_subscription_when_nothing_is_running() {
         let state = State::default();
         assert!(state.job.is_none());

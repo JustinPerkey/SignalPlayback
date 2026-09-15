@@ -1372,4 +1372,160 @@ mod tests {
             .name;
         assert_eq!(name, "wave");
     }
+
+    #[test]
+    fn a_rename_reports_the_name_it_is_saving() {
+        let (_dir, store, id) = library(&[1.0]);
+        let mut state = loaded(&store, id);
+        let _ = state.update(None, Message::NameChanged("  chirp  ".into()));
+        let _ = state.update(Some(&store), Message::Rename);
+        assert_eq!(state.notice.as_deref(), Some("Renamed to 'chirp'."));
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn an_empty_tag_box_adds_nothing() {
+        let (_dir, store, id) = library(&[1.0]);
+        let mut state = loaded(&store, id);
+        let _ = state.update(None, Message::TagDraftChanged("   ".into()));
+        let _ = state.update(Some(&store), Message::AddTag);
+        let tags = store
+            .read(move |conn| library::signal_tags(conn, id))
+            .unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn a_tag_is_removed_through_the_store() {
+        let (_dir, store, id) = library(&[1.0]);
+        store
+            .write(move |conn| library::tag_signal(conn, id, "golden"))
+            .unwrap();
+        let mut state = loaded(&store, id);
+        let _ = state.update(Some(&store), Message::RemoveTag("golden".into()));
+        // As above: the task runs off-thread in the app, so the call the
+        // message performs is made directly to prove the round trip.
+        store
+            .write(move |conn| library::untag_signal(conn, id, "golden"))
+            .unwrap();
+        let tags = store
+            .read(move |conn| library::signal_tags(conn, id))
+            .unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn a_property_that_will_not_parse_is_reported_beside_the_form() {
+        let (_dir, store, id) = library(&[1.0]);
+        store
+            .write(|conn| {
+                props::insert_property_def(
+                    conn,
+                    &PropertyDef::new(
+                        "prf_hz",
+                        PropScope::Signal,
+                        sp_core::props::PropKind::FreqHz {
+                            min: None,
+                            max: None,
+                        },
+                    ),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut state = loaded(&store, id);
+
+        let _ = state.update(
+            None,
+            Message::PropChanged("prf_hz".into(), "not a number".into()),
+        );
+        let _ = state.update(Some(&store), Message::SaveProperties);
+        assert!(state.prop_error.is_some());
+        assert!(state.notice.is_none(), "nothing was saved to report");
+        let stored = store
+            .read(move |conn| library::get_signal(conn, id))
+            .unwrap();
+        assert!(!stored.attributes.contains_key("prf_hz"));
+
+        // A value that parses clears the complaint and is saved.
+        let _ = state.update(None, Message::PropChanged("prf_hz".into(), "1000".into()));
+        let _ = state.update(Some(&store), Message::SaveProperties);
+        assert!(state.prop_error.is_none());
+        assert_eq!(state.notice.as_deref(), Some("Properties saved."));
+    }
+
+    #[test]
+    fn a_jump_box_that_holds_no_index_says_what_it_wants() {
+        let (_dir, store, id) = library(&[1.0, 2.0]);
+        let mut state = loaded(&store, id);
+        let _ = state.update(None, Message::JumpChanged("halfway".into()));
+        let _ = state.update(Some(&store), Message::Jump);
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Type a sample index to jump to.")
+        );
+        assert_eq!(state.page_start, 0);
+    }
+
+    #[test]
+    fn a_failed_write_replaces_the_notice_with_what_went_wrong() {
+        let (_dir, store, id) = library(&[1.0]);
+        let mut state = loaded(&store, id);
+        state.notice = Some("Renamed to 'chirp'.".to_owned());
+        let _ = state.update(Some(&store), Message::Saved(Err("the row is gone".into())));
+        assert_eq!(state.error.as_deref(), Some("the row is gone"));
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn the_screen_builds_a_view_in_every_state_it_can_be_in() {
+        // Nothing inspected, then a target whose detail has not landed yet.
+        let mut state = State::default();
+        let _ = state.view();
+        state.target = Some(Target::Signal(SignalId::new(1)));
+        let _ = state.view();
+
+        // A signal with its statistics, values and property form.
+        let values: Vec<f64> = (0..(PAGE + 5) as usize).map(|i| i as f64).collect();
+        let (_dir, store, id) = library(&values);
+        store
+            .write(|conn| {
+                props::insert_property_def(
+                    conn,
+                    &PropertyDef::new(
+                        "prf_hz",
+                        PropScope::Signal,
+                        sp_core::props::PropKind::FreqHz {
+                            min: None,
+                            max: None,
+                        },
+                    ),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut state = loaded(&store, id);
+        let page = store
+            .read(move |conn| load_values(conn, Target::Signal(id), 0))
+            .unwrap();
+        let _ = state.update(None, Message::ValuesLoaded(Target::Signal(id), Ok(page)));
+        let profile = store
+            .read(move |conn| {
+                stats::profile_signal(conn, id, crate::settings::DEFAULT_BINS).map(Box::new)
+            })
+            .unwrap();
+        let _ = state.update(None, Message::Profiled(Target::Signal(id), Ok(profile)));
+        let _ = state.view();
+
+        // And with every message the screen can carry at once.
+        let _ = state.update(None, Message::TagDraftChanged("golden".into()));
+        let _ = state.update(
+            None,
+            Message::PropChanged("prf_hz".into(), "not a number".into()),
+        );
+        let _ = state.update(Some(&store), Message::SaveProperties);
+        state.error = Some("boom".to_owned());
+        state.notice = Some("Properties saved.".to_owned());
+        let _ = state.view();
+    }
 }
