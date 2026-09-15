@@ -1,10 +1,20 @@
 # SignalPlayback — Design Document
 
-**Status:** v1.3
+**Status:** v1.4
 **Date:** 2026-09-15
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v1.4** — M11 is built, so §9.8's "planned" table loses the three
+> families it named and §10.1's "built so far" gains the artifacts they emit:
+> **peak find** (`Peaks`), **slice**, **symbol decode** (`Symbols`), **bit pack**
+> (`Bits`) and **pulse metrics** (`Metrics`). §14 stops saying the stage
+> conformance harness is not built and says what it checks; §9.9 records that the
+> reference library declares itself impure, which is what the harness found the
+> first time it was pointed at it; §16 gains an M11 row and §16.1 marks the
+> milestone done; §15.3 moves the entries M11 delivered; and §18's
+> non-deterministic-stage row is no longer half-mitigated.
+>
 > **Changes in v1.3** — An audit rather than a milestone: every entry in §16 was re-checked
 > against the code, and where this document described an intention the entry now describes
 > what exists. §3 no longer names `csv`, `rustfft` or `realfft` — the block parser and the
@@ -231,7 +241,8 @@ SignalPlayback/
     │   ├── scheduler.rs       #   Group-at-a-time execution, cancellation, progress
     │   ├── cache.rs           #   Content-hash keyed stage-output reuse (§9.5)
     │   ├── assert.rs          #   The assertion grammar and its evaluation (§9.7)
-    │   └── compare.rs         #   Run-vs-run and run-vs-baseline diffing
+    │   ├── compare.rs         #   Run-vs-run and run-vs-baseline diffing
+    │   └── conform.rs         #   The contract any Stage impl is held to (§14)
     ├── sp-ext/                # External stages: native-library loading over the §9.9 C ABI.
     │   ├── abi.rs             #   Flat C structs, symbol names, version negotiation
     │   ├── descriptor.rs      #   The library's published JSON -> StageDescriptor
@@ -244,8 +255,9 @@ SignalPlayback/
     │   ├── condition.rs       #   Gain, detrend (mean/linear), normalise (peak/RMS)
     │   ├── filter.rs          #   IIR biquad — low / high / band / notch
     │   ├── transform.rs       #   FFT → Spectrum, and the windows it applies
-    │   ├── measure.rs         #   Statistics → a Statistics artifact and metrics
-    │   ├── detect.rs          #   Threshold → a Detections artifact
+    │   ├── measure.rs         #   Statistics, and pulse metrics over a detector's spans
+    │   ├── detect.rs          #   Threshold → Detections; peak find → Peaks
+    │   ├── digital.rs         #   Slice → logic, symbol decode → Symbols, bit pack → Bits
     │   ├── artifacts.rs       #   The artifact types those stages publish
     │   └── util.rs            #   Passthrough: a labelled inspection point
     ├── sp-engine/             # Playback clock, transport, render pyramids.
@@ -1455,8 +1467,9 @@ Enough to exercise the harness and cover common preprocessing, all implemented a
 same public trait a user's algorithm would use — nothing in `sp-dsp` is privileged, which
 is what makes G9 testable rather than aspirational.
 
-**Built.** Eight stage kinds, every one registered through the same `StageRegistry` a
-plugin uses:
+**Built.** Thirteen stage kinds, every one registered through the same `StageRegistry` a
+plugin uses, and every one run through the conformance harness of §14 by
+`sp-dsp/tests/conformance.rs`:
 
 | Kind | Family | What it does |
 |------|--------|--------------|
@@ -1467,19 +1480,28 @@ plugin uses:
 | `dsp.filter.biquad` | Filtering | Low / high / band / notch, as a cascade of identical RBJ sections; coefficients recomputed for a group whose rate differs rather than filtering at the wrong corner |
 | `dsp.transform.fft` | Transform | → `Spectrum` artifact, with a rectangular / Hann / Hamming / Blackman-Harris window; changes no samples |
 | `dsp.detect.threshold` | Detection | → `Detections` artifact, `detections` and `widest_s` metrics, and a `detection_count` on the group |
+| `dsp.detect.peaks` | Detection | → `Peaks` artifact. Local extrema ranked by **prominence** rather than by level, so a ripple on the flank of a real return is not a second detection; a minimum separation and a count keep the strongest, and a window bounds the prominence search for a long signal |
+| `dsp.digital.slice` | Digital | Adds a `DigitalLogic` signal beside the waveform it came from — a comparator with hysteresis, keeping the input so a bit's reason survives |
+| `dsp.digital.symbols` | Digital | → `Symbols` artifact. One decision per symbol period at two or four levels, with the clock phase recovered from the first edge, and the margin to the nearest decision boundary recorded per symbol |
+| `dsp.digital.bits` | Digital | → `Bits` artifact. Packs a `symbols.v1` artifact into words of a chosen width and bit order |
 | `dsp.measure.statistics` | Measurement | → `Statistics` artifact and per-signal metrics, reading the summary the store already holds; writes `rms` back as a property when asked to |
+| `dsp.measure.pulse` | Measurement | → `Metrics` artifact. Width, PRI, PRF, jitter and duty cycle of a `detections.v1` artifact, measured per signal so two interleaved channels are not read as one train; writes `prf_hz` and `duty` back when asked to |
 
-**Planned**, as the stage families of M11 (§16.1) — the harness does not need them, but a
-realistic pipeline does:
+The three stages that read an artifact rather than samples — `dsp.digital.bits`,
+`dsp.measure.pulse` — are the typed-port model of §9.3 earning its keep: the packer never
+learns what a waveform looks like, the decoder never learns about bit order, and pipeline
+validation refuses the chain before it runs if the producer is edited out.
+
+**Planned**, the families M11 did not need:
 
 | Family | Stages still to write |
 |--------|-----------------------|
 | Conditioning | DC block, clip, resample, window, trim/pad |
 | Filtering | FIR (windowed-sinc); a designed higher-order IIR whose sections differ — Butterworth, Chebyshev — rather than one section repeated |
 | Transform | STFT → `Spectrogram`, Hilbert → envelope + instantaneous phase |
-| Digital | Threshold/slice → `DigitalLogic`, clock recovery, symbol decode → `Symbols`, bit pack → `Bits` |
-| Detection | Peak find, edge find, pulse measure, CFAR |
-| Measurement | THD/SNR/SINAD, pulse metrics → `Metrics` |
+| Digital | Clock recovery that tracks rather than aligning once (Gardner, Mueller–Müller) |
+| Detection | Edge find, CFAR |
+| Measurement | THD/SNR/SINAD |
 | Utility | Split, merge, tee-to-property |
 
 ### 9.9 External Stages (Native Libraries)
@@ -1494,6 +1516,14 @@ library declares) so that it cannot shadow a built-in and a recorded run says at
 that its stage came from outside this build. From the pipeline editor, the results
 screen and the run schema it is an ordinary stage — the same parameter form, the same
 per-stage recording, the same stage rail.
+
+**The reference library declares itself impure.** `ext.sample.gain` publishes a
+`groups_seen` counter beside its output to prove the instance handle really is the state's
+home, and a counter means the same group handed over twice gives two different outputs. The
+conformance harness (§14) said so the first time it was pointed at the library, and the
+descriptor now carries `"pure": false` — which costs it the cache and costs the harness
+nothing: it passes every other check, waiving none, through exactly the code a built-in is
+run through.
 
 **Where it lives.** A new crate `sp-ext`, depending on `sp-proc` only, sits beside `sp-dsp`
 in the dependency rule. All `unsafe` FFI, library loading and buffer marshalling is
@@ -1652,11 +1682,17 @@ pub enum ViewHint {
 overlays land on the timeline, and it persists without any storage code. That is G9 applied
 to outputs rather than algorithms.
 
-Built so far: `Statistics`, `Detections` and `Spectrum`, the outputs of the three §9.8
-stages that emit one. The viewers are ahead of them — every `ViewHint` above has a pane,
-heatmap and scatter included — so `Spectrogram`, `Symbols`, `Bits`, `Metrics`,
-`Constellation` and `FilterResponse` are a stage away rather than a viewer away, and each
-arrives with the family that emits it (M11).
+Built: `Statistics`, `Detections`, `Spectrum`, `Peaks`, `Symbols`, `Bits` and `Metrics`,
+the outputs of the seven §9.8 stages that emit one. Each arrived with the stage that emits
+it, and each cost one `impl` and no storage or viewer code — which is the claim above,
+tested four times over at M11. `Peaks` draws as markers and `Symbols` as stems, so both
+land on the scope's own time axis beside the waveform they were taken from; `Bits` and
+`Metrics` are tables, the second carrying a unit per row because a pulse measurement
+reports seconds, hertz and a bare ratio in the same breath.
+
+The viewers are still ahead of the stages — every `ViewHint` above has a pane, heatmap and
+scatter included — so `Spectrogram`, `Constellation` and `FilterResponse` remain a stage
+away rather than a viewer away.
 
 **Storage.** Payloads under 64 KB are stored as JSON in `artifact.payload_json`; larger
 ones (a spectrogram matrix) go to a content-addressed blob (`kind = 'artifact'`) with the
@@ -1978,11 +2014,12 @@ Nothing panics on bad input — a corrupt CSV, a truncated blob, or a stage give
 zero-length signal produces a diagnostic. A stage that *returns* an error fails its own
 group and no other: the run carries on, the group is recorded `failed` with the message,
 and the remaining groups still produce their numbers. A stage that **panics** is a
-different matter and is not yet contained: `catch_unwind` guards the store's writer thread,
-so a panicking job cannot poison the connection, but there is no guard around
-`Stage::process`, so a panicking algorithm takes the run with it. That guard, and a
-per-stage timeout, belong with M14's isolation work — in-process is where a native library
-crashes too (§9.9).
+different matter and is not yet contained *at run time*: `catch_unwind` guards the store's
+writer thread, so a panicking job cannot poison the connection, and the conformance harness
+runs `process` under a guard of its own so a stage that panics on an empty group is a
+finding rather than a crashed test — but there is no guard in the scheduler, so a panicking
+algorithm still takes the run with it. That guard, and a per-stage timeout, belong with
+M14's isolation work — in-process is where a native library crashes too (§9.9).
 
 **Integrity.** A blob's checksum *is* its address: `sp-store` looks a column up by hash on
 write, so an identical column is shared rather than stored twice, and a write that does not
@@ -1995,7 +2032,7 @@ neither has a button yet (§12.1). Because the bytes and the rows describing the
 one SQLite transaction, the two cannot disagree after a crash — the failure mode a split
 file/database store has, and this one does not.
 
-**Testing.** 903 tests pass at v1.3, over a workspace that is clean under
+**Testing.** 966 tests pass at v1.4, over a workspace that is clean under
 `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`. CI runs all three on
 Windows and Linux for every push and pull request.
 
@@ -2009,6 +2046,9 @@ Windows and Linux for every push and pull request.
   semicolon delimiters, comment lines and uncooperative cells.
 - `crates/sp-dsp/tests/pipeline.rs` runs the scheduler end to end — cache hits and misses,
   retention, the sample cap, cancellation, a failing group, a deleted run.
+- `crates/sp-dsp/tests/families.rs` runs the M11 families over data whose answer is known
+  in advance: a pulse train goes in and 10 Hz, 20 ms and a duty of 0.2 come back out of the
+  database; an NRZ waveform goes in and the bits that made it come back out.
 - `crates/sp-app/tests/data_flow.rs` follows the data the whole way: a spec generates a
   ladder, the ladder lands in the library, a run measures what the spec put into it, the
   Inspector recomputes the same numbers, the output plays back over a pyramid of its own,
@@ -2018,11 +2058,29 @@ Windows and Linux for every push and pull request.
   *regressed* rather than *misused* (G8).
 - Each screen's `update` is tested directly — the buttons and the forms, screen by screen —
   because an Iced `update` is a pure function and needs no window.
-- **Not built: the stage conformance harness.** A generic test any `Stage` impl could be
-  run through — same input twice gives the same output hash, ports honoured, cancellation
-  noticed, no panic on an empty, single-sample, all-NaN or DC-only input — is what would
-  make G8 hold for stages nobody here wrote. It is M11's, alongside the stage families that
-  would be its first customers.
+- **The stage conformance harness** (`sp-proc/src/conform.rs`) is the generic test any
+  `Stage` impl can be run through, and it is what makes G8 hold for a stage nobody here
+  wrote. It supplies its own groups — an ordinary one, then empty, single-sample, all-NaN,
+  DC-only and non-finite — and asks seven questions of the stage over each: the descriptor
+  is coherent and namespaced (**declaration**); `configure` takes what the descriptor
+  declares and *refuses* what it does not (**configuration**); every input signal is
+  accounted for and the next stage's frame can be built (**contract**); every required
+  output port carries something of the kind it promised, and nothing is published on a port
+  nobody declared (**ports**); the same group gives the same output through this instance
+  and through a fresh one, and two instances salt the cache key the same way, asked only of
+  a stage that declares itself pure (**determinism**); a cancelled run stops it
+  (**cancellation**); and nothing panics, since `process` runs under `catch_unwind` and a
+  panic is a finding rather than a crashed test (**survival**). An error is a legitimate
+  answer throughout — a stage that cannot work with what it was handed says so, which is
+  §14's rule, not a failure to conform.
+
+  A waived check is named in the report, because a waiver is a promise nobody is holding
+  the stage to. `sp-dsp/tests/conformance.rs` runs all thirteen built-ins through it with
+  nothing waived, and `sp-ext/tests/native.rs` runs the sample external library through the
+  same code — the harness lives in `sp-proc` and knows nothing about DSP or about dynamic
+  loading, which is the point. It earned its keep on the first run: it found a passthrough
+  that ignored both its parameters and the cancel flag, and a reference external library
+  that called itself pure while publishing a call counter (§9.9).
 
 **Observability.** `tracing` spans around every job and every stage invocation, written to
 stderr and to a daily rolling file in the application data directory — under
@@ -2113,10 +2171,11 @@ existed since M3 and only the milestone table had not noticed.
 - **[done — M7]** Assertions on metrics, statistics, artifacts and stage timings; run status
   aggregates them.
 - **[done — M7]** Baseline promotion and automatic regression comparison.
-- **[V1.x]** Stage conformance test harness for new algorithms (M11, §14).
-- **[V1.x]** Detection, symbol-decode and measurement stage families. One detector
-  (threshold) and one measurement (statistics) exist as the harness's first customers;
-  symbol decode has none, and the families are M11's (§9.8).
+- **[done — M11]** Stage conformance test harness for new algorithms (§14). Every built-in
+  and the reference external library are run through it, with nothing waived.
+- **[done — M11]** Detection, symbol-decode and measurement stage families: peak find,
+  slice, symbol decode, bit pack and pulse metrics, with the four artifact kinds they emit
+  (§9.8, §10.1).
 - **[V2]** Parameter sweep over a stage — run the pipeline across a grid, get a metrics table.
 - **[V2]** Branching pipelines (a real DAG) with a graph editor.
 - **[V2]** Per-stage breakpoints: pause a run at a stage and inspect before continuing.
@@ -2296,6 +2355,7 @@ holds it, rather than to the commit that claimed it:
 | M8 | `sp-app/tests/data_flow.rs` runs the whole loop — spec → library → run → Inspector → playback → export → re-import. The release workflow builds the Windows and Linux binaries from a tag. |
 | M9 | `sp-ext/tests/native.rs`: `a_dll_runs_as_a_stage_over_one_group_at_a_time_and_every_output_is_persisted`, `every_result_carries_the_build_that_produced_it`, `the_library_file_is_part_of_the_cache_key`, `a_library_on_disk_is_refused_until_it_is_allowed_and_then_loads`. |
 | M10 | `sp-dsp/tests/pipeline.rs`: `editing_a_stage_re_runs_it_and_everything_after_it` is the first clause, `a_cached_run_records_what_a_cold_run_records` the second, with retention, the sample cap and `a_key_whose_run_is_gone_is_unpublished_rather_than_followed` beside them. |
+| M11 | `sp-dsp/tests/conformance.rs`: `every_builtin_conforms` and `the_harness_covers_every_check_for_every_builtin` hold the second clause with nothing waived, and `sp-ext/tests/native.rs`'s `a_stage_from_outside_this_binary_is_held_to_the_same_contract` holds it for a stage this crate did not write. `sp-dsp/tests/families.rs` holds the first: `detection_and_measurement_run_end_to_end_over_a_pulse_train`, `symbol_decode_runs_end_to_end_and_the_bits_are_the_bits_that_went_in`, `a_family_pipeline_is_valid_before_it_is_run`. |
 
 Two corrections came out of that pass rather than a milestone: §9.8 and §10.1 were
 describing stage and artifact families that were planned rather than written, and §13 was
@@ -2313,7 +2373,7 @@ not by section number.
 |-------|-------------|---------------|
 | **M9 — External stages** (done) | `sp-ext`, the §9.9 C ABI, library allow-list in settings, sample conforming DLL | A sample DLL runs as a stage over one group at a time; its path, hash and version are recorded in `run_stage` (G8) |
 | **M10 — Stage cache** (done) | Content-hash stage cache, per-stage retention policy, run-level sample cap | Editing stage *n* re-runs only *n…end*; a cached run and a cold run produce identical outputs |
-| **M11 — Stage families** | Detection, symbol-decode and measurement stages; stage conformance harness; the artifact kinds they emit (§10.1) | Each family has a stage that runs end-to-end and passes the conformance harness |
+| **M11 — Stage families** (done) | Detection, symbol-decode and measurement stages; stage conformance harness; the artifact kinds they emit (§10.1) | Each family has a stage that runs end-to-end and passes the conformance harness |
 | **M12 — Generation** | Impairment ladders, one group per rung; a flat-top window and FFT phase | A ladder produces one group per SNR rung, deterministically (G3) |
 | **M13 — Ingest & UX** | Drag-and-drop and multi-file import, watch folder, command palette, configurable shortcuts | A watched folder imports without user action; every action is reachable from the palette |
 | **M14 — Isolation** | `sp-stage-host`, shared-memory transport, `process_isolated` execution | A library that segfaults fails one group with a diagnostic and the run continues |
@@ -2330,12 +2390,23 @@ PRBS were all written at M3 — the generator was built to the whole of §8.1 ra
 the MVP slice of §15.2 — so what is left of the milestone is the impairment ladder that
 produces *one group per rung*, which is a change to how a sweep writes rather than to what
 a node renders, and the two FFT gaps (phase, a flat-top window). It is small enough now to
-fold into whichever milestone needs a degradation curve first, which is M11.
+fold into whichever milestone needs a degradation curve first. M11 did not — its families
+are measured against known-answer data rather than against a curve — so it is still open.
 
-**M11 grew by the same pass.** §9.8 and §10.1 now separate what is built from what is not,
-and the planned half of both tables is M11's scope: the stage families, the artifact kinds
-they emit, and the conformance harness that makes G8 mean something for a stage this
-workspace did not write.
+**M11 grew by that pass and is now delivered.** Five stages — peak find, slice, symbol
+decode, bit pack and pulse metrics — give the three families the milestone named a stage
+each, and the four artifact kinds they emit (`Peaks`, `Symbols`, `Bits`, `Metrics`) cost an
+`impl` apiece, as §10.1 promised they would. The harness came first and was worth it
+twice over before the families were written: it found a passthrough that ignored its
+parameters and the cancel flag, and a reference external library calling itself pure while
+publishing a call counter. Two of the new stages read an artifact rather than samples,
+which is the first real exercise of §9.3's typed ports outside a test.
+
+What M11 did *not* do is the rest of §9.8's planned table — FIR and designed IIR filters,
+STFT and Hilbert, CFAR, THD/SNR — none of which the exit criterion asked for and none of
+which the harness needs. They stay planned, in the same table, with one addition: the
+clock recovery here aligns once from the first edge, which is honest for a clean capture
+and not enough for a drifting one.
 
 ---
 
@@ -2406,10 +2477,13 @@ noted.
    read for. `OnFailure` as the default was rejected: the common case is a workbench being
    iterated on, where the run that passed is the one to compare against next.
 11. **Artifact size ceiling.** 64 KB inline / blob beyond that is a guess, and still
-   untested: the three artifact kinds that exist (§10.1) are all small, and the one that
-   would strain it — a fine-resolution spectrogram, hundreds of MB a group — arrives with
-   M11. If that turns out to be routine, the spectrogram artifact should store a decimated
-   pyramid the way signals do.
+   barely tested: of the seven artifact kinds that exist (§10.1) only `Bits` and `Symbols`
+   can grow with the capture, and a long bitstream crosses the line into a blob without
+   anything noticing — which is the design working, but on a payload of megabytes rather
+   than the hundreds the ceiling was picked for. The kind that would strain it, a
+   fine-resolution spectrogram, still arrives with the STFT stage nobody has written. If
+   that turns out to be routine, the spectrogram artifact should store a decimated pyramid
+   the way signals do.
 
 ### Playback — resolved at M4
 
@@ -2453,8 +2527,8 @@ noted.
 | Per-pulse annotation demand outgrows the lazy `pulse` table (§17.5) | Model rework at M2+ | Identity is `(group, index)` either way, so materialising rows later is an additive migration, not a re-import |
 | Intermediate-result storage grows unbounded | Library bloats, disk fills | Content-addressed dedup makes passthrough free; per-stage retention policy; run-level size cap; prune-old-runs maintenance action |
 | Linear pipeline too restrictive for real algorithms | Model rework | Typed ports cover the common "needs an earlier artifact" case and have carried every pipeline written so far, M9's external stage included; the `Stage` trait is still graph-ready. §17.6 went unsettled through M5 and is now answered by use rather than by decision |
-| Stage authors write non-deterministic stages | G8 silently false | *Half-mitigated.* An impure stage opts out of caching through `descriptor().pure`, and a run records the hash of everything a stage read — but the conformance harness that would run a stage twice and compare output hashes is not written (M11, §14), so nothing yet catches a stage that lies about being pure |
-| A user algorithm panics or hangs | Run lost, app unstable | *Open.* A stage that returns an error already fails one group and no more, and the store's writer thread is guarded — but there is no `catch_unwind` around `Stage::process` and no per-stage timeout, so a panicking or hanging algorithm still takes the run. It belongs with M14, which has to solve the harder version of the same problem for a native library (§9.9, §14) |
+| Stage authors write non-deterministic stages | G8 silently false | *Mitigated.* An impure stage opts out of caching through `descriptor().pure`, a run records the hash of everything a stage read, and the conformance harness (§14) runs a pure stage's group twice — through the same instance and a fresh one — and compares a digest of everything it produced. It caught the first stage that lied about being pure the day it was written (§9.9). It is a test rather than a guarantee: a stage nobody runs through it is still unchecked, which is why every built-in and the reference library are |
+| A user algorithm panics or hangs | Run lost, app unstable | *Open.* A stage that returns an error already fails one group and no more, the store's writer thread is guarded, and the conformance harness catches a panic on the degenerate inputs it knows to try — but there is no `catch_unwind` around `Stage::process` in the scheduler and no per-stage timeout, so a panicking or hanging algorithm still takes the run. It belongs with M14, which has to solve the harder version of the same problem for a native library (§9.9, §14) |
 | Iced canvas performance at 8+ dense traces plus overlays | Misses G2 | Pyramid decimation caps draw cost at viewport width; layered caches; `wgpu` backend; fall back to instanced GPU line rendering if needed |
 | Iced API churn between releases | Build breakage | Pin the minor version; isolate all Iced usage in `sp-app` |
 | WAL growth and write amplification during a large import | Slow import, transient disk use several times the payload | 4 MiB chunks with `wal_autocheckpoint` tuned to match; import commits per group, not per file; measured against the §13 ingest budget |

@@ -10,8 +10,48 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
 ## Status
 
-**M10 — Stage cache.** The first milestone of the 1.x track to touch the
-scheduler: editing stage *n* re-runs stages *n…end* and no more, and a cached
+**M11 — Stage families.** A contract written down once, and three families of
+stage held to it.
+
+- **The stage conformance harness** (`sp-proc/src/conform.rs`) is a generic
+  test any `Stage` implementation can be run through. It supplies its own
+  groups — an ordinary one, then empty, single-sample, all-NaN, DC-only and
+  non-finite — and asks seven questions over each: is the descriptor coherent
+  and namespaced; does `configure` take what it declares and *refuse* what it
+  does not; is every input signal accounted for; does every required port
+  carry what it promised; does the same group give the same output twice, for
+  a stage that calls itself pure; does a cancelled run stop it; and does
+  anything panic. An error is a legitimate answer throughout — a stage that
+  cannot work with what it was handed says so. A waived check is named in the
+  report, because a waiver is a promise nobody is holding the stage to.
+- **It earned its keep on the first run.** It found a passthrough that ignored
+  both its parameters and the cancel flag, and a reference external library
+  that called itself pure while publishing a per-instance call counter. All
+  thirteen built-ins and the sample DLL now go through it with nothing waived
+  — the harness lives in `sp-proc` and knows nothing about DSP or about
+  dynamic loading, which is the point of G9.
+- **Detection** — `dsp.detect.peaks` ranks local extrema by **prominence**
+  rather than by level, so a ripple on the flank of a real return is not a
+  second detection. A minimum separation and a count keep the strongest; a
+  window bounds the search on a long signal, and can only understate.
+- **Symbol decode** — `dsp.digital.slice` adds a logic signal beside the
+  waveform it came from, `dsp.digital.symbols` decides one symbol per clock
+  period at two or four levels with the phase recovered from the first edge,
+  and `dsp.digital.bits` packs the result into words. Each step is a chip on
+  the rail, so "the bits are wrong" can be answered with *where*.
+- **Measurement** — `dsp.measure.pulse` turns a detector's spans into width,
+  PRI, PRF, jitter and duty cycle, measured per signal so two interleaved
+  channels are not read as one train.
+- **Four new artifact kinds** — `Peaks` and `Symbols` draw on the scope's own
+  time axis as markers and stems; `Bits` and `Metrics` are tables, the second
+  carrying a unit per row. Each cost one `impl` and no storage or viewer code.
+- **Typed ports, used for real.** The packer reads a `symbols.v1` artifact and
+  the pulse metrics a `detections.v1`, so neither names the stage in front of
+  it and editing that stage out is an error the editor reports rather than a
+  run that fails at the first group.
+
+Before it, **M10 — Stage cache**, the first milestone of the 1.x track to touch
+the scheduler: editing stage *n* re-runs stages *n…end* and no more, and a cached
 run records exactly what a cold run records.
 
 - **Content-hash reuse** — a stage's key folds its kind, version, parameters,
@@ -138,8 +178,8 @@ Dependencies point left-to-right only: `sp-core` depends on nothing else here,
 | `sp-csv` | Grouped-block CSV framer, parser, import profiles, writer | M2 |
 | `sp-gen` | `GenSpec` node tree and its renderer | M3 |
 | `sp-engine` | Transport state machine, playback clock, render pyramids | M4 |
-| `sp-proc` | `Stage` trait, registry, ports, scheduler, run recording, assertions, run diffing, the stage cache key and the sample cap | M5, M7, M10 |
-| `sp-dsp` | Built-in stages: passthrough, gain, detrend, normalise, biquad, statistics, threshold, FFT | M5 |
+| `sp-proc` | `Stage` trait, registry, ports, scheduler, run recording, assertions, run diffing, the stage cache key and the sample cap, the conformance harness | M5, M7, M10, M11 |
+| `sp-dsp` | Built-in stages: passthrough, gain, detrend, normalise, biquad, FFT, threshold, peak find, slice, symbol decode, bit pack, statistics, pulse metrics | M5, M11 |
 | `sp-ext` | External stages: loading a native library over the flat C ABI, and the paths this installation may load | M9 |
 | `sp-ext-sample` | A conforming library built as a `cdylib`: the ABI's reference implementation, and what `sp-ext`'s tests load | M9 |
 | `sp-app` | The Iced application — the only crate that knows about pixels | M0+ |

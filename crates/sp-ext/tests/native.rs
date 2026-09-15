@@ -380,3 +380,37 @@ fn a_dll_runs_as_a_stage_over_one_group_at_a_time_and_every_output_is_persisted(
         assert!(!external.cache_key.is_empty());
     }
 }
+
+#[test]
+fn a_stage_from_outside_this_binary_is_held_to_the_same_contract() {
+    // G9 is only worth something if it cuts both ways: the harness in
+    // `sp-proc` knows nothing about `sp-ext`, and the sample library is run
+    // through exactly what a built-in is run through (§14, §16.1).
+    let library = linked_in();
+    let report = sp_proc::Conformance::from_fn(move || {
+        let mut registry = StageRegistry::new();
+        sp_ext::register(&mut registry, Arc::clone(&library)).unwrap();
+        registry.create("ext.sample.gain").unwrap()
+    })
+    .with_params(ParamSet::new().with("gain", 3.0))
+    .run();
+
+    assert!(report.is_pass(), "{}", report.describe());
+    assert_eq!(report.kind(), "ext.sample.gain");
+    assert!(report.skipped().is_empty(), "nothing was waived");
+}
+
+#[test]
+fn the_reference_library_says_it_is_impure_because_it_publishes_a_counter() {
+    // What the harness found the first time it was pointed at this library:
+    // `groups_seen` makes the same group give two different outputs, which a
+    // pure stage may not do — its cached output would be a lie (§9.5, §18).
+    let library = linked_in();
+    assert!(!library.descriptor().pure);
+
+    let mut stage = stage_of(&library, ParamSet::new());
+    let first = stage.process(&ctx(), &frame(&[1.0])).unwrap();
+    let second = stage.process(&ctx(), &frame(&[1.0])).unwrap();
+    assert_eq!(first.metrics["groups_seen"], 1.0);
+    assert_eq!(second.metrics["groups_seen"], 2.0);
+}
