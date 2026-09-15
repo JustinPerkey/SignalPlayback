@@ -3,13 +3,15 @@
 //! byte, and `Verify Library` passes.
 
 use serde_json::json;
+use sp_core::run::{Disposition, RunStatus};
+use sp_core::SignalStats;
 use sp_core::{
     Attributes, DType, Domain, FieldRange, PropKind, PropScope, PropertyDef, Provenance,
     SampleBuffer, SampleRange, Samples, Scaling, SourceKind, TimeUnit, Timebase,
 };
 use sp_store::blob::{self, BlobKind, BlobWriter, HEADER_LEN};
 use sp_store::{
-    library, props, pulses, pyramid, trains, verify, NewDataset, NewGroup, NewPulseField,
+    library, props, pulses, pyramid, runs, trains, verify, NewDataset, NewGroup, NewPulseField,
     NewPulseGroup, NewSignal, NewTrain, PropertyQuery, PulsePredicate, Store,
 };
 
@@ -923,4 +925,94 @@ fn a_second_pyramid_for_the_same_column_is_refused_without_leaking() {
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn a_library_with_a_run_in_it_verifies_clean() {
+    // A run holds blob references of its own: a passthrough shares the
+    // library's column, a stage that changed samples writes a new one, and an
+    // artifact too large to sit inline becomes a blob (§9.6, §10.1). All three
+    // are references like any other, so `Verify Library` has to count them —
+    // a library is only healthy if the results in it are.
+    let (_dir, store) = open();
+    let (signal_id, group_id) = store
+        .write(|conn| {
+            let dataset =
+                library::insert_dataset(conn, &NewDataset::new("r", SourceKind::Generated))?;
+            let train = trains::insert_train(conn, &NewTrain::new(dataset, 0))?;
+            let group = library::insert_group(conn, &NewGroup::new(train, 0, 1))?;
+            let signal = library::insert_signal(
+                conn,
+                &NewSignal::new(
+                    group,
+                    0,
+                    "rf",
+                    Timebase::regular(1_000.0, 0.0),
+                    SampleBuffer::from_f64(DType::F64, &sine(64)),
+                ),
+            )?;
+            Ok((signal, group))
+        })
+        .unwrap();
+
+    let before = store.read(verify::verify).unwrap();
+    assert!(before.is_clean(), "{before:?}");
+    assert_eq!(before.blobs_checked, 1);
+
+    let run = store
+        .write(move |conn| {
+            let blob = library::signal_blob(conn, signal_id)?;
+            let pipeline = runs::insert_pipeline(conn, &runs::NewPipeline::new("p"))?;
+            let run = runs::begin_run(conn, &runs::NewRun::new(pipeline, "hash"))?;
+            let timebase = Timebase::regular(1_000.0, 0.0);
+
+            // The source, sharing the library's own column.
+            runs::record_signal(
+                conn,
+                run,
+                &runs::NewRunSignal::new(group_id, runs::SOURCE_STAGE, 0, "rf", timebase)
+                    .with_disposition(Disposition::Passthrough)
+                    .sharing_blob(blob, 64, SignalStats::default()),
+            )?;
+            // A stage that rewrote the samples, and so wrote a column of its
+            // own — different numbers, or the blob store would rightly hand
+            // back the one already there.
+            let gained: Vec<f64> = sine(64).iter().map(|v| v * 2.0).collect();
+            runs::record_signal(
+                conn,
+                run,
+                &runs::NewRunSignal::new(group_id, 0, 0, "rf", timebase)
+                    .with_disposition(Disposition::Replaced)
+                    .with_samples(SampleBuffer::from_f64(DType::F64, &gained)),
+            )?;
+            // A payload past the inline limit, which lands out of line.
+            let payload = format!(
+                r#"{{"note":"{}"}}"#,
+                "x".repeat(runs::INLINE_PAYLOAD_LIMIT + 1)
+            );
+            runs::insert_artifact(
+                conn,
+                run,
+                &runs::NewArtifact::new(0, "spectrum", "spectrum.v1", 1, payload)
+                    .for_group(group_id),
+            )?;
+            runs::finish_run(conn, run, RunStatus::Ok)?;
+            Ok(run)
+        })
+        .unwrap();
+
+    let during = store.read(verify::verify).unwrap();
+    assert!(during.is_clean(), "{during:?}");
+    assert_eq!(
+        during.blobs_checked, 3,
+        "the library column, the stage's column and the artifact payload"
+    );
+
+    // And deleting the run gives back exactly what it took.
+    store
+        .write(move |conn| runs::delete_run(conn, run))
+        .unwrap();
+    let after = store.read(verify::verify).unwrap();
+    assert!(after.is_clean(), "{after:?}");
+    assert_eq!(after.blobs_checked, before.blobs_checked);
 }

@@ -572,6 +572,22 @@ pub fn signal_blob(conn: &Connection, id: SignalId) -> Result<BlobId> {
         .ok_or_else(|| StoreError::corrupt(format!("signal {} has no sample blob", id.get())))
 }
 
+/// The generator spec a signal was rendered from, when it was generated
+/// rather than imported.
+///
+/// The samples are a cache of this (§8), so a caller that wants to re-render
+/// a signal — or to prove the stored column still matches the spec that made
+/// it (G3) — reads it back through here rather than through SQL of its own.
+pub fn gen_spec(conn: &Connection, id: SignalId) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT gen_spec FROM signal WHERE id = ?1",
+        [id.get()],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| StoreError::not_found("signal", id.get()))
+}
+
 /// Reads a span of a signal's samples; the range is clamped to the signal.
 pub fn read_samples(conn: &Connection, id: SignalId, range: SampleRange) -> Result<SampleBuffer> {
     let blob_id = signal_blob(conn, id)?;
