@@ -131,6 +131,7 @@ fn collect(node: &Node, pointer: String, depth: usize, slot: String, out: &mut V
         | Node::Delay { input, .. }
         | Node::Clip { input, .. }
         | Node::Envelope { input, .. }
+        | Node::Awgn { input, .. }
         | Node::Resample { input, .. } => collect(
             input,
             child_pointer(&pointer, INPUT, None),
@@ -203,6 +204,7 @@ pub fn summary(node: &Node) -> String {
         Node::Clip { lo, hi, .. } => format!("{} to {}", trim(*lo), trim(*hi)),
         Node::Envelope { env, .. } => env.label().to_owned(),
         Node::Modulate { kind, .. } => kind.label().to_owned(),
+        Node::Awgn { snr_db, .. } => format!("{} dB SNR", trim(*snr_db)),
         Node::Resample { to_rate_hz, .. } => hz(*to_rate_hz),
         Node::FromSignal { signal_id } => format!("signal {}", signal_id.get()),
     }
@@ -275,6 +277,7 @@ fn descend<'a>(node: &'a Node, tokens: &[&str]) -> Option<&'a Node> {
             | Node::Delay { input, .. }
             | Node::Clip { input, .. }
             | Node::Envelope { input, .. }
+            | Node::Awgn { input, .. }
             | Node::Resample { input, .. },
             INPUT,
         ) => descend(input, rest),
@@ -309,6 +312,7 @@ fn descend_mut<'a>(node: &'a mut Node, tokens: &[&str]) -> Option<&'a mut Node> 
             | Node::Delay { input, .. }
             | Node::Clip { input, .. }
             | Node::Envelope { input, .. }
+            | Node::Awgn { input, .. }
             | Node::Resample { input, .. },
             INPUT,
         ) => descend_mut(input, rest),

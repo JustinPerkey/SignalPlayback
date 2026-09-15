@@ -241,6 +241,17 @@ pub enum Node {
         modulator: Box<Node>,
         kind: ModKind,
     },
+    /// `input` with Gaussian noise added at a target signal-to-noise ratio,
+    /// which is the rung of an impairment ladder (§8.4).
+    ///
+    /// The noise is scaled from the power of what it is added to, so the node
+    /// measures its input rather than taking an amplitude. That measurement is
+    /// over a bounded probe window fixed by the node's own grid rather than by
+    /// the window being rendered, so a chunk still equals the whole (§8.2).
+    Awgn {
+        input: Box<Node>,
+        snr_db: f64,
+    },
     /// Samples `input` at `to_rate_hz` and reads it back with linear
     /// interpolation - a decimation, aliasing included.
     Resample {
@@ -298,6 +309,7 @@ pub enum NodeKind {
     Clip,
     Envelope,
     Modulate,
+    Awgn,
     Resample,
     FromSignal,
 }
@@ -305,7 +317,7 @@ pub enum NodeKind {
 impl NodeKind {
     /// Primitives first, then combinators, which is the order the palette
     /// shows them in.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::Sine,
         Self::Square,
         Self::Triangle,
@@ -327,6 +339,7 @@ impl NodeKind {
         Self::Clip,
         Self::Envelope,
         Self::Modulate,
+        Self::Awgn,
         Self::Resample,
         Self::FromSignal,
     ];
@@ -355,6 +368,7 @@ impl NodeKind {
             Self::Clip => "Clip",
             Self::Envelope => "Envelope",
             Self::Modulate => "Modulate",
+            Self::Awgn => "AWGN",
             Self::Resample => "Resample",
             Self::FromSignal => "From signal",
         }
@@ -374,6 +388,7 @@ impl NodeKind {
                 | Self::Clip
                 | Self::Envelope
                 | Self::Modulate
+                | Self::Awgn
                 | Self::Resample
         )
     }
@@ -485,6 +500,10 @@ impl NodeKind {
                 }),
                 kind: ModKind::Am { depth: 0.5 },
             },
+            Self::Awgn => Node::Awgn {
+                input: child(),
+                snr_db: 20.0,
+            },
             Self::Resample => Node::Resample {
                 input: child(),
                 to_rate_hz: 8_000.0,
@@ -550,6 +569,7 @@ impl Node {
             Self::Clip { .. } => NodeKind::Clip,
             Self::Envelope { .. } => NodeKind::Envelope,
             Self::Modulate { .. } => NodeKind::Modulate,
+            Self::Awgn { .. } => NodeKind::Awgn,
             Self::Resample { .. } => NodeKind::Resample,
             Self::FromSignal { .. } => NodeKind::FromSignal,
         }
@@ -568,6 +588,7 @@ impl Node {
             | Self::Delay { input, .. }
             | Self::Clip { input, .. }
             | Self::Envelope { input, .. }
+            | Self::Awgn { input, .. }
             | Self::Resample { input, .. } => vec![("input", input)],
             Self::Modulate {
                 carrier, modulator, ..

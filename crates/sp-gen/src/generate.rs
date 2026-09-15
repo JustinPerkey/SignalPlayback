@@ -4,11 +4,12 @@
 //! what an import produces too (§6.6) and the two have to be interchangeable
 //! as pipeline input.
 //!
-//! [`generate`] fills that train with one group of sampled signals: a single
-//! signal, or one per rung of a sweep with the swept value stored as a
-//! property on each. That is the shape a pipeline wants as test input (§8.3) —
-//! a run can group by the property and the degradation curve falls out of one
-//! run. [`generate_train`] fills it with groups of pulse records instead.
+//! [`generate`] fills that train with sampled signals: a single signal, one
+//! group holding one per rung of a sweep, or — a ladder — one group per rung,
+//! with the swept value stored as a property either way (§8.4). The layout is
+//! the difference between a curve across the signals of one group and a curve
+//! across groups, and the group is what a pipeline processes and asserts over.
+//! [`generate_train`] fills the train with groups of pulse records instead.
 //!
 //! The whole batch is one SQLite transaction, so a failure or a cancellation
 //! rolls back the rows *and* the blobs, exactly as import does (§14).
@@ -28,7 +29,7 @@ use crate::control::{GenControl, GenProgress};
 use crate::error::{GenError, Result};
 use crate::render::{self, SourceSignal, Sources};
 use crate::spec::GenSpec;
-use crate::sweep::{self, ParamSweep};
+use crate::sweep::{self, ParamSweep, SweepLayout};
 use crate::train::TrainSpec;
 use crate::validate::{self, validate, validate_train};
 
@@ -39,6 +40,14 @@ pub const SEED_KEY: &str = "gen_seed";
 /// The attribute a generated train carries its `TrainSpec` in, the way a
 /// generated signal carries its `GenSpec` in `signal.gen_spec`.
 pub const TRAIN_SPEC_KEY: &str = "gen_train_spec";
+
+/// The group attribute naming the JSON pointer a sweep stepped.
+pub const SWEEP_PARAMETER_KEY: &str = "gen_sweep_parameter";
+
+/// The group attribute naming the property the swept value is stored under.
+/// A reader follows it to the value rather than guessing which attribute of a
+/// group is its rung.
+pub const SWEEP_PROPERTY_KEY: &str = "gen_sweep_property";
 
 /// What to generate, and how to describe it in the library.
 #[derive(Debug, Clone)]
@@ -52,6 +61,8 @@ pub struct GenRequest {
     pub spec: GenSpec,
     /// The sweep, when one signal is not enough (§8.3).
     pub sweep: Option<ParamSweep>,
+    /// How the sweep's rungs land in the library (§8.4).
+    pub layout: SweepLayout,
     pub notes: Option<String>,
 }
 
@@ -64,6 +75,7 @@ impl GenRequest {
             signal_name: "Generated".to_owned(),
             spec,
             sweep: None,
+            layout: SweepLayout::default(),
             notes: None,
         }
     }
@@ -84,6 +96,19 @@ impl GenRequest {
     pub fn with_sweep(mut self, sweep: ParamSweep) -> Self {
         self.sweep = Some(sweep);
         self
+    }
+
+    #[must_use]
+    pub fn with_layout(mut self, layout: SweepLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Whether this request writes an impairment ladder: a sweep, laid out one
+    /// group per rung.
+    #[must_use]
+    pub fn is_ladder(&self) -> bool {
+        self.sweep.is_some() && self.layout == SweepLayout::GroupPerRung
     }
 
     /// The dataset name actually used.
@@ -162,6 +187,13 @@ impl GenReport {
             self.samples,
             plural(self.samples),
         );
+        if self.groups > 1 {
+            summary.push_str(&format!(
+                ", {} group{}",
+                self.groups,
+                plural(u64::from(self.groups))
+            ));
+        }
         if let Some(key) = &self.swept_property {
             summary.push_str(&format!(", swept by {key}"));
         }
@@ -220,30 +252,53 @@ pub fn generate(
             .named(request.group_name.clone().unwrap_or_else(|| name.clone())),
     )?;
 
-    let mut group_attributes = Attributes::new();
+    // A ladder gives every rung its own group, because the group is what a
+    // pipeline runs, caches and asserts over (§8.4); every other shape is one
+    // group holding the lot.
+    let ladder = request.is_ladder();
     if let Some(sweep) = &request.sweep {
-        group_attributes.insert("gen_sweep_parameter", sweep.json_pointer());
-        group_attributes.insert("gen_sweep_property", sweep.property_key.clone());
-    }
-    let group_id = library::insert_group(
-        &tx,
-        &NewGroup {
-            train_id,
-            ordinal: 0,
-            name: Some(request.group_name.clone().unwrap_or_else(|| name.clone())),
-            declared_count: signals_total,
-            actual_count: signals_total,
-            attributes: group_attributes,
-        },
-    )?;
-
-    if let Some(sweep) = &request.sweep {
-        declare_swept_property(&tx, sweep)?;
+        declare_swept_property(&tx, sweep, ladder)?;
     }
 
+    let shared_group = if ladder {
+        None
+    } else {
+        Some(library::insert_group(
+            &tx,
+            &NewGroup {
+                train_id,
+                ordinal: 0,
+                name: Some(request.group_name.clone().unwrap_or_else(|| name.clone())),
+                declared_count: signals_total,
+                actual_count: signals_total,
+                attributes: sweep_attributes(request, None),
+            },
+        )?)
+    };
+
+    let mut first_group = shared_group;
     let mut samples_done = 0;
     for (ordinal, (value, spec)) in rungs.iter().enumerate() {
         control.check()?;
+
+        let group_id = match shared_group {
+            Some(id) => id,
+            None => {
+                let id = library::insert_group(
+                    &tx,
+                    &NewGroup {
+                        train_id,
+                        ordinal: ordinal as u32,
+                        name: Some(rung_name(request, *value)),
+                        declared_count: 1,
+                        actual_count: 1,
+                        attributes: sweep_attributes(request, *value),
+                    },
+                )?;
+                first_group.get_or_insert(id);
+                id
+            }
+        };
 
         let buffer = render_rung(spec, &sources, control)?;
         let mut attributes = Attributes::new();
@@ -254,7 +309,7 @@ pub fn generate(
 
         let signal = NewSignal {
             group_id,
-            ordinal: ordinal as u32,
+            ordinal: if ladder { 0 } else { ordinal as u32 },
             name: signal_name(request, *value),
             units: None,
             domain: spec.domain,
@@ -276,6 +331,9 @@ pub fn generate(
     }
 
     control.check()?;
+    let group_id = first_group.ok_or_else(|| {
+        GenError::Invalid(validate::sweep_issue("", "the sweep produced no rungs"))
+    })?;
     tx.commit().map_err(sp_store::StoreError::from)?;
 
     Ok(GenReport {
@@ -283,7 +341,7 @@ pub fn generate(
         train_id,
         group_id,
         name,
-        groups: 1,
+        groups: if ladder { signals_total } else { 1 },
         signals: signals_total,
         samples: samples_done,
         pulses: 0,
@@ -435,6 +493,49 @@ fn render_rung(spec: &GenSpec, sources: &Sources, control: &GenControl) -> Resul
     )
 }
 
+/// What a group carries about the sweep that produced it. A ladder's group
+/// also carries its own rung, since the rung is a property of the group rather
+/// than of one signal inside it.
+fn sweep_attributes(request: &GenRequest, value: Option<f64>) -> Attributes {
+    let mut attributes = Attributes::new();
+    let Some(sweep) = &request.sweep else {
+        return attributes;
+    };
+    attributes.insert(SWEEP_PARAMETER_KEY, sweep.json_pointer());
+    attributes.insert(SWEEP_PROPERTY_KEY, sweep.property_key.clone());
+    if let Some(value) = value {
+        attributes.insert(sweep.property_key.clone(), PropertyValue::from(value));
+    }
+    attributes
+}
+
+/// A ladder group's name: the rung, in the property it is stored under, so the
+/// chart across groups is labelled by the value rather than by an ordinal.
+fn rung_name(request: &GenRequest, value: Option<f64>) -> String {
+    match (&request.sweep, value) {
+        (Some(sweep), Some(value)) => format!("{} {}", sweep.property_key, trim(value)),
+        _ => request
+            .group_name
+            .clone()
+            .unwrap_or_else(|| request.dataset_name()),
+    }
+}
+
+/// A number without a trailing `.0`, so a rung reads `snr_db 6` rather than
+/// `snr_db 6.000000`.
+fn trim(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let text = format!("{value:.6}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text.is_empty() || text == "-0" {
+        "0".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
 fn signal_name(request: &GenRequest, value: Option<f64>) -> String {
     let base = request.signal_name.trim();
     let base = if base.is_empty() { "Generated" } else { base };
@@ -481,31 +582,39 @@ fn resolve_sources(conn: &Connection, rungs: &[(Option<f64>, GenSpec)]) -> Resul
     Ok(sources)
 }
 
-/// Declares the swept value as a signal property, so the library shows it as a
-/// typed column rather than as an unrecognised attribute (§6.4).
-fn declare_swept_property(conn: &Connection, sweep: &ParamSweep) -> Result<()> {
-    if props::get_property_def(conn, PropScope::Signal, &sweep.property_key)?.is_some() {
-        return Ok(());
+/// Declares the swept value as a property, so the library shows it as a typed
+/// column rather than as an unrecognised attribute (§6.4). A ladder declares
+/// it at group scope too, since that is where its rung is written.
+fn declare_swept_property(conn: &Connection, sweep: &ParamSweep, ladder: bool) -> Result<()> {
+    let mut scopes = vec![PropScope::Signal];
+    if ladder {
+        scopes.push(PropScope::Group);
     }
-    let def = PropertyDef::new(
-        sweep.property_key.clone(),
-        PropScope::Signal,
-        PropKind::Float {
-            min: None,
-            max: None,
-            step: None,
-        },
-    )
-    .with_label(sweep.field.clone())
-    .in_section("Generated");
-    match props::insert_property_def(conn, &def) {
-        Ok(_) => Ok(()),
-        // A pointer like `parts/0/duration_s` does not make a legal property
-        // key. The value still reaches the signal's attributes, so the sweep
-        // works; it just has no typed column (§6.5).
-        Err(sp_store::StoreError::Invalid(_)) => Ok(()),
-        Err(error) => Err(error.into()),
+    for scope in scopes {
+        if props::get_property_def(conn, scope, &sweep.property_key)?.is_some() {
+            continue;
+        }
+        let def = PropertyDef::new(
+            sweep.property_key.clone(),
+            scope,
+            PropKind::Float {
+                min: None,
+                max: None,
+                step: None,
+            },
+        )
+        .with_label(sweep.field.clone())
+        .in_section("Generated");
+        match props::insert_property_def(conn, &def) {
+            Ok(_) => {}
+            // A pointer like `parts/0/duration_s` does not make a legal
+            // property key. The value still reaches the attributes, so the
+            // sweep works; it just has no typed column (§6.5).
+            Err(sp_store::StoreError::Invalid(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]

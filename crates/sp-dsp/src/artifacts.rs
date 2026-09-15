@@ -88,6 +88,12 @@ pub struct Spectrum {
     /// Amplitude in dB, referenced to an amplitude of 1.0 — so a full-scale
     /// sine peaks at 0 dB whatever the transform length.
     pub magnitude_db: Vec<f64>,
+    /// Phase per bin in radians, wrapped to `(-pi, pi]`, measured from the
+    /// start of the transformed frame. Empty on a spectrum recorded before
+    /// phase was published, which is why it defaults rather than being
+    /// required: an old run stays readable.
+    #[serde(default)]
+    pub phase_rad: Vec<f64>,
 }
 
 impl Spectrum {
@@ -97,7 +103,22 @@ impl Spectrum {
             signal: signal.into(),
             freq_hz,
             magnitude_db,
+            phase_rad: Vec::new(),
         }
+    }
+
+    /// The same spectrum with its phase attached.
+    #[must_use]
+    pub fn with_phase(mut self, phase_rad: Vec<f64>) -> Self {
+        self.phase_rad = phase_rad;
+        self
+    }
+
+    /// The phase of the strongest bin, which is the only phase a scalar
+    /// comparison between two runs can be made of.
+    #[must_use]
+    pub fn peak_phase(&self) -> Option<f64> {
+        self.phase_rad.get(self.peak_bin()?).copied()
     }
 
     #[must_use]
@@ -114,14 +135,23 @@ impl Spectrum {
     /// across-groups metric both read.
     #[must_use]
     pub fn peak(&self) -> Option<(f64, f64)> {
-        let (index, db) = self.magnitude_db.iter().copied().enumerate().fold(
-            None,
-            |best: Option<(usize, f64)>, (index, db)| match best {
+        let index = self.peak_bin()?;
+        Some((self.freq_hz[index], self.magnitude_db[index]))
+    }
+
+    /// The index of the strongest bin.
+    #[must_use]
+    fn peak_bin(&self) -> Option<usize> {
+        self.magnitude_db
+            .iter()
+            .copied()
+            .enumerate()
+            .fold(None, |best: Option<(usize, f64)>, (index, db)| match best {
                 Some((_, top)) if top >= db => best,
                 _ => Some((index, db)),
-            },
-        )?;
-        Some((self.freq_hz[index], db))
+            })
+            .map(|(index, _)| index)
+            .filter(|index| *index < self.freq_hz.len())
     }
 }
 
@@ -135,12 +165,16 @@ impl Artifact for Spectrum {
                 FieldSpec::new("signal", FieldKind::Text),
                 FieldSpec::new("freq_hz", FieldKind::FloatArray).with_unit("Hz"),
                 FieldSpec::new("magnitude_db", FieldKind::FloatArray).with_unit("dB"),
+                FieldSpec::new("phase_rad", FieldKind::FloatArray).with_unit("rad"),
             ],
             // Its own axes rather than the scope's: a spectrum has no place on
-            // a time axis (§10.1).
+            // a time axis (§10.1). Phase is on the second axis, because dB and
+            // radians share an x axis and nothing else — which is what a Bode
+            // plot is.
             ViewHint::Series {
                 x: FieldRef::new("freq_hz"),
                 y: vec![FieldRef::new("magnitude_db")],
+                y2: vec![FieldRef::new("phase_rad")],
                 x_log: false,
                 y_log: false,
             },

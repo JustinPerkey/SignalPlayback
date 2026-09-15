@@ -79,11 +79,18 @@ pub fn view<'a, M: Clone + 'a>(
 ) -> Element<'a, M> {
     let body: Element<'a, M> = match &pane.data.schema().view {
         ViewHint::Table { columns } => table(pane, columns, on_sort),
-        ViewHint::Series { x, y, x_log, y_log } => chart(
+        ViewHint::Series {
+            x,
+            y,
+            y2,
+            x_log,
+            y_log,
+        } => chart(
             pane,
             ChartKind::Series {
                 x: x.as_str().to_owned(),
                 y: y.iter().map(|f| f.as_str().to_owned()).collect(),
+                y2: y2.iter().map(|f| f.as_str().to_owned()).collect(),
                 x_log: *x_log,
                 y_log: *y_log,
             },
@@ -382,6 +389,8 @@ pub enum ChartKind {
     Series {
         x: String,
         y: Vec<String>,
+        /// Fields on their own scale at the right of the chart.
+        y2: Vec<String>,
         x_log: bool,
         y_log: bool,
     },
@@ -440,8 +449,14 @@ impl<M> canvas::Program<M> for Chart {
         frame.fill_rectangle(Point::ORIGIN, size, palette.background.base.color);
 
         match &self.kind {
-            ChartKind::Series { x, y, x_log, y_log } => {
-                self.draw_series(&mut frame, size, x, y, *x_log, *y_log, palette);
+            ChartKind::Series {
+                x,
+                y,
+                y2,
+                x_log,
+                y_log,
+            } => {
+                self.draw_series(&mut frame, size, x, (y, y2), *x_log, *y_log, palette);
             }
             ChartKind::Scatter { x, y, .. } => self.draw_scatter(&mut frame, size, x, y, palette),
             ChartKind::Heatmap { values } => self.draw_heatmap(&mut frame, size, values),
@@ -453,6 +468,9 @@ impl<M> canvas::Program<M> for Chart {
 
 type Palette<'a> = &'a iced::theme::palette::Extended;
 
+/// The dash a second-axis series is drawn with.
+const DASH: [f32; 2] = [4.0, 3.0];
+
 impl Chart {
     #[allow(clippy::too_many_arguments)]
     fn draw_series(
@@ -460,7 +478,7 @@ impl Chart {
         frame: &mut Frame,
         size: Size,
         x_field: &str,
-        y_fields: &[String],
+        (y_fields, y2_fields): (&[String], &[String]),
         x_log: bool,
         y_log: bool,
         palette: Palette<'_>,
@@ -468,68 +486,102 @@ impl Chart {
         let Some(x) = self.data.column(x_field) else {
             return;
         };
-        let series: Vec<&Column> = y_fields
-            .iter()
-            .filter_map(|name| self.data.column(name))
-            .collect();
-        if series.is_empty() {
+        let columns = |names: &[String]| -> Vec<&Column> {
+            names
+                .iter()
+                .filter_map(|name| self.data.column(name))
+                .collect()
+        };
+        let series = columns(y_fields);
+        let secondary = columns(y2_fields);
+        if series.is_empty() && secondary.is_empty() {
             return;
         }
 
         let x_values: Vec<Option<f64>> = (0..x.len())
             .map(|row| scale(x.number_at(row), x_log))
             .collect();
-        let y_extent = series
-            .iter()
-            .flat_map(|column| {
-                (0..column.len()).filter_map(|row| scale(column.number_at(row), y_log))
-            })
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| {
-                (lo.min(value), hi.max(value))
-            });
+        // Each axis is scaled on its own values: dB and radians share an x
+        // axis and nothing else, and one extent across both would flatten
+        // whichever has the smaller range.
+        let extent = |series: &[&Column], log: bool| {
+            series
+                .iter()
+                .flat_map(|column| {
+                    (0..column.len()).filter_map(move |row| scale(column.number_at(row), log))
+                })
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| {
+                    (lo.min(value), hi.max(value))
+                })
+        };
         let x_extent = x_values
             .iter()
             .flatten()
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| {
                 (lo.min(*value), hi.max(*value))
             });
-        let (Some(to_x), Some(to_y)) =
-            (mapper(x_extent, size.width), mapper(y_extent, size.height))
-        else {
+        let Some(to_x) = mapper(x_extent, size.width) else {
             return;
         };
+        let to_y = mapper(extent(&series, y_log), size.height);
+        // The second axis is linear whatever the first is: a phase in radians
+        // has no logarithm to take.
+        let to_y2 = mapper(extent(&secondary, false), size.height);
 
         axes(frame, size, palette);
-        for (index, column) in series.iter().enumerate() {
-            let colour = shade(self.colour, index);
-            let path = Path::new(|builder| {
-                let mut started = false;
-                for (row, x) in x_values.iter().enumerate().take(column.len()) {
-                    let (Some(x), Some(y)) = (*x, scale(column.number_at(row), y_log)) else {
-                        started = false;
-                        continue;
-                    };
-                    let point = Point::new(to_x(x), size.height - to_y(y));
-                    if started {
-                        builder.line_to(point);
-                    } else {
-                        builder.move_to(point);
-                        started = true;
+        let mut draw = |series: &[&Column], to_y: &dyn Fn(f64) -> f32, log: bool, dashed: bool| {
+            for (index, column) in series.iter().enumerate() {
+                let colour = shade(self.colour, index + usize::from(dashed));
+                let path = Path::new(|builder| {
+                    let mut started = false;
+                    for (row, x) in x_values.iter().enumerate().take(column.len()) {
+                        let (Some(x), Some(y)) = (*x, scale(column.number_at(row), log)) else {
+                            started = false;
+                            continue;
+                        };
+                        let point = Point::new(to_x(x), size.height - to_y(y));
+                        if started {
+                            builder.line_to(point);
+                        } else {
+                            builder.move_to(point);
+                            started = true;
+                        }
                     }
-                }
-            });
-            frame.stroke(&path, Stroke::default().with_color(colour).with_width(1.5));
+                });
+                let stroke = Stroke::default().with_color(colour).with_width(1.5);
+                // The second axis is also a second line style, so the two are
+                // told apart in a screenshot and by a reader who cannot tell
+                // the shades apart.
+                let stroke = if dashed {
+                    Stroke {
+                        line_dash: canvas::LineDash {
+                            segments: &DASH,
+                            offset: 0,
+                        },
+                        ..stroke
+                    }
+                } else {
+                    stroke
+                };
+                frame.stroke(&path, stroke);
+            }
+        };
+        if let Some(to_y) = &to_y {
+            draw(&series, to_y, y_log, false);
         }
-        label(
-            frame,
-            size,
-            palette,
-            &format!(
-                "{x_field}{}  ·  {}",
-                if x_log { " (log)" } else { "" },
-                y_fields.join(", ")
-            ),
+        if let Some(to_y2) = &to_y2 {
+            draw(&secondary, to_y2, false, true);
+        }
+
+        let mut caption = format!(
+            "{x_field}{}  ·  {}",
+            if x_log { " (log)" } else { "" },
+            y_fields.join(", ")
         );
+        if !y2_fields.is_empty() {
+            caption.push_str(&format!("  ·  {} (right)", y2_fields.join(", ")));
+        }
+        label(frame, size, palette, &caption);
     }
 
     fn draw_scatter(
@@ -708,6 +760,33 @@ mod tests {
     }
 
     #[test]
+    fn a_second_axis_is_carried_from_the_hint_into_the_chart() {
+        let hint = ViewHint::Series {
+            x: FieldRef::new("spans"),
+            y: vec![FieldRef::new("scores")],
+            y2: vec![FieldRef::new("phase_rad")],
+            x_log: false,
+            y_log: false,
+        };
+        let ViewHint::Series { y2, .. } = &hint else {
+            unreachable!()
+        };
+        assert_eq!(y2.len(), 1);
+        // The pane opens ordered by the x field whether or not there is a
+        // second axis, since that is the column a chart is read along.
+        let schema = ArtifactSchema::new(
+            vec![
+                FieldSpec::new("spans", FieldKind::SpanS),
+                FieldSpec::new("scores", FieldKind::Float),
+                FieldSpec::new("phase_rad", FieldKind::Float),
+            ],
+            hint,
+        );
+        assert!(schema.is_consistent());
+        assert_eq!(default_sort(&schema).unwrap().field, "spans");
+    }
+
+    #[test]
     fn rows_sort_by_the_chosen_column_and_reverse_on_a_second_click() {
         let data = data();
         let ascending = Sort::new("scores");
@@ -781,6 +860,15 @@ mod tests {
             ViewHint::Series {
                 x: FieldRef::new("spans"),
                 y: vec![FieldRef::new("scores")],
+                y2: Vec::new(),
+                x_log: false,
+                y_log: false,
+            },
+            // A spectrum with phase: two scales over one x axis (§10.1).
+            ViewHint::Series {
+                x: FieldRef::new("spans"),
+                y: vec![FieldRef::new("scores")],
+                y2: vec![FieldRef::new("scores")],
                 x_log: false,
                 y_log: false,
             },

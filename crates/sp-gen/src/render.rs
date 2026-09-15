@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::f64::consts::TAU;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use rayon::prelude::*;
 use sp_core::{SampleBuffer, SampleRange, SignalId};
@@ -27,7 +28,7 @@ use crate::control::{GenControl, GenProgress, CHUNK_SAMPLES};
 use crate::error::{GenError, Result};
 use crate::expr;
 use crate::noise::{self, Noise, Prbs};
-use crate::spec::{GenSpec, ModKind, Node, OscShape};
+use crate::spec::{GenSpec, ModKind, Node, NoiseKind, OscShape};
 use crate::tree::{self, ROOT};
 use crate::validate::validate;
 use crate::waveform;
@@ -68,6 +69,10 @@ struct Ctx<'a> {
     /// `FromSignal` source aligns against.
     t0_s: f64,
     sources: &'a Sources,
+    /// One `Awgn` node's measured noise scale, by node pointer. The
+    /// measurement is the same whichever chunk asks for it, so the first chunk
+    /// to need it pays for it and the rest read it.
+    probes: Mutex<HashMap<String, f64>>,
 }
 
 /// The grid one node renders on.
@@ -147,6 +152,7 @@ pub fn render_values(
         seed: spec.seed,
         t0_s: spec.timebase.t0_s,
         sources,
+        probes: Mutex::new(HashMap::new()),
     };
     let frame = Frame {
         rate_hz: spec.sample_rate_hz(),
@@ -417,6 +423,21 @@ fn fill(node: &Node, frame: &Frame, range: SampleRange, out: &mut [f64], ctx: &C
                 }
             }
         },
+        Node::Awgn { input, snr_db } => {
+            fill(input, &frame.child(tree::INPUT, None), range, out, ctx);
+            let scale = noise_scale(input, frame, *snr_db, ctx);
+            if scale == 0.0 {
+                return;
+            }
+            let mut noise = Noise::new(
+                NoiseKind::Gaussian,
+                noise::stream_key(ctx.seed, &frame.path),
+            );
+            noise.seek(range.start);
+            for (k, slot) in out.iter_mut().enumerate() {
+                *slot += scale * noise.value(range.start + k as u64);
+            }
+        }
         Node::Resample { input, to_rate_hz } => {
             // Above the output rate there is nothing to reconstruct, and the
             // inner grid would be larger than the output for no gain;
@@ -461,6 +482,103 @@ fn fill(node: &Node, frame: &Frame, range: SampleRange, out: &mut [f64], ctx: &C
             }
         }
     }
+}
+
+/// The most samples a [`Node::Awgn`] node measures over. A ladder over a
+/// hundred-million-sample signal must not cost a second render of it.
+const PROBE_SAMPLES: u64 = 65_536;
+
+/// The probe is taken as this many blocks spread evenly across the node's
+/// whole grid rather than as one block at the start, so the power of a signal
+/// that is not stationary — a chirp, an envelope, a concatenation — is the
+/// power of the whole of it rather than of its opening.
+const PROBE_BLOCKS: u64 = 16;
+
+/// The blocks an `Awgn` node measures over, given the length of its grid.
+fn probe_spans(total: u64) -> Vec<SampleRange> {
+    if total == 0 {
+        return Vec::new();
+    }
+    if total <= PROBE_SAMPLES {
+        return vec![SampleRange::new(0, total)];
+    }
+    let block = PROBE_SAMPLES / PROBE_BLOCKS;
+    let last_start = total - block;
+    (0..PROBE_BLOCKS)
+        .map(|index| {
+            // Evenly spaced from the first sample to the last, inclusive of
+            // both ends: an integer division, so no float rounding decides
+            // where a block starts.
+            let start = last_start * index / (PROBE_BLOCKS - 1);
+            SampleRange::new(start, start + block)
+        })
+        .collect()
+}
+
+/// How far a [`Node::Awgn`] node's noise stream is scaled to reach `snr_db`
+/// against its input, or `0.0` when there is nothing to measure against.
+///
+/// SNR here is the ratio of mean squares — the input's power, DC included,
+/// over the noise's — and the noise's own power is measured rather than
+/// assumed, so the achieved ratio is the requested one whatever the stream's
+/// nominal variance.
+fn noise_scale(input: &Node, frame: &Frame, snr_db: f64, ctx: &Ctx<'_>) -> f64 {
+    if let Some(scale) = ctx
+        .probes
+        .lock()
+        .expect("probe cache")
+        .get(&frame.path)
+        .copied()
+    {
+        return scale;
+    }
+
+    let total = (frame.duration_s.max(0.0) * frame.rate_hz).round();
+    let total = if total.is_finite() && total > 0.0 {
+        total as u64
+    } else {
+        0
+    };
+    let child = frame.child(tree::INPUT, None);
+    let mut noise = Noise::new(
+        NoiseKind::Gaussian,
+        noise::stream_key(ctx.seed, &frame.path),
+    );
+    let (mut signal_power, mut noise_power, mut count) = (0.0f64, 0.0f64, 0u64);
+    let mut scratch = Vec::new();
+    for span in probe_spans(total) {
+        scratch.clear();
+        scratch.resize(span.len() as usize, 0.0);
+        fill(input, &child, span, &mut scratch, ctx);
+        noise.seek(span.start);
+        for (k, value) in scratch.iter().enumerate() {
+            let drawn = noise.value(span.start + k as u64);
+            signal_power += value * value;
+            noise_power += drawn * drawn;
+            count += 1;
+        }
+    }
+
+    // Against silence there is no ratio to hit, and an input the probe read as
+    // non-finite has no power either; both add nothing rather than adding
+    // something arbitrary.
+    let measured = |power: f64| power.is_finite() && power > 0.0;
+    let scale = if count == 0 || !measured(signal_power) || !measured(noise_power) {
+        0.0
+    } else {
+        let target = (signal_power / count as f64) / 10f64.powf(snr_db / 10.0);
+        let scale = (target / (noise_power / count as f64)).sqrt();
+        if scale.is_finite() {
+            scale
+        } else {
+            0.0
+        }
+    };
+    ctx.probes
+        .lock()
+        .expect("probe cache")
+        .insert(frame.path.clone(), scale);
+    scale
 }
 
 /// Reads a source signal at an absolute time, linearly interpolated and zero
@@ -857,6 +975,155 @@ mod tests {
             part,
             whole[window.start as usize..window.end as usize].to_vec()
         );
+    }
+
+    /// The mean square of a slice, which is what an SNR is a ratio of.
+    fn power(values: &[f64]) -> f64 {
+        values.iter().map(|v| v * v).sum::<f64>() / values.len() as f64
+    }
+
+    /// A tone under an `Awgn` node, and the same tone on its own.
+    fn ladder_rung(snr_db: f64, duration_s: f64) -> (Vec<f64>, Vec<f64>) {
+        let tone = Node::Sine {
+            freq_hz: 100.0,
+            amp: 1.0,
+            phase_rad: 0.0,
+            offset: 0.0,
+        };
+        let clean = GenSpec::new(8_000.0, duration_s, tone.clone()).with_seed(99);
+        let noisy = GenSpec::new(
+            8_000.0,
+            duration_s,
+            Node::Awgn {
+                input: Box::new(tone),
+                snr_db,
+            },
+        )
+        .with_seed(99);
+        (values(&clean), values(&noisy))
+    }
+
+    #[test]
+    fn awgn_hits_the_signal_to_noise_ratio_it_was_asked_for() {
+        for snr_db in [0.0, 6.0, 20.0, 40.0] {
+            let (clean, noisy) = ladder_rung(snr_db, 2.0);
+            let noise: Vec<f64> = noisy
+                .iter()
+                .zip(&clean)
+                .map(|(noisy, clean)| noisy - clean)
+                .collect();
+            let achieved = 10.0 * (power(&clean) / power(&noise)).log10();
+            assert!(
+                (achieved - snr_db).abs() < 0.5,
+                "asked for {snr_db} dB, got {achieved} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rung_is_measured_over_the_whole_signal_rather_than_the_window_asked_for() {
+        // Longer than the probe, so the measurement is the spread blocks
+        // rather than the whole thing, and read back one window at a time.
+        let spec = GenSpec::new(
+            8_000.0,
+            30.0,
+            Node::Awgn {
+                input: Box::new(Node::Sine {
+                    freq_hz: 100.0,
+                    amp: 1.0,
+                    phase_rad: 0.0,
+                    offset: 0.0,
+                }),
+                snr_db: 12.0,
+            },
+        )
+        .with_seed(7);
+        assert!(spec.sample_count() > PROBE_SAMPLES, "a probed signal");
+
+        let whole = values(&spec);
+        for window in [
+            SampleRange::new(0, 1_000),
+            SampleRange::new(120_003, 121_777),
+            SampleRange::new(239_000, 240_000),
+        ] {
+            let part = render_values(&spec, window, &Sources::new(), &GenControl::new()).unwrap();
+            assert_eq!(
+                part,
+                whole[window.start as usize..window.end as usize].to_vec(),
+                "{window:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_probe_blocks_cover_the_whole_grid_without_overlapping() {
+        assert_eq!(probe_spans(0), Vec::new());
+        assert_eq!(probe_spans(500), vec![SampleRange::new(0, 500)]);
+
+        let total = 10_000_000;
+        let spans = probe_spans(total);
+        assert_eq!(spans.len() as u64, PROBE_BLOCKS);
+        assert_eq!(spans[0].start, 0);
+        assert_eq!(spans[spans.len() - 1].end, total);
+        for pair in spans.windows(2) {
+            assert!(pair[0].end <= pair[1].start, "{pair:?}");
+        }
+        assert!(spans.iter().map(|span| span.len()).sum::<u64>() <= PROBE_SAMPLES);
+    }
+
+    #[test]
+    fn awgn_against_silence_adds_nothing_rather_than_an_arbitrary_amplitude() {
+        let spec = GenSpec::new(
+            1_000.0,
+            0.1,
+            Node::Awgn {
+                input: Box::new(Node::Dc { level: 0.0 }),
+                snr_db: 10.0,
+            },
+        );
+        assert!(values(&spec).iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn stacked_rungs_are_measured_against_what_each_one_sees() {
+        // The outer node measures the inner node's output, noise included, so
+        // a ladder of ladders still lands where it says it does.
+        let inner = Node::Awgn {
+            input: Box::new(Node::Sine {
+                freq_hz: 100.0,
+                amp: 1.0,
+                phase_rad: 0.0,
+                offset: 0.0,
+            }),
+            snr_db: 20.0,
+        };
+        // A unit gain rather than the bare node, so the inner node sits at the
+        // same pointer in both specs and therefore draws the same stream: a
+        // node's noise is seeded by where it is (§8.2).
+        let spec = GenSpec::new(
+            8_000.0,
+            2.0,
+            Node::Gain {
+                input: Box::new(inner.clone()),
+                factor: 1.0,
+            },
+        )
+        .with_seed(3);
+        let stacked = GenSpec::new(
+            8_000.0,
+            2.0,
+            Node::Awgn {
+                input: Box::new(inner),
+                snr_db: 6.0,
+            },
+        )
+        .with_seed(3);
+
+        let one = values(&spec);
+        let two = values(&stacked);
+        let added: Vec<f64> = two.iter().zip(&one).map(|(a, b)| a - b).collect();
+        let achieved = 10.0 * (power(&one) / power(&added)).log10();
+        assert!((achieved - 6.0).abs() < 0.5, "{achieved} dB");
     }
 
     #[test]

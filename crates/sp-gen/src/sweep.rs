@@ -128,6 +128,33 @@ impl SweepValues {
     }
 }
 
+/// How a sweep's rungs land in the library (§8.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepLayout {
+    /// One group holding a signal per rung. The metric chart reads it as a
+    /// curve across the signals of one group.
+    #[default]
+    OneGroup,
+    /// One group per rung — an impairment ladder. The group is the unit a
+    /// pipeline processes, caches and asserts over, so a ladder written this
+    /// way gives every rung its own status, its own metrics and its own row in
+    /// the chart across groups (§10.5).
+    GroupPerRung,
+}
+
+impl SweepLayout {
+    pub const ALL: [Self; 2] = [Self::OneGroup, Self::GroupPerRung];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OneGroup => "One group, a signal per value",
+            Self::GroupPerRung => "One group per value (ladder)",
+        }
+    }
+}
+
 /// A parameter sweep: one target, and the values to put in it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParamSweep {
@@ -466,6 +493,12 @@ mod tests {
         assert!(apply(&spec, "/root/nowhere", 1.0).is_err());
         assert!(apply(&spec, "/root/node", 1.0).is_err());
         assert!(apply(&spec, "/dtype", 1.0).is_err());
+    }
+
+    #[test]
+    fn a_layout_is_one_group_unless_a_ladder_is_asked_for() {
+        assert_eq!(SweepLayout::default(), SweepLayout::OneGroup);
+        assert!(SweepLayout::ALL.contains(&SweepLayout::GroupPerRung));
     }
 
     #[test]

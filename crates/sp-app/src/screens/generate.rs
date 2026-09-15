@@ -28,7 +28,7 @@ use iced::{mouse, Alignment, Element, Length, Point, Rectangle, Subscription, Ta
 use serde_json::Value;
 use sp_core::{DType, Domain, SampleRange, Timebase};
 use sp_gen::generate::{GenReport, GenRequest, TrainRequest};
-use sp_gen::sweep::{ParamRef, ParamSweep, SweepValues};
+use sp_gen::sweep::{ParamRef, ParamSweep, SweepLayout, SweepValues};
 use sp_gen::train::{FieldSpec, FieldValue, TrainSpec};
 use sp_gen::{
     tree, validate, validate_train, GenControl, GenProgress, GenSpec, Issue, Issues, Node,
@@ -368,6 +368,20 @@ impl fmt::Display for SweepMode {
     }
 }
 
+/// How a sweep's rungs land in the library (§8.4), as one row of the picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutChoice(pub SweepLayout);
+
+impl LayoutChoice {
+    const ALL: [Self; 2] = [Self(SweepLayout::OneGroup), Self(SweepLayout::GroupPerRung)];
+}
+
+impl fmt::Display for LayoutChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.label())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -421,6 +435,7 @@ pub struct State {
     sweep_step: String,
     sweep_list: String,
     sweep_property: String,
+    sweep_layout: SweepLayout,
 
     preview: Option<Preview>,
     preview_error: Option<String>,
@@ -461,6 +476,7 @@ impl Default for State {
             sweep_step: "100".to_owned(),
             sweep_list: String::new(),
             sweep_property: String::new(),
+            sweep_layout: SweepLayout::default(),
             preview: None,
             preview_error: None,
             dirty_since: Some(Instant::now()),
@@ -522,6 +538,7 @@ pub enum Message {
     SweepStepChanged(String),
     SweepListChanged(String),
     SweepPropertyChanged(String),
+    SweepLayoutPicked(LayoutChoice),
 
     // Preview and run
     PreviewTick,
@@ -821,6 +838,10 @@ impl State {
             }
             Message::SweepListChanged(text) => {
                 self.sweep_list = text;
+                Task::none()
+            }
+            Message::SweepLayoutPicked(choice) => {
+                self.sweep_layout = choice.0;
                 Task::none()
             }
             Message::SweepPropertyChanged(key) => {
@@ -1165,7 +1186,7 @@ impl State {
             .named(self.dataset_name.trim())
             .with_signal_name(self.preset_name());
         if let Some(sweep) = sweep {
-            request = request.with_sweep(sweep);
+            request = request.with_sweep(sweep).with_layout(self.sweep_layout);
         }
 
         self.job = Some(Job { progress, cancel });
@@ -1872,8 +1893,9 @@ impl State {
         if !self.sweep_on {
             panel = panel.push(
                 text(
-                    "A sweep becomes one group with the swept value stored as a property on \
-                     every signal — the shape a pipeline wants as test input.",
+                    "A sweep stores the swept value as a property on every signal it emits. \
+                     One group is a curve across signals; a group per value is an impairment \
+                     ladder, and the group is what a pipeline asserts over.",
                 )
                 .size(typography::LABEL_SIZE)
                 .style(ui::dim),
@@ -1952,12 +1974,27 @@ impl State {
                 .size(typography::BODY_SIZE)
                 .into(),
         ));
+        panel = panel.push(labelled(
+            "Layout",
+            pick_list(
+                LayoutChoice::ALL.to_vec(),
+                Some(LayoutChoice(self.sweep_layout)),
+                Message::SweepLayoutPicked,
+            )
+            .text_size(typography::BODY_SIZE)
+            .into(),
+        ));
 
         let status: Element<'_, Message> = match self.sweep() {
             Some(Ok(sweep)) => match sweep.values.count() {
                 Some(rungs) => text(format!(
-                    "{rungs} signal{}, stored under {}.",
+                    "{rungs} signal{} in {}, stored under {}.",
                     if rungs == 1 { "" } else { "s" },
+                    if self.sweep_layout == SweepLayout::GroupPerRung {
+                        format!("{rungs} group{}", if rungs == 1 { "" } else { "s" })
+                    } else {
+                        "one group".to_owned()
+                    },
                     sweep.property_key
                 ))
                 .size(typography::LABEL_SIZE)
@@ -2585,6 +2622,38 @@ mod tests {
         let _ = state.update(None, Message::SweepListChanged("1, 2; 3 4\n5".into()));
         let sweep = state.sweep().unwrap().unwrap();
         assert_eq!(sweep.values.count(), Some(5));
+    }
+
+    #[test]
+    fn a_ladder_is_the_same_sweep_asked_to_write_a_group_per_rung() {
+        let mut state = state();
+        let _ = state.update(None, Message::SweepToggled(true));
+        // The layout is a property of the request, not of the sweep: the same
+        // rungs, written a different shape (§8.4).
+        assert_eq!(state.sweep_layout, SweepLayout::OneGroup);
+        let before = state.sweep().unwrap().unwrap();
+
+        let _ = state.update(
+            None,
+            Message::SweepLayoutPicked(LayoutChoice(SweepLayout::GroupPerRung)),
+        );
+        assert_eq!(state.sweep_layout, SweepLayout::GroupPerRung);
+        assert_eq!(state.sweep().unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn an_awgn_rung_is_a_node_the_picker_can_sweep() {
+        let mut state = state();
+        // Wrap the default tone in a rung, which is how a ladder is built.
+        let _ = state.update(
+            None,
+            Message::NodeKindPicked(tree::ROOT.into(), NodeKind::Awgn),
+        );
+        let targets: Vec<String> = sp_gen::sweep::parameters(&state.spec)
+            .into_iter()
+            .map(|param| param.json_pointer())
+            .collect();
+        assert!(targets.contains(&"/root/snr_db".to_owned()), "{targets:?}");
     }
 
     #[test]

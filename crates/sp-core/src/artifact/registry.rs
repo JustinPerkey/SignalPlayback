@@ -137,6 +137,7 @@ mod tests {
                 ViewHint::Series {
                     x: "freq_hz".into(),
                     y: vec!["mag_db".into()],
+                    y2: Vec::new(),
                     x_log: true,
                     y_log: false,
                 },
@@ -161,6 +162,7 @@ mod tests {
                 ViewHint::Series {
                     x: "absent".into(),
                     y: Vec::new(),
+                    y2: Vec::new(),
                     x_log: false,
                     y_log: false,
                 },

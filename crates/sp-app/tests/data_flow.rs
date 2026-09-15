@@ -44,12 +44,15 @@ const RATE_HZ: f64 = 1_024.0;
 const DURATION_S: f64 = 0.25;
 const SAMPLES: u64 = 256;
 const TONE_HZ: f64 = 64.0;
-/// One rung per amplitude: the shape §8.4 calls an impairment ladder.
+/// One rung per amplitude. This is the sweep laid out as *one group*, which
+/// is what makes a curve across the signals of a group; the group-per-rung
+/// ladder of §8.4 is held by `sp-gen/tests/ladder.rs`. Either shape feeds a
+/// run, and this file is about the loop rather than about the layout.
 const AMPLITUDES: [f64; 3] = [0.25, 0.5, 1.0];
 const GAIN: f64 = 2.0;
 const SEED: u64 = 7;
 
-/// A library holding one generated ladder, ready to run.
+/// A library holding one generated sweep, ready to run.
 struct Ladder {
     _dir: tempfile::TempDir,
     store: Store,
@@ -165,8 +168,9 @@ fn tone() -> GenSpec {
     .with_seed(SEED)
 }
 
-/// Generates the amplitude ladder into `store`, the way the Generate screen
-/// does: one dataset, one train, one group, one signal per rung.
+/// Generates the amplitude sweep into `store`, the way the Generate screen
+/// does at its default layout: one dataset, one train, one group, one signal
+/// per rung.
 fn generate_ladder(store: &Store, name: &str) -> GenReport {
     let request = GenRequest::new(tone())
         .named(name)
