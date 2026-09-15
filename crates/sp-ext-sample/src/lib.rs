@@ -76,6 +76,7 @@ const DESCRIPTOR: &str = r#"{
     "version": 1,
     "label": "Sample gain (external)",
     "summary": "The reference external stage: a flat gain, with an optional envelope",
+    "pure": false,
     "concurrency": "thread_safe",
     "params": [
         {"name": "gain", "label": "Gain", "kind": {"type": "float", "min": -1000, "max": 1000},
@@ -90,6 +91,12 @@ const DESCRIPTOR: &str = r#"{
 /// Everything one instance owns. The host may open several against the same
 /// library and call them from separate threads, which is what
 /// `"concurrency": "thread_safe"` above promises — so none of this is global.
+///
+/// `groups_seen` is why the descriptor says `"pure": false`. The gain itself
+/// is a pure function of its input, but the counter published beside it is
+/// not: the same group handed to the same instance twice gives two different
+/// metrics, so its output cannot be cached and replayed. The conformance
+/// harness is what says so (§14).
 #[derive(Debug)]
 struct Instance {
     gain: f64,

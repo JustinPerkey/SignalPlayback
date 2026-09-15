@@ -13,6 +13,7 @@
 pub mod artifacts;
 pub mod condition;
 pub mod detect;
+pub mod digital;
 pub mod filter;
 pub mod measure;
 pub mod transform;
@@ -24,11 +25,12 @@ use sp_proc::registry::{RegistryError, StageFactory, StageRegistry};
 use sp_proc::stage::{PortKind, PortSpec};
 use sp_proc::SignalRef;
 
-pub use artifacts::{Detections, Spectrum, Statistics};
+pub use artifacts::{Bits, Detections, Metrics, Peaks, Spectrum, Statistics, Symbols};
 pub use condition::{Detrend, Gain, Normalise};
-pub use detect::Threshold;
+pub use detect::{PeakFind, Threshold};
+pub use digital::{BitPack, Slice, SymbolDecode};
 pub use filter::{Biquad, Coefficients, Response};
-pub use measure::StatisticsStage;
+pub use measure::{PulseMetrics, StatisticsStage};
 pub use transform::{Fft, Window};
 pub use util::Passthrough;
 
@@ -48,7 +50,12 @@ pub fn builtins() -> Vec<StageFactory> {
         || Box::<Normalise>::default(),
         || Box::<Biquad>::default(),
         || Box::<StatisticsStage>::default(),
+        || Box::<PulseMetrics>::default(),
         || Box::<Threshold>::default(),
+        || Box::<PeakFind>::default(),
+        || Box::<Slice>::default(),
+        || Box::<SymbolDecode>::default(),
+        || Box::<BitPack>::default(),
         || Box::<Fft>::default(),
     ]
 }
@@ -73,6 +80,10 @@ pub fn artifact_registry() -> Result<ArtifactRegistry, ArtifactRegistryError> {
     registry.register::<Statistics>()?;
     registry.register::<Detections>()?;
     registry.register::<Spectrum>()?;
+    registry.register::<Peaks>()?;
+    registry.register::<Symbols>()?;
+    registry.register::<Bits>()?;
+    registry.register::<Metrics>()?;
     Ok(registry)
 }
 
@@ -202,7 +213,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert_eq!(artifacts.len(), 3);
+        assert_eq!(artifacts.len(), 7);
     }
 
     #[test]

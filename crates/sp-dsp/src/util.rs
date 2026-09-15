@@ -28,11 +28,17 @@ impl Stage for Passthrough {
         &PASSTHROUGH
     }
 
-    fn configure(&mut self, _params: &ParamSet) -> Result<(), ConfigError> {
-        Ok(())
+    fn configure(&mut self, params: &ParamSet) -> Result<(), ConfigError> {
+        // It declares no parameters, so any parameter at all is a typo worth
+        // reporting rather than a setting silently doing nothing.
+        params.validate(&[])
     }
 
-    fn process(&mut self, _ctx: &StageCtx, input: &GroupFrame) -> Result<StageOutput, StageError> {
+    fn process(&mut self, ctx: &StageCtx, input: &GroupFrame) -> Result<StageOutput, StageError> {
+        // Nothing here takes long, but a stage that ignores the flag entirely
+        // is one the run cannot get out of — and this is the stage every other
+        // one is written from.
+        ctx.check()?;
         Ok(StageOutput::passthrough_of(input))
     }
 }

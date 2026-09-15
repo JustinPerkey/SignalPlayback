@@ -16,6 +16,7 @@
 pub mod assert;
 pub mod cache;
 pub mod compare;
+pub mod conform;
 pub mod error;
 pub mod frame;
 pub mod param;
@@ -26,6 +27,7 @@ pub mod stage;
 
 pub use assert::{AssertError, Assertion, GroupFacts, Outcome as AssertOutcome, Subject};
 pub use compare::{check_baseline, diff_runs, BaselineReport, DiffOptions, RunDiff};
+pub use conform::{Check, Conformance, Finding, Report as ConformanceReport};
 pub use error::{ConfigError, ProcError, Result, StageError};
 pub use frame::{GroupFrame, PortMap, PortValue, SignalRef};
 pub use param::{ParamDefault, ParamKind, ParamSet, ParamSpec};
