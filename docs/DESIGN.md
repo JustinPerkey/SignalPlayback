@@ -1,10 +1,25 @@
 # SignalPlayback — Design Document
 
-**Status:** v1.2
+**Status:** v1.3
 **Date:** 2026-09-15
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v1.3** — An audit rather than a milestone: every entry in §16 was re-checked
+> against the code, and where this document described an intention the entry now describes
+> what exists. §3 no longer names `csv`, `rustfft` or `realfft` — the block parser and the
+> FFT are both hand-rolled and neither dependency is in the workspace. §4.1 is the crate
+> tree as it stands and §4.2 names the cancellation flag that was actually written. §5.2
+> carries schema version 5, the train index and the derived-run columns; §9.6 gains
+> `stage_cache` and the columns the migrations added; §9.2 gains `cache_salt` and `pure`.
+> §9.8, §10.1 and §9.9's opening separate what is built from what the families still plan.
+> §11.4, §12.1, §12.2 and §12.3 say what the screens do today. §13 drops a benchmark suite
+> that was never written and records the G2 measurement that was; §14 stops crediting a
+> conformance harness, a per-stage `catch_unwind` and a verify-on-read that do not exist,
+> and says what the 903 tests do cover. §15 marks what has shipped and §16.1 follows it —
+> most of M12's generation work was already built during M3 — and §17 is renumbered, with
+> question 7 reopened because the scheduler was written without the flag it asked for.
+>
 > **Changes in v1.2** — M10 is built, so §9.5 now says what the cache and the retention
 > policies actually do: `on_failure` output is written as the stage records and swept when
 > the group comes out well, because a group's fate is not settled until its last stage has
@@ -116,11 +131,11 @@ reproducible, comparable against a baseline, and can assert pass/fail on metrics
 | GUI | **Iced** (`iced` 0.13.x, `wgpu` backend) | Retained-mode Elm architecture: a single `Message` enum and pure `update` make the transport and pipeline state machines easy to reason about and test. Pure Rust, no JS toolchain. Custom `canvas::Program` gives full control of the scope renderer. |
 | Metadata store | **SQLite** via `rusqlite` (bundled feature, WAL mode) | Ad-hoc SQL over groups/signals/properties/runs, transactional integrity, single-file backup, universally inspectable. |
 | Sample store | **Chunked SQLite BLOBs** read with incremental blob I/O (`sqlite3_blob_open`) | Keeps the library a single file (G4) and every byte reachable from `sqlite3` (G6). Chunking sidesteps SQLite's 1 GB blob ceiling and bounds WAL churn; incremental I/O reads a slice without materialising the whole column. Content addressing still makes pipeline passthrough free. |
-| CSV | `csv` crate over a custom block framer | Handles quoting/escaping correctly; the framer above it enforces the group/signal block grammar. |
+| CSV | A hand-written block framer and field decoder (`sp-csv`, no external dependency) | The grammar is a fixed preamble, file-level headers and count-driven framing (§7.2), which is not what a general CSV reader is for; quoting, embedded delimiters, BOMs and lone `\r` are handled in `parse.rs` and pinned by the fixture corpus. |
 | Serialization | `serde` + `serde_json` | Generator specs, stage parameters, artifact payloads and property values. |
 | Hashing | `blake3` | Content addressing, integrity checks, and pipeline cache keys. |
 | RNG | `rand` + `rand_chacha` | `ChaCha12Rng` is portable and deterministic across platforms and versions — required by G3. |
-| DSP | `rustfft`, `realfft` | FFT stages and the spectrogram artifact. Filters are hand-rolled (biquad/FIR) to keep dependencies thin. |
+| DSP | None — `sp-dsp` has no dependency beyond `sp-core`, `sp-proc` and `serde` | The FFT stage is an iterative radix-2 Cooley-Tukey in `transform.rs` and the filters are hand-rolled biquads. A library is worth taking on when a stage needs a transform size or a speed this does not reach; until then the stages stay readable and the dependency list stays short. |
 | Parallelism | `rayon` (CPU work), `tokio` (task orchestration/IO) | Generation, decimation and cross-group pipeline execution parallelise cleanly; Iced `Task`s need an async executor. |
 | Logging | `tracing` + `tracing-subscriber` | Structured spans around import/generate/run for diagnosing slow files and slow stages. |
 | Dialogs | `rfd` | Native file pickers on Windows/macOS/Linux. |
@@ -159,40 +174,64 @@ SignalPlayback/
 ├── Cargo.toml                 # [workspace]
 ├── docs/
 │   └── DESIGN.md
+├── sample/                    # sample.csv — the file the §7 grammar was settled against
 └── crates/
     ├── sp-core/               # Domain vocabulary. No IO, no UI.
     │   ├── signal.rs          #   Signal, SignalId, SampleBuffer, DType, Domain
-    │   ├── group.rs           #   SignalGroup, Dataset, GroupFrame
-    │   ├── time.rs            #   TimeRange, SampleIndex, Timebase
-    │   ├── props.rs           #   PropertyDef, PropertyValue, PropertySet
+    │   ├── group.rs           #   SignalGroup, SignalTrain, Dataset
+    │   ├── time.rs            #   TimeRange, SampleRange, Timebase
+    │   ├── props.rs           #   PropertyDef, PropKind, Attributes
     │   ├── pulse.rs           #   PulseRef, PulseField, pulse-record vocabulary
-    │   ├── artifact.rs        #   Artifact trait, ArtifactSchema, ViewHint
-    │   └── stats.rs           #   min/max/mean/rms summarisation
+    │   ├── run.rs             #   Run/stage/assertion status, Disposition, Retention
+    │   ├── artifact/          #   Artifact trait, ArtifactSchema, ViewHint (mod.rs), the
+    │   │                      #   decoded columnar payload (data.rs), the kind registry
+    │   └── stats.rs           #   Streaming min/max/mean/rms/σ, zero crossings, histogram
     ├── sp-store/              # Persistence: SQLite schema, migrations, blob store.
-    │   ├── schema/            #   NNNN_name.sql migration files (embedded)
-    │   ├── db.rs              #   Connection management, writer actor
+    │   ├── schema/            #   NNNN_name.sql migration files, embedded (§5.2)
+    │   ├── db.rs              #   Connections, the migrator, the writer actor
     │   ├── blob.rs            #   Chunked BLOB read/write, incremental I/O, checksums
-    │   ├── runs.rs            #   Run/stage/artifact recording and retrieval
+    │   ├── library.rs         #   Dataset/train/group/signal rows, search, tags
+    │   ├── props.rs           #   Property definitions and the indexed mirror
     │   ├── pulses.rs          #   Column read/scan, zone-map prefilter, pulse search
-    │   └── query.rs           #   Typed query API (no SQL escapes this crate)
+    │   ├── trains.rs          #   Trains and the groups under them
+    │   ├── pyramid.rs         #   The render-pyramid index (§5.4)
+    │   ├── runs.rs            #   Run/stage/signal/artifact recording; the stage cache
+    │   ├── regress.rs         #   Baselines and recorded assertion outcomes
+    │   ├── profiles.rs        #   Saved import profiles
+    │   ├── stats.rs           #   What the library is made of, for the Settings screen
+    │   └── verify.rs          #   Rehash every blob, reconcile references (§14)
     ├── sp-csv/                # Block-grammar parser/writer + import profiles.
     │   ├── framer.rs          #   Count-driven block framing
     │   ├── parse.rs           #   Header/row decoding, error positions
+    │   ├── sniff.rs           #   A bounded first pass: delimiter, preamble, a proposal
     │   ├── profile.rs         #   Preamble/delimiter/count/time settings, column mapping
-    │   └── export.rs          #   Database → CSV
+    │   ├── ingest.rs          #   Streaming file → chunked columns → library
+    │   ├── diag.rs            #   The error list an import shows instead of a dialog
+    │   ├── control.rs         #   Progress and cancellation for a long import
+    │   └── export.rs          #   Database → CSV, reversing the grammar (§7.5)
     ├── sp-gen/                # Parametric synthesis.
-    │   ├── spec.rs            #   GenSpec DAG (serde)
-    │   ├── waveform.rs        #   Primitive oscillators
-    │   ├── noise.rs           #   Gaussian / uniform / pink / PRBS
-    │   ├── modulate.rs        #   AM/FM/PM, chirps, envelopes
-    │   └── render.rs          #   Spec → SampleBuffer
+    │   ├── spec.rs            #   GenSpec tree (serde), Node, NodeKind
+    │   ├── tree.rs            #   JSON-pointer addressing of nodes and parameters
+    │   ├── waveform.rs        #   Primitives: oscillators, chirp, pulse, step, ramp
+    │   ├── noise.rs           #   Gaussian / uniform / pink / brown / PRBS, all seekable
+    │   ├── expr.rs            #   The f(t) node: shunting-yard compiler + stack machine
+    │   ├── render.rs          #   Spec → SampleBuffer, AM/FM/PM and Resample included
+    │   ├── generate.rs        #   Render a spec, or a sweep, into the library
+    │   ├── sweep.rs           #   One swept parameter → a group of signals
+    │   ├── train.rs           #   Pulse-train generation (§8.5)
+    │   ├── preset.rs          #   The built-in preset library, load/save
+    │   ├── validate.rs        #   Nyquist, duty, negative frequency — up front
+    │   └── control.rs         #   Progress and cancellation
     ├── sp-proc/               # Pipeline orchestration. Knows nothing about DSP.
-    │   ├── stage.rs           #   Stage trait, StageDescriptor, ports, params
+    │   ├── stage.rs           #   Stage trait, StageDescriptor, ports, StageOutput
+    │   ├── param.rs           #   ParamSpec/ParamSet: the generated parameter form
+    │   ├── frame.rs           #   GroupFrame, SignalRef, applying a stage's output
     │   ├── registry.rs        #   StageRegistry: kind → constructor + descriptor
     │   ├── pipeline.rs        #   Pipeline model, port validation
     │   ├── scheduler.rs       #   Group-at-a-time execution, cancellation, progress
-    │   ├── cache.rs           #   Content-hash keyed stage-output reuse
-    │   └── compare.rs         #   Run-vs-baseline diffing, assertions
+    │   ├── cache.rs           #   Content-hash keyed stage-output reuse (§9.5)
+    │   ├── assert.rs          #   The assertion grammar and its evaluation (§9.7)
+    │   └── compare.rs         #   Run-vs-run and run-vs-baseline diffing
     ├── sp-ext/                # External stages: native-library loading over the §9.9 C ABI.
     │   ├── abi.rs             #   Flat C structs, symbol names, version negotiation
     │   ├── descriptor.rs      #   The library's published JSON -> StageDescriptor
@@ -202,23 +241,38 @@ SignalPlayback/
     ├── sp-ext-sample/         # A conforming library, built as a cdylib: the ABI's
     │                          # reference implementation, and what sp-ext's tests load.
     ├── sp-dsp/                # Built-in Stage implementations. Depends on sp-proc.
-    │   ├── condition.rs       #   Detrend, DC block, normalise, resample, window
-    │   ├── filter.rs          #   FIR/IIR low/high/band/notch
-    │   ├── transform.rs       #   FFT, spectrogram, Hilbert/envelope
-    │   ├── digital.rs         #   Threshold/slice, clock recovery, symbol decode
-    │   └── detect.rs          #   Peak/edge/pulse detection → Detections artifact
-    ├── sp-engine/             # Playback clock, scheduler, render pyramids.
-    │   ├── transport.rs       #   State machine: Stopped/Playing/Paused
+    │   ├── condition.rs       #   Gain, detrend (mean/linear), normalise (peak/RMS)
+    │   ├── filter.rs          #   IIR biquad — low / high / band / notch
+    │   ├── transform.rs       #   FFT → Spectrum, and the windows it applies
+    │   ├── measure.rs         #   Statistics → a Statistics artifact and metrics
+    │   ├── detect.rs          #   Threshold → a Detections artifact
+    │   ├── artifacts.rs       #   The artifact types those stages publish
+    │   └── util.rs            #   Passthrough: a labelled inspection point
+    ├── sp-engine/             # Playback clock, transport, render pyramids.
+    │   ├── transport.rs       #   State machine: Stopped/Playing/Paused, loop modes
     │   ├── clock.rs           #   Monotonic virtual time, rate scaling
     │   ├── pyramid.rs         #   Multi-resolution min/max mipmaps
-    │   └── viewport.rs        #   Time/amplitude window → draw commands
+    │   ├── source.rs          #   A column plus the pyramid over it, built on demand
+    │   ├── reduce.rs          #   Column + viewport → a drawable snapshot
+    │   ├── compare.rs         #   The residual trace between two stages' signals
+    │   └── viewport.rs        #   Time/amplitude window, follow modes
     └── sp-app/                # Iced binary. The only crate that knows about pixels.
-        ├── main.rs
-        ├── state.rs           #   App state, Message enum
-        ├── screens/           #   library / import / generate / pipeline / results / scope
-        ├── widgets/scope.rs   #   canvas::Program implementation
-        ├── widgets/stagerail.rs #  Stage breadcrumb + compare pinning
-        └── views/             #   ViewHint → concrete artifact viewer widgets
+        ├── main.rs            #   A window, or a subcommand
+        ├── cli.rs             #   The headless command line (§10.4)
+        ├── state.rs           #   App state, the root Message, the key bindings
+        ├── jobs.rs            #   Store work, off the UI thread
+        ├── stages.rs          #   The registry: sp-dsp plus the allowed external libraries
+        ├── settings.rs        #   settings.json and its defaults (§12.4)
+        ├── paths.rs           #   Platform-correct library, settings and log locations
+        ├── logging.rs         #   The rolling file log, plus stderr
+        ├── ui.rs · theme.rs · typography.rs  #  The design system every screen draws from
+        ├── screens/           #   library, inspector, properties, import, generate,
+        │                      #   pipeline, runs, results, scope, settings
+        └── widgets/
+            ├── scope.rs       #   The scope's canvas::Program
+            ├── panes.rs       #   ViewHint → an artifact pane: table, chart, scalars, tree
+            ├── histogram.rs   #   The Inspector's distribution
+            └── glyph.rs       #   The marks the icon font cannot draw
 ```
 
 **Dependency rule:** dependencies point left-to-right only. `sp-core` depends on nothing
@@ -227,7 +281,9 @@ everything; no crate depends on `sp-app`.
 
 **Why `sp-proc` and `sp-dsp` are separate.** The orchestration layer must not know what a
 Butterworth filter is. Keeping them apart is what makes G9 true — and it is the seam a
-plugin interface would later slot into.
+plugin interface would later slot into. M9 went through that seam: `sp-ext` sits beside
+`sp-dsp`, depends on the same two crates, and registers stages the scheduler cannot tell
+apart from compiled ones.
 
 ### 4.2 Process and Threading Model
 
@@ -241,10 +297,11 @@ plugin interface would later slot into.
         │ Task::perform / commands     │ Messages (progress, stage done, error)
         ▼                              │
 ┌──────────────────────────────────────┴───────────────────────┐
-│ Tokio worker pool                                            │
+│ Tokio blocking pool — one task per job, none on the UI thread│
 │   • CSV import   (streaming, chunked, cancellable)           │
 │   • Generation   (rayon fan-out over sample ranges)          │
-│   • Pipeline run (rayon fan-out over GROUPS; stages in order)│
+│   • Pipeline run (a rayon pool of in_flight_cap over GROUPS; │
+│                   stages within a group strictly in order)   │
 │   • Pyramid build, export, statistics                        │
 └───────┬──────────────────────────────▲───────────────────────┘
         │ DbCommand (mpsc)             │ oneshot replies
@@ -262,8 +319,11 @@ plugin interface would later slot into.
 - **Groups are the unit of parallelism.** Stages within a group run strictly in order;
   different groups run concurrently, bounded to `min(cores, in_flight_cap)` live frames so
   memory stays predictable.
-- **Cancellation** via `CancellationToken` checked at chunk boundaries (every 64 K samples,
-  1 000 CSV rows, or between stages), so cancel latency stays under ~50 ms.
+- **Cancellation** via a shared `AtomicBool` — `RunControl` for a run, an equivalent
+  control for import and generation — checked at chunk boundaries (a block of samples, a
+  block of CSV rows, or between stages), so cancel latency stays under ~50 ms. A flag
+  rather than tokio's `CancellationToken`, because what has to notice it is synchronous
+  rayon work rather than a future.
 
 ---
 
@@ -309,7 +369,7 @@ of the source" option stores it as a compressed blob when the provenance matters
 CREATE TABLE app_meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
-);  -- seeded with ('schema_version','2')
+);  -- ('schema_version','5') as of migration 0005
 
 -- One import run, one generation batch, or one derived collection.
 CREATE TABLE dataset (
@@ -429,9 +489,12 @@ CREATE TABLE playlist_item (
 );
 
 CREATE INDEX ix_signal_group  ON signal(group_id);
-CREATE INDEX ix_group_dataset ON signal_group(dataset_id);
+CREATE INDEX ix_train_dataset ON signal_train(dataset_id);
+CREATE INDEX ix_group_train   ON signal_group(train_id);
 CREATE INDEX ix_signal_name   ON signal(name);
 
+-- External-content FTS5, kept in step with `signal` by insert/update/delete
+-- triggers: the index is derived, so it never holds a row the table does not.
 CREATE VIRTUAL TABLE signal_fts USING fts5(
     name, units, attributes, content='signal', content_rowid='id'
 );
@@ -470,11 +533,18 @@ CREATE TABLE pulse_tag (
 );
 ```
 
-Processing-related tables are in §9.6.
+Property definitions and the indexed mirror of `attributes` are in §6.3, the render-pyramid
+index in §5.4, and everything a run records in §9.6. Migration 0004 also adds
+`signal.derived_run_id` and `signal.derived_stage_ordinal`, which are what make the
+`derived` provenance token (§6.1) traceable back to the stage that produced the signal.
 
 **Migrations.** Numbered SQL files (`0001_init.sql`, `0002_…`) embedded in the binary and
 applied in order inside a transaction, gated on `app_meta.schema_version`. Downgrades are
-refused with a clear message rather than attempted.
+refused with a clear message rather than attempted. Five are applied as of v1.2: the initial
+schema, the signal train (§6.6), the pyramid index (§5.4), runs (§9.6) and regression
+(§9.7). A migration that has to restructure a table rebuilds it the way SQLite's own
+procedure prescribes — 0002 does, because `signal_group` carried a UNIQUE constraint on a
+column that had to go — so the ids other tables reference survive.
 
 ### 5.3 Column Blob Format
 
@@ -533,9 +603,9 @@ the source blob's checksum:
   64:1 reduction, each level halves again. Level 0 adds ~3% to an `f32` source and the
   levels above it sum to one more of the same, so the whole pyramid costs ~6%.
 - Levels are built once, lazily, on the worker pool and cached in the library. Measured at
-  M4: **~0.7 s per 100 M samples** in a release build, which is the streaming read of the
-  column out of its chunks plus one linear fold; the build is a background job, never on
-  the frame path.
+  M4 and re-measured at v1.3: **~0.8 s per 100 M samples** in a release build, which is the
+  streaming read of the column out of its chunks plus one linear fold; the build is a
+  background job, never on the frame path.
 - The renderer picks the level where **samples-per-pixel lands in [1, 2]** and reads that
   slice — a few KB, one chunk — then draws vertical min/max bars.
 - Below one sample per pixel the renderer reads the raw span and draws a polyline with
@@ -822,7 +892,7 @@ file with millions of rows per group.
 | **Field whitespace** | Leading and trailing whitespace is trimmed from every field before parsing — the format writes `, ` as its delimiter run. |
 | **Time column** | Located by name (`time`, `toa`, `time_of_arrival`). Its unit comes from the profile, defaulting to **microseconds**, and is scaled to seconds for the absolute timeline on ingest. The original unit is recorded so export restores it exactly. |
 | **Pulse fields** | Every non-time column of the pulse header becomes one field array per group (§6.6). Files are numeric throughout; a non-numeric column is reported as a diagnostic and kept as a text field array rather than aborting the import. |
-| **Numeric storage** | Pulse columns default to `f64`, not the `f32` of §17.11: G1 asks for a lossless round trip and a decimal that survives `f32` is the exception. Narrowing a column to `f32` or `i32` halves or quarters its storage and is a per-column choice in the mapping UI. The sniff pass *offers* a narrowing it can see is safe but never applies one, because it has read only the first group. |
+| **Numeric storage** | Pulse columns default to `f64`, not the `f32` of §17.14: G1 asks for a lossless round trip and a decimal that survives `f32` is the exception. Narrowing a column to `f32` or `i32` halves or quarters its storage and is a per-column choice in the mapping UI. The sniff pass *offers* a narrowing it can see is safe but never applies one, because it has read only the first group. |
 | **Text columns** | A text field array is stored the way every other column is — as a numeric blob — by dictionary-encoding it: the column holds `i32` indices and the group carries the distinct cells in `csv_text.<key>`. Export restores the original spelling, so the round trip is lossless; the column's zone map orders by first appearance rather than by value, which is why a text column is not searchable by range. |
 | **Group fields** | Every group-header column other than the count becomes a group property. Text is expected here (`info` in the sample) and is stored as a group attribute. |
 | **Delimiter** | Auto-detected from the group header (`,` `;` `\t` `\|`), overridable. |
@@ -1072,6 +1142,11 @@ pub trait Stage: Send + Sync {
     /// Validate and apply parameters. Called before any group is processed.
     fn configure(&mut self, params: &ParamSet) -> Result<(), ConfigError>;
 
+    /// Extra identity this instance adds to its cache key, beyond the kind,
+    /// version and parameters the descriptor already accounts for. A compiled
+    /// stage has none; an external one returns its library file's hash (§9.9).
+    fn cache_salt(&self) -> Option<String> { None }
+
     /// Optional: called once per run before the first group.
     fn begin_run(&mut self, _ctx: &RunCtx) -> Result<(), StageError> { Ok(()) }
 
@@ -1095,6 +1170,7 @@ pub struct StageDescriptor {
     pub inputs:   &'static [PortSpec],
     pub outputs:  &'static [PortSpec],
     pub params:   &'static [ParamSpec],
+    pub pure:     bool,                // false opts the stage out of caching (§9.5)
 }
 ```
 
@@ -1247,9 +1323,10 @@ CREATE TABLE run (
 
 CREATE TABLE run_group (
     run_id   INTEGER NOT NULL REFERENCES run(id) ON DELETE CASCADE,
-    group_id INTEGER NOT NULL REFERENCES signal_group(id),
+    group_id INTEGER NOT NULL REFERENCES signal_group(id) ON DELETE CASCADE,
     status   TEXT NOT NULL,
     wall_ms  INTEGER,
+    message  TEXT,                      -- why a failed group failed
     PRIMARY KEY (run_id, group_id)
 );
 
@@ -1262,6 +1339,7 @@ CREATE TABLE run_stage (
     cache_key     TEXT    NOT NULL,
     metrics_json  TEXT    NOT NULL DEFAULT '{}',
     diagnostics_json TEXT NOT NULL DEFAULT '[]',
+    message       TEXT,                 -- the stage error, when it failed
     PRIMARY KEY (run_id, group_id, stage_ordinal)
 );
 
@@ -1275,8 +1353,10 @@ CREATE TABLE run_signal (
     domain        TEXT    NOT NULL,
     disposition   TEXT    NOT NULL
                   CHECK (disposition IN ('replaced','added','passthrough','dropped')),
-    blob_id       INTEGER REFERENCES sample_blob(id),
+    blob_id       INTEGER REFERENCES sample_blob(id),   -- NULL once swept (§9.5)
     sample_rate_hz REAL, t0_s REAL, sample_count INTEGER,
+    -- Cached with the row, so a swept stage still answers for what it produced.
+    min_value     REAL, max_value REAL, mean_value REAL, rms_value REAL,
     attrs_json    TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (run_id, group_id, stage_ordinal, signal_ordinal)
 );
@@ -1294,6 +1374,18 @@ CREATE TABLE artifact (
     summary       TEXT                  -- '4 detections, best score 0.91'
 );
 CREATE INDEX ix_artifact_lookup ON artifact(run_id, group_id, stage_ordinal);
+
+-- Which recorded output a cache key resolves to (§9.5). Hanging it off the run
+-- means a deleted run takes its cache entries with it, so a key never points at
+-- rows that are gone — and only an `always` stage is ever published here.
+CREATE TABLE stage_cache (
+    cache_key     TEXT    PRIMARY KEY,
+    run_id        INTEGER NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+    group_id      INTEGER NOT NULL,
+    stage_ordinal INTEGER NOT NULL,
+    created_utc   TEXT    NOT NULL
+);
+CREATE INDEX ix_stage_cache_run ON stage_cache(run_id);
 
 -- A run promoted to golden, for regression comparison.
 CREATE TABLE baseline (
@@ -1330,6 +1422,11 @@ CREATE TABLE run_assertion (
 `stage_ordinal = -1` records the source signals as they entered the pipeline, so "before"
 is a real row and not a special case in the UI.
 
+A stage whose samples were swept by retention, or that did not fit under the run's sample
+cap, keeps its `run_signal` row with `blob_id` NULL: the disposition, the timebase, the
+sample count and the cached statistics are all still there, and only the waveform is gone
+(§9.5).
+
 ### 9.7 Assertions
 
 A pipeline may carry assertions, evaluated per group after the last stage. This is what
@@ -1355,25 +1452,46 @@ group whose stages did not all run is not asked: it has already failed.
 ### 9.8 Built-in Stages (`sp-dsp`)
 
 Enough to exercise the harness and cover common preprocessing, all implemented against the
-same public trait a user's algorithm would use:
+same public trait a user's algorithm would use — nothing in `sp-dsp` is privileged, which
+is what makes G9 testable rather than aspirational.
 
-| Family | Stages |
-|--------|--------|
-| Conditioning | Detrend, DC block, normalise (peak/RMS), gain, clip, resample, window, trim/pad |
-| Filtering | FIR (windowed-sinc), IIR biquad cascade — low / high / band / notch |
-| Transform | FFT → `Spectrum`, STFT → `Spectrogram`, Hilbert → envelope + instantaneous phase |
+**Built.** Eight stage kinds, every one registered through the same `StageRegistry` a
+plugin uses:
+
+| Kind | Family | What it does |
+|------|--------|--------------|
+| `dsp.util.passthrough` | Utility | A labelled inspection point: shares its input's blob and claims no storage |
+| `dsp.condition.gain` | Conditioning | Scalar gain |
+| `dsp.condition.detrend` | Conditioning | Removes the mean or a least-squares line |
+| `dsp.condition.normalise` | Conditioning | To unit peak or unit RMS |
+| `dsp.filter.biquad` | Filtering | Low / high / band / notch, as a cascade of identical RBJ sections; coefficients recomputed for a group whose rate differs rather than filtering at the wrong corner |
+| `dsp.transform.fft` | Transform | → `Spectrum` artifact, with a rectangular / Hann / Hamming / Blackman-Harris window; changes no samples |
+| `dsp.detect.threshold` | Detection | → `Detections` artifact, `detections` and `widest_s` metrics, and a `detection_count` on the group |
+| `dsp.measure.statistics` | Measurement | → `Statistics` artifact and per-signal metrics, reading the summary the store already holds; writes `rms` back as a property when asked to |
+
+**Planned**, as the stage families of M11 (§16.1) — the harness does not need them, but a
+realistic pipeline does:
+
+| Family | Stages still to write |
+|--------|-----------------------|
+| Conditioning | DC block, clip, resample, window, trim/pad |
+| Filtering | FIR (windowed-sinc); a designed higher-order IIR whose sections differ — Butterworth, Chebyshev — rather than one section repeated |
+| Transform | STFT → `Spectrogram`, Hilbert → envelope + instantaneous phase |
 | Digital | Threshold/slice → `DigitalLogic`, clock recovery, symbol decode → `Symbols`, bit pack → `Bits` |
-| Detection | Peak find, edge find, pulse measure, CFAR → `Detections` |
-| Measurement | Statistics, THD/SNR/SINAD, pulse metrics → `Metrics` |
-| Utility | Passthrough (a labelled inspection point), split, merge, tee-to-property |
+| Detection | Peak find, edge find, pulse measure, CFAR |
+| Measurement | THD/SNR/SINAD, pulse metrics → `Metrics` |
+| Utility | Split, merge, tee-to-property |
 
 ### 9.9 External Stages (Native Libraries)
 
 The algorithm under test often already exists as a compiled library — a C/C++ codebase, a
 vendor SDK, MATLAB Coder or Simulink output — and rewriting it in Rust to test it defeats
-the point of the harness. So one stage kind is **`ext.native`**: it loads a DLL (`.dll` /
-`.so` / `.dylib`), hands it **one group at a time**, and reads the output back into the
-same `StageOutput` every native stage produces. From the pipeline editor, the results
+the point of the harness. So a stage kind may come from outside the binary: `sp-ext` loads
+a DLL (`.dll` / `.so` / `.dylib`), hands it **one group at a time**, and reads the output
+back into the same `StageOutput` every compiled stage produces. The library names its own
+kind, which must sit in the **`ext.`** namespace (`ext.sample.gain` is what the reference
+library declares) so that it cannot shadow a built-in and a recorded run says at a glance
+that its stage came from outside this build. From the pipeline editor, the results
 screen and the run schema it is an ordinary stage — the same parameter form, the same
 per-stage recording, the same stage rail.
 
@@ -1480,7 +1598,7 @@ a deliberate user action rather than a scan of a plugin directory.
 | Question | Answer | Reasoning |
 |----------|--------|-----------|
 | How does an output say what happened to each input? | `dispositions` is one byte per **input** signal, in input order; `signals` carries the replacement buffers first, in that same order, then any additions | The §9.4 rule that every input is accounted for then holds by construction rather than by trusting the library, and `sp_signal` needs no ordinal field |
-| What dtype crosses the boundary? | The host lends `f64`; a library may return `f32` or `f64`, and any other dtype is refused by name rather than reinterpreted | §17.10 has stages doing their arithmetic in `f64` anyway. The dtype byte stays in the struct, so lending native buffers later is a host change rather than an ABI break |
+| What dtype crosses the boundary? | The host lends `f64`; a library may return `f32` or `f64`, and any other dtype is refused by name rather than reinterpreted | §17.14 has stages doing their arithmetic in `f64` anyway. The dtype byte stays in the struct, so lending native buffers later is a host change rather than an ABI break |
 | What may an external stage be called? | Every external kind must start with `ext.`, checked at load time | A library then cannot shadow a built-in, and a recorded run says at a glance that its stage came from outside this build |
 | How does a loaded stage reach the registry? | `StageRegistry::register_loaded`, which takes a descriptor and a closure rather than a `fn` pointer | An external stage's factory has to carry its library along with it; the compiled path is untouched |
 | Who owns a descriptor, which must be `'static`? | The strings and slices parsed from the library's JSON are leaked, once per library per process | A descriptor genuinely lives as long as the library it describes, and a library is never unloaded once a run has referenced it |
@@ -1534,8 +1652,11 @@ pub enum ViewHint {
 overlays land on the timeline, and it persists without any storage code. That is G9 applied
 to outputs rather than algorithms.
 
-Built-in kinds: `Spectrum`, `Spectrogram`, `Detections`, `Symbols`, `Bits`, `Metrics`,
-`Constellation`, `Histogram`, `FilterResponse`, `Table`, `Text`.
+Built so far: `Statistics`, `Detections` and `Spectrum`, the outputs of the three §9.8
+stages that emit one. The viewers are ahead of them — every `ViewHint` above has a pane,
+heatmap and scatter included — so `Spectrogram`, `Symbols`, `Bits`, `Metrics`,
+`Constellation` and `FilterResponse` are a stage away rather than a viewer away, and each
+arrives with the family that emits it (M11).
 
 **Storage.** Payloads under 64 KB are stored as JSON in `artifact.payload_json`; larger
 ones (a spectrogram matrix) go to a content-addressed blob (`kind = 'artifact'`) with the
@@ -1565,8 +1686,10 @@ The results screen is organised around a horizontal rail — one chip per stage,
   comparison; the scope then draws A and B overlaid with a residual (A−B) trace beneath,
   and artifact panes show a field-level diff.
 - Left/right arrow keys walk the pipeline, so stepping through an algorithm is one key.
-- The rail is present in the Scope screen too, so playback and stage inspection are the
-  same surface rather than two.
+- The rail lives on the Results screen. The Scope screen keeps its own transport and
+  viewport and shares the playhead conventions, but has no rail of its own: a run is
+  inspected where its stages are, and the two screens each keep their place across
+  navigation (§12.3).
 
 ### 10.3 The Results Screen
 
@@ -1669,13 +1792,12 @@ traces:
 | Overlay | Playhead, cursors, annotations, hover readout, selection band | Every tick (cheap) |
 
 Interactions: scroll = zoom time about the pointer, shift+scroll = pan, ctrl+scroll = zoom
-amplitude, drag = box zoom, double-click = fit, `Home`/`End` = jump to bounds,
-space = play/pause, `[` / `]` = set loop in/out, `←`/`→` = previous/next stage.
-
-M4 ships every one of these except `←`/`→`, which needs a stage rail to step along and
-arrives with M6; the artifacts layer is likewise empty until there are stages to produce
-them. A single click on the canvas moves the playhead, which the table above leaves to the
-transport but is what a scope is expected to do.
+amplitude, drag = box zoom, double-click = fit, click = move the playhead, `Home`/`End` =
+jump to bounds, space = play/pause. On the Results screen `←`/`→` walk the stage rail
+(§10.2). Loop in and out are buttons on the transport rather than `[` / `]`: the canvas
+takes the keyboard for the playhead, and a key that silently redefines the loop while the
+pointer is elsewhere is worse than a labelled control. Binding them is part of the
+configurable shortcut map (§15.11).
 
 Per-trace controls: visibility, colour, gain, vertical offset, and a **stacked vs.
 overlaid** layout toggle. Domain drives the default renderer — `DigitalLogic` signals get
@@ -1695,60 +1817,69 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 | **Pipeline** | Stage palette on the left, ordered stage list in the middle, generated parameter form on the right. Port validation inline. Run controls with group selection. |
 | **Results** | Group list + stage rail + scope + artifact panes (§10.3). The main working surface for algorithm development. |
 | **Runs** | History of runs with pipeline hash, status, timing, assertion results; promote to baseline; diff two runs. A run whose stages all ran but whose assertions failed reads as a failing run (§9.7), and the failures-only filter is how one is found in a long history. Opening or diffing a run hands it to the Results screen, which already draws both — one renderer, one set of conventions. |
-| **Scope** | Playback-focused view of stored signals, with the same stage rail available when a run is loaded. |
+| **Scope** | Playback-focused view of stored signals: transport, loop region, per-trace controls, and a viewport that survives navigation. A run's stages are walked on the Results screen, which has the rail (§10.2). |
 | **Inspector** | Detail for one signal, pulse field or pulse: full metadata, property editor, tags, statistics, histogram, and a virtualised value table — for a pulse group, the table is the pulse records themselves, one row per pulse across every field. Statistics are recomputed from the samples in one streaming pass (min, max, peak-to-peak, mean, RMS, standard deviation, zero crossings and the distribution), not read from the cached row, so they answer for what is actually stored; the table is a window on the column, paged, so a 100 M-sample signal costs a read rather than a copy. A pulse is addressed as a row of its group's table: an unannotated pulse has no row of its own (§6.6). |
-| **Properties** | Manage property definitions and property sets (§6.3). |
-| **Settings** | Library location, theme, default sample rate, strict/tolerant import, retention defaults, the run-level sample cap, decimation quality, keyboard map. It also reports what the open library is made of — rows, bytes by blob kind, published stage-cache keys — with `Reclaim unused blobs` and `Clear stage cache` beside the figures. Clearing unpublishes keys and nothing else: the output they named belongs to the run that recorded it and stays there, so the cost is the next run's reuse. |
+| **Properties** | The list of property definitions and the form that declares a new one (§6.3). Property *sets* — named reusable bundles — have their tables in the schema but no screen yet (§15.5). |
+| **Settings** | Library location, theme, default sample rate, strict/tolerant import, retention defaults, the run-level sample cap, decimation quality, histogram bins, the allowed external libraries, and the (fixed, v1) keyboard map. It also reports what the open library is made of — rows, bytes by blob kind, published stage-cache keys — with `Reclaim unused blobs` and `Clear stage cache` beside the figures. Clearing unpublishes keys and nothing else: the output they named belongs to the run that recorded it and stays there, so the cost is the next run's reuse. `Verify Library`, `VACUUM` and `Rebuild pyramids` are written and tested in `sp-store` but have no button yet (§15.6). |
 
 ### 12.2 Iced Application Shape
 
 ```rust
+/// Which screen is showing. A tag, not a state container: every screen's state
+/// is a field of `App` and outlives navigation, which is what §12.3 promises.
 enum Screen {
-    Library, Import(ImportState), Generate(GenState),
-    Pipeline(PipelineState), Results(ResultsState), Runs,
-    Scope(ScopeState), Inspector(InspectTarget), Properties, Settings,
-}
-
-/// What the Inspector is looking at. A pulse group has no per-pulse row until
-/// one is annotated (§6.6), so the target is a reference, not an id.
-enum InspectTarget {
-    Signal(SignalId),
-    PulseField { group: GroupId, ordinal: u32 },
-    Pulse(PulseRef),
+    Library, Inspector, Properties, Import, Generate,
+    Pipeline, Runs, Results, Scope, Settings,
 }
 
 struct App {
-    store:   StoreHandle,       // channel to the writer actor
-    stages:  StageRegistry,     // populated at startup by sp-dsp (+ future plugins)
-    screen:  Screen,
-    library: LibraryIndex,      // cached metadata; samples stay on disk
-    scope:   ScopeState,        // survives screen switches so playback keeps its position
-    active_run: Option<RunView>,// current run + selected (group, stage) + pinned stage
-    toasts:  Vec<Toast>,
-    modal:   Option<Modal>,
+    screen:   Screen,
+    settings: Settings,          // written back to settings.json as it changes
+    store:    Option<Store>,     // None when the library would not open
+    store_error: Option<String>, // why, for the status bar
+    library:  library::State,    // one field per screen, each owning its own state
+    import:   import::State,
+    generate: generate::State,
+    pipeline: pipeline::State,
+    properties: properties::State,
+    inspector:  inspector::State,
+    runs:     runs::State,
+    results:  results::State,    // run, group, stage, pinned stage and playhead
+    scope:    scope::State,      // playback keeps its position across screens
+    settings_screen: settings::State,
 }
 
 enum Message {
     Nav(Screen),
+    ToggleTheme,
     Library(library::Message),
     Import(import::Message),
     Generate(generate::Message),
     Pipeline(pipeline::Message),
-    Results(results::Message),      // SelectStage, PinStage, SelectGroup, TogglePane
+    Properties(properties::Message),
+    Inspector(inspector::Message),
+    Runs(runs::Message),
+    Results(results::Message),   // SelectStage, PinStage, SelectGroup, StepStage, Tick
     Scope(scope::Message),
-    Store(StoreEvent),
-    Tick(Instant),                  // playback clock
-    Progress { job: JobId, done: u64, total: u64 },
-    StageFinished { run: RunId, group: GroupId, stage: u16, status: StageStatus },
-    JobFinished(JobId, Result<JobOutcome, JobError>),
-    Error(AppError),
+    Settings(settings::Message),
+}
+
+/// What the Inspector is looking at. A pulse is addressed as a row of its
+/// group's record table rather than as a target of its own: an unannotated
+/// pulse has no row to point at (§6.6).
+enum Target {
+    Signal(SignalId),
+    PulseField { group: GroupId, ordinal: u32 },
 }
 ```
 
 Each screen module owns its own `State`/`Message`/`update`/`view`, and the root `update`
-delegates. Long jobs return a `JobId` immediately; progress arrives as messages.
-`StageFinished` is separate from generic progress so the stage rail can fill in live as a
-run proceeds — the user can inspect stage 1's output while stage 4 is still computing.
+delegates — progress, job completion, store errors and the playback tick are all variants
+of the owning screen's message rather than of the root's. A long job is a
+`Task::perform` over `jobs::read`/`jobs::write`, so the store is touched on the blocking
+pool and the UI thread only ever sees the message that comes back. Per-stage progress
+arrives while a run is still going, so the stage rail fills in live — the user can inspect
+stage 1's output while stage 4 is still computing.
 
 ### 12.3 UX Principles
 
@@ -1758,8 +1889,11 @@ run proceeds — the user can inspect stage 1's output while stage 4 is still co
   Nothing in the results screen mutates the library.
 - **The view survives navigation.** Playhead, viewport, selected group and selected stage
   persist across screen switches, so comparing two stages never costs the user their place.
-- **Destructive actions confirm and are undoable** where cheap (delete moves to a trash
-  table for the session; permanent delete is a separate explicit action).
+- **Destructive actions are few and are refused when they would cost evidence.** Deleting a
+  run a baseline names is refused by the store with the baseline's name in the message, and
+  retention never prunes one. What is not built is the softer half of this: there is no
+  confirmation step, no trash table and no undo, and §15.11 tracks it. The library screen
+  offers no delete at all, which is why the gap has not bitten.
 - **Errors are data, not dialogs.** Import problems and stage diagnostics land in
   filterable lists the user can work through, not a popup per row.
 - **Keyboard first** for transport, stage stepping and navigation.
@@ -1789,8 +1923,10 @@ an older build did not write, falls back to the default for that field: losing a
 preference must never cost the user their application. Out-of-range values are clamped
 rather than refused, for the same reason.
 
-The keyboard map is fixed in v1; the screen lists it so the shortcuts are discoverable
-(§15.11 tracks making it configurable).
+The keyboard map is fixed in v1; the screen lists the ones that work from anywhere —
+`Ctrl`+`1`…`9` and `Ctrl`+`0` to jump to a screen, `Ctrl`+`T` for the theme — so they are
+discoverable. The transport and rail keys belong to the screen they act on and are labelled
+there instead (§11.4). §15.11 tracks making the whole map configurable.
 
 ---
 
@@ -1813,7 +1949,25 @@ The keyboard map is fixed in v1; the screen lists it so the shortcuts are discov
 | Library query | < 50 ms at 10 000 signals | Indexed SQLite + FTS5 + `signal_property` index, metadata only |
 | Cold start | < 500 ms | Lazy pyramid load, no eager sample reads |
 
-Benchmarks live in `crates/*/benches/` using `criterion` and run in CI on a fixed fixture set.
+These are design targets, not all of them measured. The two that are, are the two the
+goals name:
+
+- **G2, the frame budget.** `sp-engine/tests/scale.rs` writes a 100 M-sample library and
+  reduces the visible span to one `(min, max)` pair per pixel column at 1080p, sixty times
+  over, at four zoom levels. Re-measured at v1.3 in a release build: **1.06 ms** a frame
+  over the whole signal (pyramid level 9), **1.01 ms** over a tenth of it (level 6),
+  **1.46 ms** over a thousandth and **0.65 ms** on raw samples — against the 8 ms budget,
+  with the pyramid itself built in 0.84 s. That is one trace: the budget's eight are eight
+  such reductions, which is what the margin is for, and drawing them is Iced's cost rather
+  than this crate's. It is `#[ignore]`d because it writes ~400 MB and only means anything
+  optimised; `cargo test -p sp-engine --release --test scale -- --ignored` is the command.
+- **Re-run after a param edit.** `sp-dsp/tests/pipeline.rs` runs a pipeline, edits stage
+  *n* and asserts that stages before it come back `cached` and stages from it on re-ran.
+
+The rest are budgets the design was shaped around rather than numbers under test: there is
+no `benches/` directory and no `criterion` dependency. A criterion suite over a fixed
+fixture set is the honest way to hold the ingest, search and generation lines to account,
+and belongs with the first milestone that has a reason to defend one of them.
 
 ---
 
@@ -1821,45 +1975,88 @@ Benchmarks live in `crates/*/benches/` using `criterion` and run in CI on a fixe
 
 **Error handling.** `thiserror` enums per crate; `sp-app` maps them to user-facing text.
 Nothing panics on bad input — a corrupt CSV, a truncated blob, or a stage given a
-zero-length signal produces a diagnostic. Panics in worker tasks and in stage code are
-caught at the task boundary (`catch_unwind`) and reported as a stage failure with the
-group named, so one bad algorithm cannot take down a run.
+zero-length signal produces a diagnostic. A stage that *returns* an error fails its own
+group and no other: the run carries on, the group is recorded `failed` with the message,
+and the remaining groups still produce their numbers. A stage that **panics** is a
+different matter and is not yet contained: `catch_unwind` guards the store's writer thread,
+so a panicking job cannot poison the connection, but there is no guard around
+`Stage::process`, so a panicking algorithm takes the run with it. That guard, and a
+per-stage timeout, belong with M14's isolation work — in-process is where a native library
+crashes too (§9.9).
 
-**Integrity.** Blob checksums are verified on first read after app start and after any
-crash-recovery. A `Verify Library` action rehashes every blob and reports mismatches, plus
-any blob at refcount 0 and any row referencing a missing blob. Because the bytes and the
-rows describing them commit in one SQLite transaction, the two cannot disagree after a
-crash — the failure mode a split file/database store has, and this one does not.
+**Integrity.** A blob's checksum *is* its address: `sp-store` looks a column up by hash on
+write, so an identical column is shared rather than stored twice, and a write that does not
+finish never acquires a checksum to be found by. Verification is deliberate rather than
+automatic — reads do not rehash, because a read is on the frame path and a rehash is a
+pass over the whole column. `verify()` rehashes every blob and reports checksum mismatches,
+length mismatches, refcount disagreements, blobs no row references and rows pointing at a
+missing blob; `repair_references()` reconciles what can be reconciled. Both are tested and
+neither has a button yet (§12.1). Because the bytes and the rows describing them commit in
+one SQLite transaction, the two cannot disagree after a crash — the failure mode a split
+file/database store has, and this one does not.
 
-**Testing.**
-- Unit tests per crate; property tests (`proptest`) for the CSV round-trip (G1) and for
-  generator determinism across chunk boundaries (G3).
-- Golden-file tests for the parser against a fixture corpus including malformed files.
-- **Stage conformance harness**: a generic test any `Stage` impl can be run through,
-  checking determinism (same input twice → identical output hash), port contract
-  compliance, cancellation responsiveness, and no-panic on degenerate inputs (empty
-  signal, single sample, all-NaN, DC-only). New algorithms get this for free.
-- `sp-engine` transport tests drive the state machine with a mock clock — no UI needed.
-- A headless smoke test opens a library, imports a fixture, runs a pipeline, and asserts
-  against a baseline.
+**Testing.** 903 tests pass at v1.3, over a workspace that is clean under
+`cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`. CI runs all three on
+Windows and Linux for every push and pull request.
 
-**Observability.** `tracing` spans around every job and every stage invocation; a Log panel
-in the app plus a rolling file log in the library root. Per-stage wall time is recorded in
-`run_stage`, so a slow stage is visible in the rail without profiling.
+- Unit tests per crate, beside the code they test; property tests (`proptest`) for the CSV
+  round-trip (G1), for generator determinism across chunk boundaries (G3), and for the
+  playback invariants that hold at any zoom: a cell bounds its span, a pyramid builds the
+  same whatever the chunk size, the playhead never leaves its range, and a reduction never
+  outgrows the canvas.
+- Golden-file tests for the parser against a fixture corpus in `crates/sp-csv/tests/` that
+  includes the malformed cases: a wrong count, no count at all, a BOM, CRLF, a lone `\r`,
+  semicolon delimiters, comment lines and uncooperative cells.
+- `crates/sp-dsp/tests/pipeline.rs` runs the scheduler end to end — cache hits and misses,
+  retention, the sample cap, cancellation, a failing group, a deleted run.
+- `crates/sp-app/tests/data_flow.rs` follows the data the whole way: a spec generates a
+  ladder, the ladder lands in the library, a run measures what the spec put into it, the
+  Inspector recomputes the same numbers, the output plays back over a pyramid of its own,
+  and an exported file re-imports to the rows it came from.
+- `crates/sp-app/tests/cli.rs` is the headless smoke test: build a library, run the
+  pipeline, promote a baseline, change the algorithm, and check the exit code says
+  *regressed* rather than *misused* (G8).
+- Each screen's `update` is tested directly — the buttons and the forms, screen by screen —
+  because an Iced `update` is a pure function and needs no window.
+- **Not built: the stage conformance harness.** A generic test any `Stage` impl could be
+  run through — same input twice gives the same output hash, ports honoured, cancellation
+  noticed, no panic on an empty, single-sample, all-NaN or DC-only input — is what would
+  make G8 hold for stages nobody here wrote. It is M11's, alongside the stage families that
+  would be its first customers.
 
-**Distribution.** `cargo build --release` → single `.exe`. Windows is the primary target;
-Linux and macOS build from the same source. An optional MSI via `cargo-wix` later.
+**Observability.** `tracing` spans around every job and every stage invocation, written to
+stderr and to a daily rolling file in the application data directory — under
+`SignalPlayback/logs`, beside `settings.json` rather than inside the library, because the
+library is a file the user may move or replace and the log should not follow it.
+`RUST_LOG` sets verbosity. Per-stage wall time is recorded in
+`run_stage`, so a slow stage is visible in the rail without profiling, and per-stage
+diagnostics are shown on the Results screen. An in-app log panel is not built: the file and
+the diagnostics pane between them have covered it so far.
 
-**Accessibility.** Colour palettes are colour-blind-safe by default (Okabe–Ito for traces);
-trace and artifact identity is also conveyed by legend and line style, never colour alone.
-Minimum 14 px UI text, full keyboard navigation.
+**Distribution.** `cargo build --release` → one binary, no runtime, no companion directory.
+A `v*` tag builds and attaches Windows and Linux x86-64 binaries to a GitHub release;
+macOS builds from the same source but is not produced by the workflow. An optional MSI via
+`cargo-wix` later.
+
+**Accessibility.** The trace palette is the Okabe–Ito colour-blind-safe set, and trace and
+artifact identity is also carried by the legend, never by colour alone. Minimum 14 px UI
+text. Keyboard coverage is partial rather than full: every screen is reachable by
+`Ctrl`+*digit*, the transport and the stage rail have keys, and text inputs take focus in
+order — but there is no focus ring walking every control, and §15.11's configurable
+shortcut map is where finishing the job belongs.
 
 ---
 
 ## 15. Potential Features
 
-Grouped by area and tiered: **[MVP]** ships in v1 · **[V1.x]** near-term · **[V2]**
-larger effort · **[Stretch]** speculative.
+Grouped by area and tiered: **[MVP]** shipped in v1 · **[done]** shipped since, in the
+milestone named · **[V1.x]** near-term · **[V2]** larger effort · **[Stretch]** speculative.
+
+Every **[MVP]** line below is built — that is what closed §16 — so the tier that carries
+information now is **[done]**, which marks a post-v1 entry the code has caught up with.
+Several are marked from M3 rather than from a 1.x milestone: the generator was written to
+the whole of §8.1 at the time, so nodes this section had filed under *near-term* have
+existed since M3 and only the milestone table had not noticed.
 
 ### 15.1 Import & Data Ingest
 - **[MVP]** Pulse-record CSV import (§7) with preview and column mapping.
@@ -1881,12 +2078,19 @@ larger effort · **[Stretch]** speculative.
 - **[MVP]** Sum/product composition, gain, delay, envelope.
 - **[MVP]** Deterministic seeded noise.
 - **[MVP]** Parameter sweep to generate a whole group at once.
-- **[V1.x]** Chirps (linear/log/quadratic) and AM/FM/PM modulation.
-- **[V1.x]** Arbitrary `f(t)` expression node.
-- **[V1.x]** PRBS / m-sequence generator.
-- **[V1.x]** Direct generation of `digital_logic` and `symbols` signals as preprocessed inputs.
-- **[V1.x]** Impairment ladders — one source across a sweep of SNRs, one group per rung.
-- **[V1.x]** Preset library with import/export.
+- **[done — M3]** Chirps (linear/log/quadratic) and AM/FM/PM modulation. FM and PM require
+  an oscillator carrier, for the reason in §8.1.
+- **[done — M3]** Arbitrary `f(t)` expression node, compiled once to RPN (`sp-gen/expr.rs`).
+- **[done — M3]** PRBS / m-sequence generator, seekable by repeated squaring over GF(2).
+- **[done — M3]** Direct generation of `digital_logic` and `symbols` signals as preprocessed
+  inputs: the domain is a field of the spec and the Generate screen offers it.
+- **[done — M3]** Preset library with import/export: nine built-ins embedded in the binary
+  (tone, two-tone, noisy tone, linear chirp, pulse train, AM, FM, PRBS-9 NRZ, step edge),
+  plus load and save of a `GenSpec` file.
+- **[V1.x]** Impairment ladders — one source across a sweep of SNRs, **one group per rung**.
+  A sweep today produces one group holding a signal per rung, which the metric chart reads
+  as a curve; a group per rung is what a *pipeline* wants, since the group is the unit of
+  processing and of assertion.
 - **[V2]** Digital modulation: ASK/FSK/PSK/QPSK/QAM with configurable symbol rate and pulse shaping.
 - **[V2]** Impairment stack: AWGN at a target SNR, phase noise, IQ imbalance, DC offset, clock drift, dropouts, clipping.
 - **[V2]** Known-answer vectors carrying their own expected result for assertion.
@@ -1903,18 +2107,23 @@ larger effort · **[Stretch]** speculative.
 - **[MVP]** Per-stage recording of signals, artifacts, metrics and diagnostics.
 - **[MVP]** Built-in conditioning, filtering, FFT and threshold stages.
 - **[MVP]** Cancellable runs with per-group progress.
-- **[V1.x]** Content-hash stage cache — editing stage *n* re-runs only *n…end*.
-- **[V1.x]** Retention policy per stage (always / on failure / never).
-- **[V1.x]** Assertions on metrics and artifacts; run status aggregates them.
-- **[V1.x]** Baseline promotion and automatic regression comparison.
-- **[V1.x]** Stage conformance test harness for new algorithms.
-- **[V1.x]** Detection, symbol-decode and measurement stage families.
+- **[done — M10]** Content-hash stage cache — editing stage *n* re-runs only *n…end*.
+- **[done — M10]** Retention policy per stage (always / on failure / never), plus the
+  run-level sample cap the default needed (§9.5).
+- **[done — M7]** Assertions on metrics, statistics, artifacts and stage timings; run status
+  aggregates them.
+- **[done — M7]** Baseline promotion and automatic regression comparison.
+- **[V1.x]** Stage conformance test harness for new algorithms (M11, §14).
+- **[V1.x]** Detection, symbol-decode and measurement stage families. One detector
+  (threshold) and one measurement (statistics) exist as the harness's first customers;
+  symbol decode has none, and the families are M11's (§9.8).
 - **[V2]** Parameter sweep over a stage — run the pipeline across a grid, get a metrics table.
 - **[V2]** Branching pipelines (a real DAG) with a graph editor.
 - **[V2]** Per-stage breakpoints: pause a run at a stage and inspect before continuing.
 - **[V2]** Stage-level unit fixtures — pin one group's input as a stage's test case.
-- **[V1.x]** External stage: a native library (DLL/.so) fed one group at a time over a
-  flat C ABI, recorded like any other stage (§9.9).
+- **[done — M9]** External stage: a native library (DLL/.so) fed one group at a time over a
+  flat C ABI, recorded like any other stage (§9.9), with an allow-list in Settings and a
+  conforming reference library (`sp-ext-sample`) the tests load.
 - **[V1.x]** Process-isolated external stages — a crashing library fails one group, not the run.
 - **[V2]** Plugin stages beyond the §9.9 ABI — custom artifact kinds and import formats.
 - **[V2]** Distributed / multi-process run execution for large datasets.
@@ -1927,12 +2136,16 @@ larger effort · **[Stretch]** speculative.
 - **[MVP]** Overlay artifacts drawn on the scope's time axis.
 - **[MVP]** Global playhead shared across scope and every time-aware artifact pane.
 - **[MVP]** Group list with status, timing and metric columns.
-- **[V1.x]** Pin-two-stages comparison with residual (A−B) trace.
-- **[V1.x]** Heatmap viewer for spectrograms and correlation surfaces.
-- **[V1.x]** Scatter viewer for constellations and feature spaces.
-- **[V1.x]** Run-to-run diff: max abs error, RMS error, first divergence index.
-- **[V1.x]** Metric-across-groups chart (the degradation curve).
-- **[V1.x]** Jump from a diagnostic to the time span that produced it.
+- **[done — M6]** Pin-two-stages comparison with residual (A−B) trace and a field-level
+  artifact diff (G7).
+- **[done — M6]** Heatmap viewer for spectrograms and correlation surfaces, and
+- **[done — M6]** Scatter viewer for constellations and feature spaces — both are panes
+  driven by a `ViewHint`, and both are waiting on a stage that emits one (§10.1).
+- **[done — M7]** Run-to-run diff: max abs error, RMS error, first divergence index.
+- **[done — M7]** Metric-across-groups chart (the degradation curve), built as an artifact
+  so the same viewer draws it.
+- **[V1.x]** Jump from a diagnostic to the time span that produced it. Diagnostics are
+  listed per stage; none of them carries a time span to jump to yet.
 - **[V2]** Field-level artifact diff between runs.
 - **[V2]** Save an inspection layout (panes, pinned stages, viewport) per pipeline.
 - **[V2]** Export a stage's output back into the library as a new dataset.
@@ -1942,9 +2155,15 @@ larger effort · **[Stretch]** speculative.
 - **[MVP]** Domain and provenance on every signal, driving default rendering.
 - **[MVP]** User-defined property definitions with typed kinds, units and validation.
 - **[MVP]** Property editor in the Inspector; unrecognised attributes preserved.
-- **[V1.x]** Named property sets applied to a dataset or group.
-- **[V1.x]** Indexed property queries and saved smart searches.
-- **[V1.x]** Stage write-back of estimated properties, namespaced by stage.
+- **[V1.x]** Named property sets applied to a dataset or group. The tables are in the
+  schema from migration 0001; nothing reads or writes them.
+- **[done — M8]** Indexed property queries: the Library screen filters on a property with a
+  comparison (`prf_hz >= 1000`, `coding` is `nrz`) through the `signal_property` index,
+  alongside tags and full-text search. **[V1.x]** Saving one as a smart search.
+- **[V1.x]** Stage write-back of estimated properties, **namespaced by stage**. A stage can
+  patch a signal's or a group's attributes today — the statistics stage writes `rms` when
+  asked, the threshold stage writes `detection_count` — but the patch lands in the run's
+  record under its plain key, not in the library and not namespaced.
 - **[V2]** Property templates inferred from a sample file.
 - **[V2]** Derived/computed properties defined by an expression over other properties.
 - **[Stretch]** Schema versioning with migration of existing property values.
@@ -1953,11 +2172,21 @@ larger effort · **[Stretch]** speculative.
 - **[MVP]** Dataset/group/signal hierarchy, search, sortable detail table.
 - **[MVP]** Tags with filter-by-tag.
 - **[MVP]** Cross-group pulse search: numeric predicates over pulse fields, zone-map prefiltered (§6.6).
-- **[V1.x]** Name and tag an individual pulse; saved pulse selections.
+- **[V1.x]** Name and tag an individual pulse; saved pulse selections. The `pulse` and
+  `pulse_tag` tables are in the schema and nothing writes them yet — a pulse is addressed as
+  `(group, index)` until one is annotated, which is what §6.6 chose.
 - **[V1.x]** Bulk edit: rename, retag, set properties across a selection.
-- **[V1.x]** Duplicate detection via blob checksum; deduplicate on ingest.
-- **[V1.x]** Library statistics dashboard (count, total size, rate distribution, run storage).
-- **[V1.x]** Vacuum / verify / rebuild-pyramids / prune-old-runs maintenance actions (a library that has shed data needs `VACUUM` to return the pages).
+- **[done — M1]** Deduplication on ingest: a column is addressed by its BLAKE3 hash, so an
+  identical column is shared rather than stored twice and a passthrough stage costs nothing.
+  **[V1.x]** Surfacing that as *duplicate detection* — telling the user which signals are
+  the same bytes.
+- **[done — M8]** Library statistics: the Settings screen reports rows by table, bytes by
+  blob kind, unreferenced bytes and published cache keys. **[V1.x]** The rest of the
+  dashboard — rate distribution, run storage over time.
+- **[done — M8]** `Reclaim unused blobs` and `Clear stage cache`, and prune-old-runs as the
+  retention setting. **[V1.x]** `Verify Library`, `VACUUM` and `Rebuild pyramids` are
+  written and tested in `sp-store` but have no button (§12.1); a library that has shed data
+  needs the `VACUUM` to get its pages back.
 - **[V2]** Multiple libraries open simultaneously with cross-library compare.
 - **[V2]** Versioning: keep prior revisions of an edited signal.
 - **[V2]** Archive/restore a dataset or a run to a single portable `.splib` bundle.
@@ -1982,9 +2211,13 @@ larger effort · **[Stretch]** speculative.
 - **[Stretch]** GPU compute-shader path for >1 G-sample traces.
 
 ### 15.8 Analysis
-- **[V1.x]** Per-signal statistics: min, max, mean, RMS, std dev, peak-to-peak, zero crossings.
-- **[V1.x]** Histogram view.
-- **[V1.x]** FFT magnitude/phase with selectable window (Hann, Hamming, Blackman-Harris, flat-top).
+- **[done — M8]** Per-signal statistics: min, max, mean, RMS, std dev, peak-to-peak, zero
+  crossings, recomputed from the samples in one streaming pass rather than read from the
+  cached row.
+- **[done — M8]** Histogram view, in the Inspector, at a configurable bin count.
+- **[done — M8]** FFT magnitude with a selectable window (rectangular, Hann, Hamming,
+  Blackman-Harris), published as a `Spectrum` artifact. **[V1.x]** Phase, and a flat-top
+  window for amplitude accuracy.
 - **[V2]** THD, SNR, SINAD, SFDR, ENOB measurements.
 - **[V2]** Cross-correlation and time-delay estimation between two signals.
 - **[V2]** Envelope detection, peak finding, edge/pulse measurements (rise time, width, duty).
@@ -1993,7 +2226,9 @@ larger effort · **[Stretch]** speculative.
 
 ### 15.9 Export & Interop
 - **[MVP]** Export to the native pulse-record CSV format (round-trip fidelity, TOA restored to its source unit).
-- **[V1.x]** Export a selection, a time range, or a stage's output.
+- **[V1.x]** Export a selection, a time range, or a stage's output. A whole imported
+  dataset exports today, from the Library screen or the command line (§7.5); a generated
+  one has no layout to reverse and is refused.
 - **[V1.x]** Export the scope view as PNG/SVG.
 - **[V1.x]** Export a run's metrics table as CSV.
 - **[V2]** Export to WAV, `.npy`, Parquet, MATLAB, HDF5, SigMF.
@@ -2002,14 +2237,18 @@ larger effort · **[Stretch]** speculative.
 - **[Stretch]** Python binding (`pyo3`) to read the library and run results from scripts.
 
 ### 15.10 Automation & Extensibility
-- **[V1.x]** CLI mode: `signalplayback import|generate|run|export` for scripting and CI.
-- **[V1.x]** `run --assert-baseline` exit code, so a pipeline is a CI check.
+- **[done — M7, M8]** CLI mode: `signalplayback run|baselines|promote|import|export` for
+  scripting and CI. **[V1.x]** `generate` — a spec can be rendered into a library only from
+  the window, which is the one gap in a scriptable generate → run → compare loop.
+- **[done — M7]** `run --assert-baseline` with a distinct exit code for *misused* and
+  *regressed*, so a pipeline is a CI check (G8).
 - **[V2]** Scriptable batch jobs (a job file describing generate → run → compare → export).
 - **[V2]** Plugin interface for custom stages, artifact kinds and import formats.
 - **[Stretch]** Embedded scripting (Rhai/Lua) for on-the-fly signal math and quick stages.
 
 ### 15.11 Quality of Life
-- **[MVP]** Persistent window layout and last-opened library.
+- **[MVP]** Last-opened library, remembered in `settings.json`. **[V1.x]** Window layout:
+  the window opens at its default size and the pane widths are fixed.
 - **[MVP]** Light/dark theme.
 - **[V1.x]** Undo/redo for library and pipeline edits.
 - **[V1.x]** Recent files, datasets and pipelines.
@@ -2038,9 +2277,31 @@ larger effort · **[Stretch]** speculative.
 M2 and M3 are independent after M1 and can proceed in parallel. M5 depends on M1 (storage)
 and benefits from M3 (test inputs) but not from M4; M6 depends on both M4 and M5.
 
-**M0–M8 are delivered.** Every exit criterion above is met, which is what makes this
-revision v1.0 rather than another draft. The table is closed: nothing is added to it, and
-later work is a post-v1 milestone below.
+**M0–M8 are delivered.** The table is closed: nothing is added to it, and later work is a
+post-v1 milestone below.
+
+**Re-checked at v1.3.** Each exit criterion was taken back to the code and to a test that
+holds it, rather than to the commit that claimed it:
+
+| Phase | What holds the exit criterion now |
+|-------|-----------------------------------|
+| M0 | CI runs `cargo fmt --check`, `clippy --all-targets -D warnings` and the test suite on Windows and Linux, all clean. Ten screens, each one's `update` tested directly. |
+| M1 | `sp-store/tests/library.rs`: `signals_insert_and_list`, `property_definitions_and_queries`, `samples_round_trip_byte_for_byte_across_chunks`, `identical_columns_share_one_blob`, `verify_passes_on_a_healthy_library_and_catches_damage`. Verify passes as a tested store function; it has no button yet (§12.1). |
+| M2 | `sp-csv/tests/corpus.rs` imports the fixture corpus, malformed files included; `roundtrip.rs` holds G1, `any_well_formed_file_round_trips` as a proptest. |
+| M3 | `sp-gen/tests/determinism.rs` holds G3, chunk joins and per-node noise streams included; every built-in preset is parsed, validated and rendered by its own test; `a_generated_train_is_the_same_shape_as_an_imported_one` is the third clause, as written. |
+| M4 | `sp-engine/tests/scale.rs` holds G2 at 100 M samples — re-measured for §13, worst case 1.46 ms a frame against an 8 ms budget. |
+| M5 | `sp-dsp/tests/pipeline.rs`: `a_pipeline_runs_group_by_group_and_records_every_stage`, `each_stage_records_what_it_actually_computed`, `one_bad_group_fails_on_its_own_without_sinking_the_run`. |
+| M6 | The Results screen's own tests hold G7: `a_pinned_stage_gives_every_matched_signal_a_residual_trace`, `a_pinned_artifact_is_diffed_field_by_field`, `an_overlay_artifact_lands_on_the_scope_and_follows_the_playhead`. |
+| M7 | `sp-app/tests/cli.rs` holds G8 end to end: a baseline deviation exits 2, a bad request exits 1. `sp-proc/tests/compare.rs` covers what a diff must notice. |
+| M8 | `sp-app/tests/data_flow.rs` runs the whole loop — spec → library → run → Inspector → playback → export → re-import. The release workflow builds the Windows and Linux binaries from a tag. |
+| M9 | `sp-ext/tests/native.rs`: `a_dll_runs_as_a_stage_over_one_group_at_a_time_and_every_output_is_persisted`, `every_result_carries_the_build_that_produced_it`, `the_library_file_is_part_of_the_cache_key`, `a_library_on_disk_is_refused_until_it_is_allowed_and_then_loads`. |
+| M10 | `sp-dsp/tests/pipeline.rs`: `editing_a_stage_re_runs_it_and_everything_after_it` is the first clause, `a_cached_run_records_what_a_cold_run_records` the second, with retention, the sample cap and `a_key_whose_run_is_gone_is_unpublished_rather_than_followed` beside them. |
+
+Two corrections came out of that pass rather than a milestone: §9.8 and §10.1 were
+describing stage and artifact families that were planned rather than written, and §13 was
+crediting a benchmark suite that does not exist. Neither is an exit criterion — every
+criterion above is about the harness, and the harness is what got built — but a design
+document that describes stages nobody wrote is one an M11 would be planned from wrongly.
 
 ### 16.1 Post-v1 Track
 
@@ -2052,8 +2313,8 @@ not by section number.
 |-------|-------------|---------------|
 | **M9 — External stages** (done) | `sp-ext`, the §9.9 C ABI, library allow-list in settings, sample conforming DLL | A sample DLL runs as a stage over one group at a time; its path, hash and version are recorded in `run_stage` (G8) |
 | **M10 — Stage cache** (done) | Content-hash stage cache, per-stage retention policy, run-level sample cap | Editing stage *n* re-runs only *n…end*; a cached run and a cold run produce identical outputs |
-| **M11 — Stage families** | Detection, symbol-decode and measurement stages; stage conformance harness | Each family has a stage that runs end-to-end and passes the conformance harness |
-| **M12 — Generation** | Chirps, AM/FM/PM, `f(t)` expression node, PRBS, impairment ladders | A ladder produces one group per SNR rung, deterministically (G3) |
+| **M11 — Stage families** | Detection, symbol-decode and measurement stages; stage conformance harness; the artifact kinds they emit (§10.1) | Each family has a stage that runs end-to-end and passes the conformance harness |
+| **M12 — Generation** | Impairment ladders, one group per rung; a flat-top window and FFT phase | A ladder produces one group per SNR rung, deterministically (G3) |
 | **M13 — Ingest & UX** | Drag-and-drop and multi-file import, watch folder, command palette, configurable shortcuts | A watched folder imports without user action; every action is reachable from the palette |
 | **M14 — Isolation** | `sp-stage-host`, shared-memory transport, `process_isolated` execution | A library that segfaults fails one group with a diagnostic and the run continues |
 
@@ -2063,6 +2324,18 @@ M10's key was already computed and recorded per stage when M5 wrote the schedule
 added is the part that decides what a key may point at — `on_failure` swept once its group
 passes, only `always` published, a stale key unpublished on the lookup that finds it, and a
 run-level cap that limits bytes without costing the account of what a stage did.
+
+**M12 shrank when it was re-read against `sp-gen`.** Chirps, AM/FM/PM, the `f(t)` node and
+PRBS were all written at M3 — the generator was built to the whole of §8.1 rather than to
+the MVP slice of §15.2 — so what is left of the milestone is the impairment ladder that
+produces *one group per rung*, which is a change to how a sweep writes rather than to what
+a node renders, and the two FFT gaps (phase, a flat-top window). It is small enough now to
+fold into whichever milestone needs a degradation curve first, which is M11.
+
+**M11 grew by the same pass.** §9.8 and §10.1 now separate what is built from what is not,
+and the planned half of both tables is M11's scope: the stage families, the artifact kinds
+they emit, and the conformance harness that makes G8 mean something for a stage this
+workspace did not write.
 
 ---
 
@@ -2097,23 +2370,33 @@ noted.
    ports (§9.3). If real algorithms need genuine branching — two parallel chains reconciled
    at the end — that is a v2 graph editor, and knowing now would change the pipeline model
    rather than extend it later.
-7. ⚠ **Cross-group state — now likelier than assumed.** The design assumes stages are
-   independent per group, with `begin_run`/`end_run` as the only cross-group hooks. Groups
-   are segments of one train (§6.6), so an algorithm that carries adaptive state *between*
-   them in order — a tracker, a deinterleaver, an adaptive equaliser — is the expected
-   case rather than the exception, and group parallelism must become opt-out per stage. A
-   `sequential` flag in `StageDescriptor`, plus a scope that runs a stage over a whole
-   train, covers it cheaply, but only if it goes in before the scheduler is written
-   (**decide at M5**).
+7. ⚠ **Cross-group state — still open, and now more expensive.** The design assumes stages
+   are independent per group, with `begin_run`/`end_run` as the only cross-group hooks.
+   Groups are segments of one train (§6.6), so an algorithm that carries adaptive state
+   *between* them in order — a tracker, a deinterleaver, an adaptive equaliser — is the
+   expected case rather than the exception, and group parallelism would have to become
+   opt-out per stage. M5 was the cheap moment and it passed: the scheduler was written
+   without the flag, `StageDescriptor` has `pure` but no `sequential`, and every stage
+   instance serves exactly one group because `process` takes `&mut self`. What M9 added is
+   not this: a `sequential` *library* gets a lock, which is mutual exclusion rather than
+   ordered delivery (§9.9). Adding it now means a second execution mode in the scheduler —
+   one instance per stage, groups fed to it in order, no fan-out — which is a day's work
+   and a second path through the part of the system every run depends on. **Decide when a
+   real algorithm needs it**, and take the cost then rather than building a mode nothing
+   asks for.
 8. **External-stage ABI shape (§9.9).** The C ABI assumes one group per call with
    borrowed input buffers and library-allocated outputs. If the libraries to be tested are
    really stream-oriented (fed pulse by pulse, holding state across calls) or expect the
    host to allocate output buffers up front, the ABI changes shape rather than extends. M9
    built the one-group-per-call shape and a conforming sample library against it, so the
    question is now what a real vendor library makes of it rather than what to build.
-9. **Stage output signal count.** Assumed a stage may add and drop signals freely within a
-   group. If downstream stages must see a fixed signal count matching the group's declared
-   `count`, that is a validation rule worth stating now.
+9. **Stage output signal count.** ✅ *Settled at M5, confirmed at M9.* A stage adds and
+   drops freely, and the rule that makes it safe is the accounting one: an output must say
+   what happened to every input, so `check_covers` refuses an output that quietly forgets
+   one. M9 carried the same rule across the C ABI as a disposition byte per input signal
+   (§9.9), which makes it structural rather than a matter of trusting the library. A group's
+   declared `count` is the number of *pulse records* in the source block (§7.2), not a
+   constraint on how many signals a stage may produce, so the two never had to agree.
 10. **Retention default.** ✅ *Settled at M10 (2026-09-15): `Always` with a size cap.*
    Content addressing makes passthrough free, so the default keeps everything and costs
    nothing for the stages that change nothing. The pipeline that does cost — every stage
@@ -2122,19 +2405,21 @@ noted.
    did and measured, and by `OnFailure` per stage for the intermediates only a failure is
    read for. `OnFailure` as the default was rejected: the common case is a workbench being
    iterated on, where the run that passed is the one to compare against next.
-11. **Artifact size ceiling.** 64 KB inline / blob beyond that is a guess. A per-group
-   spectrogram at fine resolution can reach hundreds of MB; if that is routine, the
-   spectrogram artifact should store a decimated pyramid the way signals do.
+11. **Artifact size ceiling.** 64 KB inline / blob beyond that is a guess, and still
+   untested: the three artifact kinds that exist (§10.1) are all small, and the one that
+   would strain it — a fine-resolution spectrogram, hundreds of MB a group — arrives with
+   M11. If that turns out to be routine, the spectrogram artifact should store a decimated
+   pyramid the way signals do.
 
 ### Playback — resolved at M4
 
-14. **Complex signals on the scope (part of §17.12).** A `c64` column reduces to
+12. **Complex signals on the scope (part of §17.15).** A `c64` column reduces to
     **magnitude** in the pyramid, because a min/max pair is a real-valued idea; the scope
     draws that envelope mirrored about zero, which is the shape an I/Q capture is read by.
     Constellation and separate I/Q traces need either a second pyramid per component or a
     complex-aware cell, and stay V1.x. Nothing about the stored format has to change for
     them: a pyramid is derived data and can be rebuilt in a new shape.
-15. **Irregular signals on the scope.** A signal whose times come from a companion time
+13. **Irregular signals on the scope.** A signal whose times come from a companion time
     column has no arithmetic index-to-time map, so the reducer cannot pick a pyramid cell
     by span. It reports the trace as undrawable rather than guessing, and no such signal
     exists in practice yet — import writes pulse groups, generation writes regular
@@ -2145,17 +2430,17 @@ noted.
 
 ### Data model
 
-11. **Numeric precision.** Default storage is `f32` for *signals* (halves memory, ample for
+14. **Numeric precision.** Default storage is `f32` for *signals* (halves memory, ample for
     most captured signals); `f64` is available per signal. **Pulse columns resolved to `f64`
     at M2** — G1 requires the CSV round trip to be lossless, and `f32` cannot promise it, so
     narrowing a pulse column is an explicit per-column choice (§7.3). Processing is always
     done in `f64` internally and narrowed on write — confirm that narrowing on every stage
     boundary is acceptable, or whether intermediate stages should stay `f64` end-to-end.
-12. **Complex signals.** `c64` is in the dtype enum and `BasebandIq` is a domain, but full
+15. **Complex signals.** `c64` is in the dtype enum and `BasebandIq` is a domain, but full
     complex support (complex-aware pyramids, constellation rendering) is scheduled for
     V1.x. Confirm whether I/Q pairs arrive as two real signals or as one complex one — this
     affects M2, not just the renderer.
-13. **Library scale.** Design targets 10 000 signals / ~100 GB of samples, plus run
+16. **Library scale.** Design targets 10 000 signals / ~100 GB of samples, plus run
     storage. An order of magnitude beyond that would argue for a columnar store.
 
 ---
@@ -2167,11 +2452,11 @@ noted.
 | A later file shape differs from `sample/sample.csv` (§17.1–17.4) | Rework of `sp-csv` | Grammar confirmed against a real file; every framing constant (preamble length, count column, time column and unit, delimiter) is an import-profile setting rather than a literal |
 | Per-pulse annotation demand outgrows the lazy `pulse` table (§17.5) | Model rework at M2+ | Identity is `(group, index)` either way, so materialising rows later is an additive migration, not a re-import |
 | Intermediate-result storage grows unbounded | Library bloats, disk fills | Content-addressed dedup makes passthrough free; per-stage retention policy; run-level size cap; prune-old-runs maintenance action |
-| Linear pipeline too restrictive for real algorithms | Model rework at M5+ | Typed ports cover the common "needs an earlier artifact" case; `Stage` trait is already graph-ready; settle §17.6 before M5 |
-| Stage authors write non-deterministic stages | G8 silently false | Conformance harness runs every stage twice and compares output hashes; impure stages must opt out explicitly and are excluded from caching |
-| A user algorithm panics or hangs | Run lost, app unstable | `catch_unwind` per stage invocation; per-stage timeout; failure isolated to one group |
+| Linear pipeline too restrictive for real algorithms | Model rework | Typed ports cover the common "needs an earlier artifact" case and have carried every pipeline written so far, M9's external stage included; the `Stage` trait is still graph-ready. §17.6 went unsettled through M5 and is now answered by use rather than by decision |
+| Stage authors write non-deterministic stages | G8 silently false | *Half-mitigated.* An impure stage opts out of caching through `descriptor().pure`, and a run records the hash of everything a stage read — but the conformance harness that would run a stage twice and compare output hashes is not written (M11, §14), so nothing yet catches a stage that lies about being pure |
+| A user algorithm panics or hangs | Run lost, app unstable | *Open.* A stage that returns an error already fails one group and no more, and the store's writer thread is guarded — but there is no `catch_unwind` around `Stage::process` and no per-stage timeout, so a panicking or hanging algorithm still takes the run. It belongs with M14, which has to solve the harder version of the same problem for a native library (§9.9, §14) |
 | Iced canvas performance at 8+ dense traces plus overlays | Misses G2 | Pyramid decimation caps draw cost at viewport width; layered caches; `wgpu` backend; fall back to instanced GPU line rendering if needed |
 | Iced API churn between releases | Build breakage | Pin the minor version; isolate all Iced usage in `sp-app` |
 | WAL growth and write amplification during a large import | Slow import, transient disk use several times the payload | 4 MiB chunks with `wal_autocheckpoint` tuned to match; import commits per group, not per file; measured against the §13 ingest budget |
-| Library file stays large after data is deleted | Disk not reclaimed | Blob refcounting frees pages on delete; `VACUUM` in the maintenance actions reclaims the file itself |
-| Scope creep from §15 | M1–M8 slip | Tiers are contractual: nothing beyond **[MVP]** enters v1 without cutting something else |
+| Library file stays large after data is deleted | Disk not reclaimed | Blob refcounting frees rows on delete and `Reclaim unused blobs` sweeps what nothing references; `VACUUM` is written in `sp-store` but has no button yet, so returning the pages to the filesystem currently needs `sqlite3` (§15.6) |
+| Scope creep from §15 | Milestones slip | Tiers are contractual: nothing beyond **[MVP]** entered v1, and a post-v1 entry moves to **[done]** only when a milestone delivered it. The v1.3 pass found the failure mode this guards against runs both ways — §15 had generation work filed as *near-term* that M3 had already built, and §9.8 had stages written up as built that nobody had started |

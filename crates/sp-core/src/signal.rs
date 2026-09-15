@@ -374,7 +374,7 @@ impl Samples {
 
 /// Samples plus the scaling needed to read them in engineering units.
 ///
-/// Processing is done in `f64` internally and narrowed on write (§17.10), so
+/// Processing is done in `f64` internally and narrowed on write (§17.14), so
 /// [`SampleBuffer::value`] is the single place raw storage becomes a real
 /// number for the renderer, statistics and stages alike.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

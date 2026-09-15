@@ -139,7 +139,9 @@ Dependencies point left-to-right only: `sp-core` depends on nothing else here,
 | `sp-gen` | `GenSpec` node tree and its renderer | M3 |
 | `sp-engine` | Transport state machine, playback clock, render pyramids | M4 |
 | `sp-proc` | `Stage` trait, registry, ports, scheduler, run recording, assertions, run diffing, the stage cache key and the sample cap | M5, M7, M10 |
-| `sp-dsp` | Built-in stages: conditioning, filtering, transforms, detection | M5 |
+| `sp-dsp` | Built-in stages: passthrough, gain, detrend, normalise, biquad, statistics, threshold, FFT | M5 |
+| `sp-ext` | External stages: loading a native library over the flat C ABI, and the paths this installation may load | M9 |
+| `sp-ext-sample` | A conforming library built as a `cdylib`: the ABI's reference implementation, and what `sp-ext`'s tests load | M9 |
 | `sp-app` | The Iced application — the only crate that knows about pixels | M0+ |
 
 Inside `sp-store`, row-level functions (`library`, `props`, `pulses`, `blob`,
