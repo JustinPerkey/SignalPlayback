@@ -199,7 +199,7 @@ impl SignalRef {
     }
 
     /// Every sample as an `f64`, which is how a stage does its arithmetic
-    /// (§17.10).
+    /// (§17.14).
     pub fn read_values(&self) -> Result<Vec<f64>, StageError> {
         Ok(self.read_all()?.values().collect())
     }

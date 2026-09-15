@@ -116,7 +116,7 @@ pub fn render_with(
 
 /// Renders one window as `f64`, before it is narrowed to the spec's dtype.
 ///
-/// Processing is `f64` throughout and narrows on write (§17.10), so the live
+/// Processing is `f64` throughout and narrows on write (§17.14), so the live
 /// preview and the statistics both read this rather than the stored samples.
 pub fn render_values(
     spec: &GenSpec,

@@ -248,7 +248,7 @@ impl Lent {
         let mut signals = Vec::with_capacity(count);
 
         for signal in &frame.signals {
-            // f64 for now: §17.10 has every stage doing its arithmetic in
+            // f64 for now: §17.14 has every stage doing its arithmetic in
             // f64, and the dtype byte is in the struct so lending native
             // buffers later does not change the ABI's shape.
             samples.push(signal.read_values()?);

@@ -79,7 +79,7 @@ pub fn artifact_registry() -> Result<ArtifactRegistry, ArtifactRegistryError> {
 /// A buffer of the same dtype as `signal`, unless that dtype cannot hold the
 /// result.
 ///
-/// Processing happens in `f64` and is narrowed on write (§17.10). Narrowing
+/// Processing happens in `f64` and is narrowed on write (§17.14). Narrowing
 /// back to an integer dtype would quantise a filtered or normalised signal to
 /// whole counts, so an integer input comes out as `f64`; a float input keeps
 /// its width.
