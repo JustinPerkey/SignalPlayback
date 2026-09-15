@@ -92,6 +92,10 @@ pub struct GroupEntry {
     pub id: GroupId,
     pub name: String,
     pub outcome: RunGroupRow,
+    /// The rung this group is, for a dataset generated as an impairment
+    /// ladder (§8.4): the property the sweep was stored under, and its value.
+    /// It is what the chart across groups is plotted against (§10.5).
+    pub rung: Option<(String, f64)>,
 }
 
 /// Everything about a run that does not depend on which group is selected.
@@ -1702,6 +1706,7 @@ impl State {
 
         let mut groups = Vec::new();
         let mut values = Vec::new();
+        let mut rungs = Vec::new();
         for (index, entry) in detail.groups.iter().enumerate() {
             let Some(row) = detail.stage_row(entry.id, self.stage) else {
                 continue;
@@ -1710,25 +1715,54 @@ impl State {
                 continue;
             };
             groups.push(index as f64);
+            rungs.push(entry.rung.clone());
             values.push(*value);
         }
         if values.is_empty() {
             return;
         }
 
+        // Over a ladder the x axis is the rung rather than the group's place
+        // in the list, so unevenly spaced rungs plot where they belong and the
+        // axis is labelled in the units the sweep was in.
+        let ladder = rungs.first().and_then(Clone::clone).filter(|(key, _)| {
+            rungs
+                .iter()
+                .all(|rung| rung.as_ref().is_some_and(|(other, _)| other == key))
+        });
+        let (x_field, x_values) = match &ladder {
+            Some((key, _)) => (
+                // A rung named after the metric it is charted against — an SNR
+                // ladder under a measured SNR — would be one column name for
+                // two columns, so it is marked as the rung rather than given
+                // up on.
+                if key == &metric {
+                    format!("{key} (rung)")
+                } else {
+                    key.clone()
+                },
+                rungs
+                    .iter()
+                    .filter_map(|rung| rung.as_ref().map(|(_, value)| *value))
+                    .collect(),
+            ),
+            None => ("group".to_owned(), groups),
+        };
+
         let schema = ArtifactSchema::new(
             vec![
-                FieldSpec::new("group", FieldKind::Float),
+                FieldSpec::new(x_field.clone(), FieldKind::Float),
                 FieldSpec::new(metric.clone(), FieldKind::Float),
             ],
             ViewHint::Series {
-                x: "group".into(),
+                x: x_field.as_str().into(),
                 y: vec![metric.as_str().into()],
+                y2: Vec::new(),
                 x_log: false,
                 y_log: false,
             },
         );
-        let payload = serde_json::json!({ "group": groups, metric.clone(): values });
+        let payload = serde_json::json!({ x_field.clone(): x_values, metric.clone(): values });
         match ArtifactData::from_value(schema, &payload) {
             Ok(data) => self.metric_data = Some(data),
             Err(error) => tracing::warn!(%error, "the metric series would not decode"),
@@ -2055,8 +2089,9 @@ fn load_detail(conn: &sp_store::Connection, choice: &RunChoice) -> sp_store::Res
 
     let mut groups = Vec::new();
     for outcome in runs::run_groups(conn, choice.id)? {
-        let name = library::get_group(conn, outcome.group_id).map_or_else(
-            |_| format!("Group {}", outcome.group_id.get()),
+        let group = library::get_group(conn, outcome.group_id).ok();
+        let name = group.as_ref().map_or_else(
+            || format!("Group {}", outcome.group_id.get()),
             |group| {
                 group
                     .name
@@ -2064,10 +2099,20 @@ fn load_detail(conn: &sp_store::Connection, choice: &RunChoice) -> sp_store::Res
                     .unwrap_or_else(|| format!("Group {}", group.ordinal))
             },
         );
+        // A ladder's group says which property its rung is stored under, so
+        // the chart does not have to guess which attribute means the x axis.
+        let rung = group.as_ref().and_then(|group| {
+            let key = group
+                .attributes
+                .get_str(sp_gen::generate::SWEEP_PROPERTY_KEY)?;
+            let value = group.attributes.get_f64(key)?;
+            Some((key.to_owned(), value))
+        });
         groups.push(GroupEntry {
             id: outcome.group_id,
             name,
             outcome,
+            rung,
         });
     }
 
@@ -2223,6 +2268,7 @@ mod tests {
                         wall_ms: Some(12),
                         message: None,
                     },
+                    rung: None,
                 })
                 .collect(),
             stage_rows,
@@ -2496,6 +2542,52 @@ mod tests {
         assert_eq!(data.rows(), 2);
         assert_eq!(data.column("snr_db").unwrap().number_at(1), Some(6.0));
         assert_eq!(data.column("group").unwrap().number_at(1), Some(1.0));
+    }
+
+    #[test]
+    fn over_a_ladder_the_curve_is_plotted_against_the_rung_rather_than_the_ordinal() {
+        // The rungs are unevenly spaced on purpose: plotted against their
+        // place in the list they would be a different curve (§10.5).
+        let mut state = opened();
+        let rungs = |state: &mut State, key: &str| {
+            if let Some(detail) = state.detail.as_mut() {
+                for (index, entry) in detail.groups.iter_mut().enumerate() {
+                    entry.rung = Some((key.to_owned(), [0.0, 18.0][index]));
+                }
+            }
+            state.rebuild_metric();
+        };
+
+        rungs(&mut state, "noise_db");
+        let data = state.metric_data.as_ref().expect("a curve");
+        let x = data.column("noise_db").expect("plotted against the rung");
+        assert_eq!(x.number_at(0), Some(0.0));
+        assert_eq!(x.number_at(1), Some(18.0));
+        assert!(
+            data.column("group").is_none(),
+            "the ordinal is not what a ladder is read against"
+        );
+
+        // An SNR ladder charted against a measured SNR: two columns, two
+        // names, and the axis is still the ladder's.
+        rungs(&mut state, "snr_db");
+        let data = state.metric_data.as_ref().expect("a curve");
+        assert_eq!(
+            data.column("snr_db (rung)").unwrap().number_at(1),
+            Some(18.0)
+        );
+        assert_eq!(data.column("snr_db").unwrap().number_at(1), Some(6.0));
+    }
+
+    #[test]
+    fn a_run_whose_groups_are_not_all_rungs_keeps_the_ordinal_axis() {
+        let mut state = opened();
+        if let Some(detail) = state.detail.as_mut() {
+            detail.groups[0].rung = Some(("snr_db".to_owned(), 0.0));
+        }
+        state.rebuild_metric();
+        let data = state.metric_data.as_ref().expect("a curve");
+        assert!(data.column("group").is_some(), "half a ladder is not one");
     }
 
     #[test]

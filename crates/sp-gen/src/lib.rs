@@ -42,7 +42,7 @@ pub use spec::{
     ConcatPart, EnvelopeSpec, GenSpec, ModKind, Node, NodeKind, NoiseKind, OscShape, Oscillator,
     Sweep,
 };
-pub use sweep::{ParamRef, ParamSweep, SweepValues};
+pub use sweep::{ParamRef, ParamSweep, SweepLayout, SweepValues};
 pub use train::{FieldSpec, FieldValue, Pri, TrainSpec};
 pub use tree::{NodeRef, ROOT};
 pub use validate::{validate, validate_train, Issue, Issues, Severity};

@@ -142,6 +142,13 @@ fn node() -> impl Strategy<Value = Node> {
                 input: Box::new(input),
                 env: EnvelopeSpec::Tukey { alpha },
             }),
+            // An impairment rung measures its input before it adds anything,
+            // so it is the node with the most to lose from a window-dependent
+            // render; the chunk-join property below is what holds it.
+            (inner.clone(), -10.0..40.0f64).prop_map(|(input, snr_db)| Node::Awgn {
+                input: Box::new(input),
+                snr_db,
+            }),
             (inner.clone(), RATE_HZ * 0.75..RATE_HZ).prop_map(|(input, to_rate_hz)| {
                 Node::Resample {
                     input: Box::new(input),

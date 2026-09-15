@@ -998,6 +998,8 @@ pub enum Node {
     Envelope  { input: Box<Node>, env: EnvelopeSpec },  // ADSR | Gaussian | Tukey
     Modulate  { carrier: Box<Node>, modulator: Box<Node>, kind: ModKind },
                                                // Am{depth} | Fm{dev_hz} | Pm{dev_rad}
+    Awgn      { input: Box<Node>, snr_db: f64 },  // Gaussian noise at a target SNR,
+                                               //   measured against the input's own power
     Resample  { input: Box<Node>, to_rate_hz: f64 },
     FromSignal{ signal_id: SignalId },         // reference a stored signal as a source
 }
@@ -1018,6 +1020,15 @@ why `Concat` holds a named struct rather than a tuple: a tuple has no field to p
 | **`Delay` shifts by whole samples.** | A sub-sample shift needs interpolation, and `Resample` is the node that owns interpolation. |
 | **`Resample` only ever lowers the rate.** | Above the output rate there is nothing to reconstruct; below it is what models a slower converter. Validation warns rather than blocking. |
 | **`serde_json`'s `float_roundtrip` feature is required.** | Without it the parser can return an `f64` a bit out from the one written, which would break both the stored `gen_spec` re-rendering identically (G3) and an attribute surviving export unchanged (G1). |
+
+**Settled during M12.**
+
+| Decision | Why |
+|----------|-----|
+| **`Awgn` measures its input rather than taking an amplitude**, and measures the noise stream too, so the *achieved* ratio is the requested one whatever the stream's nominal variance. | A rung of a ladder is a signal-to-noise ratio, not a noise amplitude; an amplitude that means a different SNR for every source is not a rung. |
+| **The measurement is over a bounded probe window fixed by the node's own grid**: the whole signal when it is short, otherwise sixteen blocks of 4 096 samples spread evenly from its first sample to its last. | Power is a property of the whole signal, and §8.2 requires a node to be a function of its own index — so the window it measures over cannot be the window being rendered. Bounding it keeps a ladder over a 100 M-sample source from costing a second render of it; spreading it keeps a chirp's power from being read off its opening. |
+| **Against silence no noise is added.** | There is no ratio to hit, and any amplitude would be arbitrary. Validation warns where it can see it coming. |
+| **One probe per node per render**, memoised by the node's pointer. | The value is the same whichever chunk asks for it, so the first chunk to need it pays for it and the rest read it — a ladder costs one extra probe, not one per chunk. |
 
 ### 8.2 Rendering
 
@@ -1058,6 +1069,9 @@ and cannot be — `sin`, `ln` and `cos` are not bit-specified by IEEE 754.
   explicit list) to emit a whole group of signals in one action — e.g. 20 sine waves from
   100 Hz to 2 kHz. The sweep becomes a `signal_group` with the swept value stored as a
   property, which is exactly the shape a pipeline wants as test input.
+- **Layout**: the same rungs write one of two shapes — one group holding a signal per rung,
+  or one group *per* rung, which is the impairment ladder of §8.4. The choice is a field of
+  the request rather than of the sweep, because it changes nothing about what is rendered.
 - Presets are `GenSpec` JSON files; a small built-in library ships with the app.
 
 The parameter form and the sweep target picker are both generated from the spec's
@@ -1079,6 +1093,13 @@ Generation exists primarily to feed §9. Three patterns get first-class support:
   alongside an *expectation* the pipeline can assert against (§9.7).
 - **Impairment ladders** — one clean source rendered at a sweep of SNRs or clock offsets,
   producing a group per rung, so an algorithm's degradation curve falls out of one run.
+  Built at M12: the `Awgn` node makes the rung a ratio rather than an amplitude, and the
+  `GroupPerRung` layout gives each rung its own group — the unit a pipeline processes,
+  caches, asserts over and charts against. Every group carries its rung as a declared
+  group property and is named by it, so the chart across groups (§10.5) is plotted against
+  the ladder rather than against a group's place in the list. Any numeric parameter is
+  sweepable this way, so a clock-offset or duration ladder is the same machinery with a
+  different pointer.
 - **Preprocessed inputs** — generation can emit `digital_logic` or `symbols` signals
   directly, so a stage that expects an already-sliced input can be tested without first
   running the analog front end.
@@ -1478,7 +1499,7 @@ plugin uses, and every one run through the conformance harness of §14 by
 | `dsp.condition.detrend` | Conditioning | Removes the mean or a least-squares line |
 | `dsp.condition.normalise` | Conditioning | To unit peak or unit RMS |
 | `dsp.filter.biquad` | Filtering | Low / high / band / notch, as a cascade of identical RBJ sections; coefficients recomputed for a group whose rate differs rather than filtering at the wrong corner |
-| `dsp.transform.fft` | Transform | → `Spectrum` artifact, with a rectangular / Hann / Hamming / Blackman-Harris window; changes no samples |
+| `dsp.transform.fft` | Transform | → `Spectrum` artifact — magnitude in dB and phase in radians — with a rectangular / Hann / Hamming / Blackman-Harris / flat-top window; changes no samples |
 | `dsp.detect.threshold` | Detection | → `Detections` artifact, `detections` and `widest_s` metrics, and a `detection_count` on the group |
 | `dsp.detect.peaks` | Detection | → `Peaks` artifact. Local extrema ranked by **prominence** rather than by level, so a ripple on the flank of a real return is not a second detection; a minimum separation and a count keep the strongest, and a window bounds the prominence search for a long signal |
 | `dsp.digital.slice` | Digital | Adds a `DigitalLogic` signal beside the waveform it came from — a comparator with hysteresis, keeping the input so a bit's reason survives |
@@ -1665,7 +1686,8 @@ pub enum ViewHint {
     /// Drawn on the scope's time axis, aligned with the signals.
     Overlay  { form: OverlayForm },    // Spans | Markers | Stems | Bands
     /// A line chart with its own axes (spectrum, filter response, ROC).
-    Series   { x: FieldRef, y: Vec<FieldRef>, x_log: bool, y_log: bool },
+    /// `y2` is a second scale at the right, for a Bode plot's phase.
+    Series   { x: FieldRef, y: Vec<FieldRef>, y2: Vec<FieldRef>, x_log: bool, y_log: bool },
     /// A 2-D intensity map (spectrogram, correlation surface).
     Heatmap  { rows: FieldRef, cols: FieldRef, values: FieldRef },
     /// Points in a plane (constellation, feature space).
@@ -1762,6 +1784,12 @@ Every stage's `metrics` map is recorded per group, so a run yields a metrics tab
 group × stage × metric. The results screen charts any metric across groups — with a
 generated dataset whose groups are an impairment ladder (§8.4), that chart *is* the
 algorithm's performance curve, produced by one run and no extra tooling.
+
+The x axis is the group's place in the list, unless every group in the run carries the
+same sweep property: then it is the rung itself, in the units the ladder was swept in, so
+unevenly spaced rungs plot where they belong. A rung named after the metric it is charted
+against — an SNR ladder under a measured SNR — is marked as the rung rather than given up
+on.
 
 ---
 
@@ -2050,9 +2078,12 @@ Windows and Linux for every push and pull request.
   in advance: a pulse train goes in and 10 Hz, 20 ms and a duty of 0.2 come back out of the
   database; an NRZ waveform goes in and the bits that made it come back out.
 - `crates/sp-app/tests/data_flow.rs` follows the data the whole way: a spec generates a
-  ladder, the ladder lands in the library, a run measures what the spec put into it, the
+  sweep, the sweep lands in the library, a run measures what the spec put into it, the
   Inspector recomputes the same numbers, the output plays back over a pyramid of its own,
   and an exported file re-imports to the rows it came from.
+- `crates/sp-gen/tests/ladder.rs` holds the other layout: one group per rung, each carrying
+  its own SNR, bit-identical on a second generation, and every rung measured back to the
+  ratio it asked for.
 - `crates/sp-app/tests/cli.rs` is the headless smoke test: build a library, run the
   pipeline, promote a baseline, change the algorithm, and check the exit code says
   *regressed* rather than *misused* (G8).
@@ -2145,12 +2176,15 @@ existed since M3 and only the milestone table had not noticed.
 - **[done — M3]** Preset library with import/export: nine built-ins embedded in the binary
   (tone, two-tone, noisy tone, linear chirp, pulse train, AM, FM, PRBS-9 NRZ, step edge),
   plus load and save of a `GenSpec` file.
-- **[V1.x]** Impairment ladders — one source across a sweep of SNRs, **one group per rung**.
-  A sweep today produces one group holding a signal per rung, which the metric chart reads
-  as a curve; a group per rung is what a *pipeline* wants, since the group is the unit of
-  processing and of assertion.
+- **[done — M12]** Impairment ladders — one source across a sweep of SNRs, **one group per
+  rung**, with an `Awgn` node that makes the rung a ratio of the source's own power rather
+  than a noise amplitude. The old layout is still there: one group holding a signal per
+  rung is a curve across signals, a group per rung is a curve across groups, and only the
+  second is what a *pipeline* asserts over.
 - **[V2]** Digital modulation: ASK/FSK/PSK/QPSK/QAM with configurable symbol rate and pulse shaping.
-- **[V2]** Impairment stack: AWGN at a target SNR, phase noise, IQ imbalance, DC offset, clock drift, dropouts, clipping.
+- **[V2]** Impairment stack: phase noise, IQ imbalance, DC offset, clock drift, dropouts,
+  clipping. AWGN at a target SNR was pulled forward to M12, which needed it to have an SNR
+  rung at all; the rest of the stack is untouched.
 - **[V2]** Known-answer vectors carrying their own expected result for assertion.
 - **[V2]** Multi-tone / comb generator with per-tone phase control.
 - **[V2]** Draw-a-waveform: sketch on the canvas and fit it to a sample array.
@@ -2275,8 +2309,8 @@ existed since M3 and only the milestone table had not noticed.
   cached row.
 - **[done — M8]** Histogram view, in the Inspector, at a configurable bin count.
 - **[done — M8]** FFT magnitude with a selectable window (rectangular, Hann, Hamming,
-  Blackman-Harris), published as a `Spectrum` artifact. **[V1.x]** Phase, and a flat-top
-  window for amplitude accuracy.
+  Blackman-Harris), published as a `Spectrum` artifact. **[done — M12]** Phase, on the
+  spectrum's own second axis, and a flat-top window for amplitude accuracy.
 - **[V2]** THD, SNR, SINAD, SFDR, ENOB measurements.
 - **[V2]** Cross-correlation and time-delay estimation between two signals.
 - **[V2]** Envelope detection, peak finding, edge/pulse measurements (rise time, width, duty).
@@ -2356,6 +2390,7 @@ holds it, rather than to the commit that claimed it:
 | M9 | `sp-ext/tests/native.rs`: `a_dll_runs_as_a_stage_over_one_group_at_a_time_and_every_output_is_persisted`, `every_result_carries_the_build_that_produced_it`, `the_library_file_is_part_of_the_cache_key`, `a_library_on_disk_is_refused_until_it_is_allowed_and_then_loads`. |
 | M10 | `sp-dsp/tests/pipeline.rs`: `editing_a_stage_re_runs_it_and_everything_after_it` is the first clause, `a_cached_run_records_what_a_cold_run_records` the second, with retention, the sample cap and `a_key_whose_run_is_gone_is_unpublished_rather_than_followed` beside them. |
 | M11 | `sp-dsp/tests/conformance.rs`: `every_builtin_conforms` and `the_harness_covers_every_check_for_every_builtin` hold the second clause with nothing waived, and `sp-ext/tests/native.rs`'s `a_stage_from_outside_this_binary_is_held_to_the_same_contract` holds it for a stage this crate did not write. `sp-dsp/tests/families.rs` holds the first: `detection_and_measurement_run_end_to_end_over_a_pulse_train`, `symbol_decode_runs_end_to_end_and_the_bits_are_the_bits_that_went_in`, `a_family_pipeline_is_valid_before_it_is_run`. |
+| M12 | `sp-gen/tests/ladder.rs`: `a_ladder_produces_one_group_per_snr_rung` and `a_ladder_is_the_same_ladder_the_second_time` are the criterion, with `every_rung_lands_at_the_noise_it_names` and `the_rung_is_a_declared_group_property_rather_than_a_loose_attribute` beside them. `determinism.rs` now carries an `Awgn` node in its strategy, so `chunks_join_up_into_the_whole_render` is what holds the probe window to G3. |
 
 Two corrections came out of that pass rather than a milestone: §9.8 and §10.1 were
 describing stage and artifact families that were planned rather than written, and §13 was
@@ -2374,7 +2409,7 @@ not by section number.
 | **M9 — External stages** (done) | `sp-ext`, the §9.9 C ABI, library allow-list in settings, sample conforming DLL | A sample DLL runs as a stage over one group at a time; its path, hash and version are recorded in `run_stage` (G8) |
 | **M10 — Stage cache** (done) | Content-hash stage cache, per-stage retention policy, run-level sample cap | Editing stage *n* re-runs only *n…end*; a cached run and a cold run produce identical outputs |
 | **M11 — Stage families** (done) | Detection, symbol-decode and measurement stages; stage conformance harness; the artifact kinds they emit (§10.1) | Each family has a stage that runs end-to-end and passes the conformance harness |
-| **M12 — Generation** | Impairment ladders, one group per rung; a flat-top window and FFT phase | A ladder produces one group per SNR rung, deterministically (G3) |
+| **M12 — Generation** (done) | Impairment ladders, one group per rung; a flat-top window and FFT phase | A ladder produces one group per SNR rung, deterministically (G3) |
 | **M13 — Ingest & UX** | Drag-and-drop and multi-file import, watch folder, command palette, configurable shortcuts | A watched folder imports without user action; every action is reachable from the palette |
 | **M14 — Isolation** | `sp-stage-host`, shared-memory transport, `process_isolated` execution | A library that segfaults fails one group with a diagnostic and the run continues |
 
@@ -2385,13 +2420,33 @@ added is the part that decides what a key may point at — `on_failure` swept on
 passes, only `always` published, a stale key unpublished on the lookup that finds it, and a
 run-level cap that limits bytes without costing the account of what a stage did.
 
-**M12 shrank when it was re-read against `sp-gen`.** Chirps, AM/FM/PM, the `f(t)` node and
-PRBS were all written at M3 — the generator was built to the whole of §8.1 rather than to
-the MVP slice of §15.2 — so what is left of the milestone is the impairment ladder that
-produces *one group per rung*, which is a change to how a sweep writes rather than to what
-a node renders, and the two FFT gaps (phase, a flat-top window). It is small enough now to
-fold into whichever milestone needs a degradation curve first. M11 did not — its families
-are measured against known-answer data rather than against a curve — so it is still open.
+**M12 shrank when it was re-read against `sp-gen`, then grew by one node.** Chirps,
+AM/FM/PM, the `f(t)` node and PRBS were all written at M3 — the generator was built to the
+whole of §8.1 rather than to the MVP slice of §15.2 — so what was left of the milestone was
+the impairment ladder that produces *one group per rung* and the two FFT gaps (phase, a
+flat-top window).
+
+The ladder is indeed a change to how a sweep writes rather than to what a node renders: the
+rungs, the substitution and the property declaration are M3's, and the layout picks one of
+two shapes at write time. But the exit criterion says *SNR* rung, and nothing in §8.1 could
+express one. A swept `Noise.amp` is a ladder of noise amplitudes, which is a different
+ladder for every source and not a ratio of anything; so `Awgn` came forward from §15.2's V2
+impairment stack — the one item of it the criterion requires, with phase noise, IQ
+imbalance, clock drift, dropouts and clipping left where they were.
+
+That node is where the milestone's design work went. Power is a property of a whole signal
+and §8.2 requires every node to be a function of its own sample index, so the window a rung
+measures over cannot be the window being rendered: it is a bounded probe fixed by the
+node's own grid, spread across the whole of it, memoised once per render. The property
+test that holds §8.2 — a chunked render equals a whole one — now has `Awgn` in its
+strategy, which is the only reason to believe any of that.
+
+Two things fell out of the ladder rather than being asked for. A rung is a property of a
+*group*, so the chart across groups is plotted against the rung and not against a group's
+ordinal (§10.5) — without which the curve of §8.4 is a curve against 0, 1, 2, 3. And
+publishing FFT phase needed a second scale on the `Series` view, since dB and radians share
+an x axis and nothing else: `ViewHint::Series` gained a `y2`, which is what a Bode plot is
+and what `FilterResponse` will want when a filter stage publishes one.
 
 **M11 grew by that pass and is now delivered.** Five stages — peak find, slice, symbol
 decode, bit pack and pulse metrics — give the three families the milestone named a stage

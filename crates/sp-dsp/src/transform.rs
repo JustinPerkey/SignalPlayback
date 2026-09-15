@@ -5,6 +5,11 @@
 //! measurement stage does. One spectrum per group, from one named signal —
 //! a port holds a single value (§9.3), so a per-signal spectrum would leave
 //! only the last one visible.
+//!
+//! The spectrum carries phase beside magnitude, on its own axis, and the
+//! window list includes a flat top: the widest main lobe of the four, and the
+//! only one that reads a tone's amplitude correctly wherever it falls between
+//! two bins.
 
 use sp_core::Diagnostic;
 use sp_proc::error::{ConfigError, StageError};
@@ -28,11 +33,20 @@ const PARAMS: &[ParamSpec] = &[
         "window",
         "Window",
         ParamKind::Enum {
-            variants: &["rectangular", "hann", "hamming", "blackman-harris"],
+            variants: &[
+                "rectangular",
+                "hann",
+                "hamming",
+                "blackman-harris",
+                "flat-top",
+            ],
         },
         ParamDefault::Text("hann"),
     )
-    .with_help("Rectangular leaks; Hann is the safe default for an unknown signal."),
+    .with_help(
+        "Rectangular leaks; Hann is the safe default for an unknown signal; \
+         a flat top reads an off-bin amplitude and costs resolution for it.",
+    ),
     ParamSpec::new(
         "size",
         "Length",
@@ -66,6 +80,10 @@ pub enum Window {
     Hann,
     Hamming,
     BlackmanHarris,
+    /// Five terms, a main lobe four bins wide and a scalloping loss under
+    /// 0.01 dB: what to use when the amplitude is the measurement and the
+    /// frequency is not.
+    FlatTop,
 }
 
 impl Window {
@@ -74,6 +92,7 @@ impl Window {
             "rectangular" => Self::Rectangular,
             "hamming" => Self::Hamming,
             "blackman-harris" => Self::BlackmanHarris,
+            "flat-top" => Self::FlatTop,
             _ => Self::Hann,
         }
     }
@@ -96,6 +115,11 @@ impl Window {
                     Self::BlackmanHarris => {
                         0.35875 - 0.48829 * t.cos() + 0.14128 * (2.0 * t).cos()
                             - 0.01168 * (3.0 * t).cos()
+                    }
+                    Self::FlatTop => {
+                        0.215_578_95 - 0.416_631_58 * t.cos() + 0.277_263_158 * (2.0 * t).cos()
+                            - 0.083_578_947 * (3.0 * t).cos()
+                            + 0.006_947_368 * (4.0 * t).cos()
                     }
                 }
             })
@@ -167,6 +191,9 @@ impl Stage for Fft {
             output.metric("peak_hz", hz);
             output.metric("peak_db", db);
         }
+        if let Some(phase_rad) = spectrum.peak_phase() {
+            output.metric("peak_phase_rad", phase_rad);
+        }
         output.metric("fft_size", length as f64);
         output
             .artifacts
@@ -215,6 +242,7 @@ impl Fft {
         let bins = length / 2 + 1;
         let mut freq_hz = Vec::with_capacity(bins);
         let mut magnitude_db = Vec::with_capacity(bins);
+        let mut phase_rad = Vec::with_capacity(bins);
         for k in 0..bins {
             // DC and Nyquist appear once in the two-sided transform; every
             // other bin has a mirror carrying half of the amplitude.
@@ -227,8 +255,13 @@ impl Fft {
             } else {
                 FLOOR_DB
             });
+            // Phase is the bin's own angle, unscaled: the mirror carries the
+            // amplitude, not the argument. It is measured from the start of
+            // the frame, so two runs over the same frame are comparable and a
+            // frame that starts elsewhere is not.
+            phase_rad.push(im[k].atan2(re[k]));
         }
-        Spectrum::new(name, freq_hz, magnitude_db)
+        Spectrum::new(name, freq_hz, magnitude_db).with_phase(phase_rad)
     }
 }
 
@@ -316,12 +349,76 @@ mod tests {
 
     #[test]
     fn every_window_reads_the_same_amplitude() {
-        for window in ["rectangular", "hann", "hamming", "blackman-harris"] {
+        for window in [
+            "rectangular",
+            "hann",
+            "hamming",
+            "blackman-harris",
+            "flat-top",
+        ] {
             let mut stage = fft(ParamSet::new().with("window", window));
             let (_, output) = process(&mut stage, &frame(&[("rf", tone(125.0, 512))]));
             let (_, db) = spectrum_of(&output).peak().unwrap();
             assert!(db.abs() < 0.3, "{window} read {db} dB");
         }
+    }
+
+    #[test]
+    fn a_flat_top_reads_an_off_bin_amplitude_that_the_others_understate() {
+        // Exactly half way between bins 70 and 71 at 1 kHz over 512 samples,
+        // which is the worst case for scalloping loss and the whole reason the
+        // window exists.
+        let half_bin_hz = 70.5 * 1_000.0 / 512.0;
+        let read = |window: &str| {
+            let mut stage = fft(ParamSet::new().with("window", window));
+            let (_, output) = process(&mut stage, &frame(&[("rf", tone(half_bin_hz, 512))]));
+            spectrum_of(&output).peak().unwrap().1
+        };
+        let flat_top = read("flat-top");
+        assert!(flat_top.abs() < 0.05, "flat top read {flat_top} dB");
+        let hann = read("hann");
+        assert!(hann < -1.3, "hann should scallop, and read {hann} dB");
+    }
+
+    #[test]
+    fn a_cosine_and_a_sine_are_a_quarter_turn_apart_in_the_bin_they_share() {
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let phase_of = |values: Vec<f64>| {
+            let mut stage = fft(ParamSet::new().with("window", "rectangular"));
+            let (_, output) = process(&mut stage, &frame(&[("rf", values)]));
+            let spectrum = spectrum_of(&output);
+            assert_eq!(spectrum.phase_rad.len(), spectrum.len());
+            spectrum.peak_phase().unwrap()
+        };
+        // A sine lags a cosine by a quarter turn, whatever sign convention the
+        // transform uses; the difference is what is worth asserting.
+        let sine = phase_of(tone(125.0, 512));
+        let cosine = phase_of(
+            (0..512)
+                .map(|i| (std::f64::consts::TAU * 125.0 * i as f64 / 1000.0).cos())
+                .collect(),
+        );
+        let delta = (cosine - sine).abs();
+        assert!((delta - quarter).abs() < 1e-6, "{delta} rad apart");
+    }
+
+    #[test]
+    fn the_peak_phase_is_recorded_as_a_metric_beside_the_peak() {
+        let mut stage = fft(ParamSet::new());
+        let (_, output) = process(&mut stage, &frame(&[("rf", tone(125.0, 512))]));
+        let phase = output.metrics.get("peak_phase_rad").copied().unwrap();
+        assert!(phase.is_finite() && phase.abs() <= std::f64::consts::PI);
+    }
+
+    #[test]
+    fn a_spectrum_recorded_before_phase_existed_still_reads() {
+        // The field defaults, so an artifact from an older run decodes with no
+        // phase rather than failing the results screen.
+        let older = r#"{"signal":"rf","freq_hz":[0.0,1.0],"magnitude_db":[-3.0,-6.0]}"#;
+        let spectrum: Spectrum = serde_json::from_str(older).unwrap();
+        assert_eq!(spectrum.len(), 2);
+        assert!(spectrum.phase_rad.is_empty());
+        assert!(spectrum.peak_phase().is_none());
     }
 
     #[test]

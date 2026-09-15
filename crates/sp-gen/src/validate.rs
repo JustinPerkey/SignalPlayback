@@ -820,6 +820,21 @@ fn node(issues: &mut Issues, node: &Node, pointer: &str, rate_hz: f64, duration_
                 duration_s,
             );
         }
+        Node::Awgn { input, snr_db } => {
+            finite(issues, "snr_db", *snr_db);
+            // A source with no signal in it has no ratio to hit, and the
+            // renderer adds nothing rather than guessing an amplitude.
+            if matches!(**input, Node::Dc { level } if level == 0.0) {
+                issues.push(
+                    Severity::Warning,
+                    pointer,
+                    Some("snr_db"),
+                    "there is no signal here to measure the noise against",
+                    "give the input something to be a ratio of; against silence no noise is added",
+                );
+            }
+            child(issues, input, pointer, tree::INPUT, rate_hz, duration_s);
+        }
         Node::Resample { input, to_rate_hz } => {
             if !to_rate_hz.is_finite() || *to_rate_hz <= 0.0 {
                 issues.push(

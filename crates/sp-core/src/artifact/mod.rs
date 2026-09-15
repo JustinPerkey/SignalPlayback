@@ -202,6 +202,11 @@ pub enum ViewHint {
     Series {
         x: FieldRef,
         y: Vec<FieldRef>,
+        /// Fields on a second y axis, scaled on their own — magnitude in dB
+        /// and phase in radians share an x axis and nothing else, which is
+        /// what a Bode plot is. Empty for a chart with one scale.
+        #[serde(default)]
+        y2: Vec<FieldRef>,
         x_log: bool,
         y_log: bool,
     },
@@ -229,8 +234,8 @@ impl ViewHint {
     pub fn referenced_fields(&self) -> Vec<&str> {
         match self {
             Self::Table { columns } => columns.iter().map(|c| c.field.as_str()).collect(),
-            Self::Series { x, y, .. } => std::iter::once(x.as_str())
-                .chain(y.iter().map(FieldRef::as_str))
+            Self::Series { x, y, y2, .. } => std::iter::once(x.as_str())
+                .chain(y.iter().chain(y2).map(FieldRef::as_str))
                 .collect(),
             Self::Heatmap { rows, cols, values } => {
                 vec![rows.as_str(), cols.as_str(), values.as_str()]
@@ -302,6 +307,7 @@ mod tests {
             ViewHint::Series {
                 x: "freq_hz".into(),
                 y: vec!["mag_db".into()],
+                y2: Vec::new(),
                 x_log: true,
                 y_log: false,
             },
@@ -316,6 +322,26 @@ mod tests {
             scores: vec![0.4, 0.91],
         };
         assert_eq!(detections.summary(), "2 detections, best score 0.91");
+    }
+
+    #[test]
+    fn a_second_axis_is_a_field_the_view_reads_like_any_other() {
+        let schema = ArtifactSchema::new(
+            vec![
+                FieldSpec::new("freq_hz", FieldKind::FloatArray),
+                FieldSpec::new("magnitude_db", FieldKind::FloatArray),
+                FieldSpec::new("phase_rad", FieldKind::FloatArray),
+            ],
+            ViewHint::Series {
+                x: "freq_hz".into(),
+                y: vec!["magnitude_db".into()],
+                y2: vec!["phase_rad".into()],
+                x_log: false,
+                y_log: false,
+            },
+        );
+        assert!(schema.is_consistent());
+        assert!(schema.view.referenced_fields().contains(&"phase_rad"));
     }
 
     #[test]
