@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use sp_csv::profile::CountMode;
 use sp_engine::reduce::Quality;
 
+use crate::keymap::Keymap;
+
 /// Bins the Inspector's histogram is drawn with.
 pub const MIN_BINS: usize = 8;
 pub const MAX_BINS: usize = 256;
@@ -174,6 +176,15 @@ pub struct Settings {
     /// (§9.9). Loading one runs its code in this process, so the list is
     /// consent: a library is here because the user added this file.
     pub external_libraries: Vec<PathBuf>,
+    /// A folder whose new files are imported without being asked for (§7.6).
+    ///
+    /// It is consent in the same way the library list is: a folder is here
+    /// because the user pointed at it, and pointing at it is what makes an
+    /// unattended import their decision rather than the application's.
+    pub watch_folder: Option<PathBuf>,
+    /// Which chord runs which action (§15.11). Only the bindings that differ
+    /// from the defaults are stored.
+    pub keymap: Keymap,
 }
 
 impl Default for Settings {
@@ -188,6 +199,8 @@ impl Default for Settings {
             decimation: Quality::default(),
             histogram_bins: DEFAULT_BINS,
             external_libraries: Vec::new(),
+            watch_folder: None,
+            keymap: Keymap::default(),
         }
     }
 }
@@ -289,6 +302,15 @@ mod tests {
             decimation: Quality::Fine,
             histogram_bins: 128,
             external_libraries: vec![PathBuf::from("/opt/vendor/libeq.so")],
+            watch_folder: Some(PathBuf::from("/data/incoming")),
+            keymap: {
+                let mut keymap = Keymap::default();
+                keymap.bind(
+                    crate::actions::Action::PipelineRun,
+                    Some(crate::keymap::Chord::ctrl(crate::keymap::Key::Char('r'))),
+                );
+                keymap
+            },
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);

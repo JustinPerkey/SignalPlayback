@@ -8,9 +8,12 @@
 // builds keep the console so `tracing` output is visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod actions;
 mod cli;
 mod jobs;
+mod keymap;
 mod logging;
+mod palette;
 mod paths;
 mod screens;
 mod settings;
@@ -19,6 +22,7 @@ mod state;
 mod theme;
 mod typography;
 mod ui;
+mod watch;
 mod widgets;
 
 use iced::{Size, Task};

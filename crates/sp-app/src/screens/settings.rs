@@ -22,7 +22,9 @@ use sp_engine::reduce::Quality;
 use sp_store::stats::{self, StorageStats};
 use sp_store::{LibrarySummary, Store};
 
+use crate::actions::Action;
 use crate::jobs;
+use crate::keymap::Chord;
 use crate::settings::{Retention, SampleCap, Settings, ThemeChoice, MAX_BINS, MIN_BINS};
 use crate::typography;
 use crate::ui;
@@ -79,6 +81,9 @@ pub struct State {
     /// A library the user picked, waiting for the root to open it. The inner
     /// `None` means "go back to the default location".
     library_request: Option<Option<PathBuf>>,
+    /// The action whose key is being captured, if the user is holding the
+    /// keyboard open waiting to press one.
+    rebinding: Option<Action>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +108,18 @@ pub enum Message {
     AddExternalLibrary,
     ExternalLibraryChosen(Option<PathBuf>),
     RemoveExternalLibrary(PathBuf),
+
+    ChooseWatchFolder,
+    WatchFolderChosen(Option<PathBuf>),
+    StopWatching,
+
+    /// Start listening for the chord to bind to this action.
+    Rebind(Action),
+    /// The chord that was pressed while listening; the root hands it over.
+    BindCaptured(Chord),
+    StopRebinding,
+    Unbind(Action),
+    ResetKeymap,
 }
 
 impl State {
@@ -143,6 +160,16 @@ impl State {
     /// The library the user has asked to open, once.
     pub fn take_library_request(&mut self) -> Option<Option<PathBuf>> {
         self.library_request.take()
+    }
+
+    /// The action waiting for a key, if any.
+    ///
+    /// The root reads it to know that the next key press is a *binding* and
+    /// not a shortcut — which is the only way to bind `Ctrl`+`1` to something
+    /// else without the press navigating away first.
+    #[must_use]
+    pub const fn rebinding(&self) -> Option<Action> {
+        self.rebinding
     }
 
     pub fn update(&mut self, store: Option<&Store>, message: Message) -> Task<Message> {
@@ -271,6 +298,106 @@ impl State {
                 );
                 Task::none()
             }
+            Message::ChooseWatchFolder => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Watch a folder for new capture files")
+                        .pick_folder()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                Message::WatchFolderChosen,
+            ),
+            Message::WatchFolderChosen(folder) => {
+                let Some(folder) = folder else {
+                    return Task::none();
+                };
+                let already = crate::watch::importable_in(&folder).len();
+                self.settings.watch_folder = Some(folder);
+                self.changed = true;
+                self.error = None;
+                // Saying what will *not* happen is the point: the files
+                // already in the folder are adopted, and a user who expected
+                // four hundred imports should find that out here rather than
+                // by watching them not happen (§7.6).
+                self.notice = Some(if already == 0 {
+                    "Watching. A capture written into this folder imports on its own.".to_owned()
+                } else {
+                    format!(
+                        "Watching. The {already} file{} already there {} left alone; \
+                         'Import every file in the watched folder' takes them.",
+                        if already == 1 { "" } else { "s" },
+                        if already == 1 { "is" } else { "are" },
+                    )
+                });
+                Task::none()
+            }
+            Message::StopWatching => {
+                if self.settings.watch_folder.take().is_some() {
+                    self.changed = true;
+                    self.notice = Some("Stopped watching.".to_owned());
+                }
+                Task::none()
+            }
+
+            Message::Rebind(action) => {
+                self.rebinding = Some(action);
+                self.notice = Some(format!(
+                    "Press the keys for '{}'. Escape cancels.",
+                    action.label()
+                ));
+                Task::none()
+            }
+            Message::StopRebinding => {
+                self.rebinding = None;
+                self.notice = None;
+                Task::none()
+            }
+            Message::BindCaptured(chord) => {
+                let Some(action) = self.rebinding.take() else {
+                    return Task::none();
+                };
+                self.settings.keymap.bind(action, Some(chord));
+                self.changed = true;
+                let conflicts = self.settings.keymap.conflicts();
+                // A chord bound twice is resolved, not refused: refusing it
+                // would mean the user has to remember which of fifty actions
+                // is holding the key they want. What they get instead is the
+                // key and a line saying what it no longer reaches.
+                self.notice = Some(
+                    match conflicts
+                        .iter()
+                        .find(|(kept, shadowed)| *kept == action || *shadowed == action)
+                    {
+                        Some((kept, shadowed)) => format!(
+                            "{} is now {} — which no longer reaches '{}'.",
+                            chord.label(),
+                            kept.label(),
+                            shadowed.label(),
+                        ),
+                        None => format!("'{}' is now {}.", action.label(), chord.label()),
+                    },
+                );
+                Task::none()
+            }
+            Message::Unbind(action) => {
+                self.settings.keymap.bind(action, None);
+                self.rebinding = None;
+                self.changed = true;
+                self.notice = Some(format!(
+                    "'{}' has no key; it is still in the command palette.",
+                    action.label()
+                ));
+                Task::none()
+            }
+            Message::ResetKeymap => {
+                self.settings.keymap.reset();
+                self.rebinding = None;
+                self.changed = true;
+                self.notice = Some("Every shortcut is back to its default.".to_owned());
+                Task::none()
+            }
+
             Message::Refresh => store.map_or_else(Task::none, |store| self.load(store)),
             Message::Storage(result) => {
                 match result {
@@ -359,11 +486,13 @@ impl State {
             section_rule(),
             self.defaults_section(),
             section_rule(),
+            self.ingest_section(),
+            section_rule(),
             self.storage_section(),
             section_rule(),
             self.external_section(),
             section_rule(),
-            keyboard_section(),
+            self.keyboard_section(),
         ]
         .spacing(10)
         .max_width(760);
@@ -573,6 +702,58 @@ impl State {
         .into()
     }
 
+    /// The watched folder (§7.6).
+    ///
+    /// Like the external-library list above it, this is consent rather than
+    /// configuration: a folder is here because the user pointed at it, and
+    /// that pointing is what makes an unattended import theirs.
+    fn ingest_section(&self) -> Element<'_, Message> {
+        let mut section = column![
+            heading("Watched folder"),
+            text(
+                "A capture written into this folder is imported with the profile the Import \
+                 screen is holding, once it has stopped changing. Files already in the folder \
+                 are left alone.",
+            )
+            .size(typography::LABEL_SIZE)
+            .style(ui::dim),
+        ]
+        .spacing(6);
+
+        match &self.settings.watch_folder {
+            Some(folder) => {
+                section = section.push(
+                    text(folder.display().to_string())
+                        .size(typography::BODY_SIZE)
+                        .font(typography::READOUT),
+                );
+                if !folder.is_dir() {
+                    section = section.push(
+                        text("This folder is not there; nothing is being watched.")
+                            .size(typography::LABEL_SIZE)
+                            .style(ui::warned),
+                    );
+                }
+                section = section.push(
+                    row![
+                        command("Watch another folder…", Message::ChooseWatchFolder),
+                        command("Stop watching", Message::StopWatching),
+                    ]
+                    .spacing(6),
+                );
+            }
+            None => {
+                section = section.push(
+                    text("No folder is watched.")
+                        .size(typography::BODY_SIZE)
+                        .style(ui::dim),
+                );
+                section = section.push(command("Watch a folder…", Message::ChooseWatchFolder));
+            }
+        }
+        section.into()
+    }
+
     fn storage_section(&self) -> Element<'_, Message> {
         let mut section = column![row![
             heading("This library"),
@@ -649,38 +830,111 @@ impl State {
     }
 }
 
-fn keyboard_section<'a>() -> Element<'a, Message> {
-    let mut section = column![
-        heading("Keyboard"),
-        text("Fixed in this version; a configurable map is a later milestone (§15.11).")
+impl State {
+    /// The whole keyboard map, action by action (§15.11).
+    ///
+    /// Every entry in the catalogue is here, not only the ones with keys: the
+    /// list is what tells the user what *could* have a key, and an action with
+    /// none says so and names the palette instead.
+    fn keyboard_section(&self) -> Element<'_, Message> {
+        let keymap = &self.settings.keymap;
+        let mut section = column![
+            row![
+                heading("Keyboard"),
+                Space::with_width(Length::Fill),
+                command("Reset every shortcut", Message::ResetKeymap),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text(
+                "Ctrl+K opens the command palette, which reaches every one of these whether \
+                 or not it has a key. A key on a screen's own row works while that screen is \
+                 showing; a global one works anywhere.",
+            )
             .size(typography::LABEL_SIZE)
             .style(ui::dim),
-    ]
-    .spacing(4);
-    for (keys, action) in [
-        ("Ctrl+1 … Ctrl+9, Ctrl+0", "Jump to a screen"),
-        ("Ctrl+T", "Switch theme"),
-        ("Space", "Play or pause (Scope, Results)"),
-        ("Home / End", "Jump to the start or the end"),
-        ("[ / ]", "Set the loop points (Scope)"),
-        ("← / →", "Step through the stage rail (Results)"),
-    ] {
-        // The keys are keys on a keyboard, so they are set as keys; what
-        // they do is prose, so it is set as prose.
-        section = section.push(
-            row![
-                container(
-                    text(keys)
+        ]
+        .spacing(6);
+
+        if let Some(action) = self.rebinding {
+            section = section.push(
+                row![
+                    text(format!("Waiting for a key for '{}'…", action.label()))
                         .size(typography::BODY_SIZE)
-                        .font(typography::READOUT),
-                )
-                .width(Length::Fixed(240.0)),
-                text(action).size(typography::BODY_SIZE).style(ui::dim),
-            ]
-            .align_y(Alignment::Center),
-        );
+                        .style(ui::warned),
+                    command("Cancel", Message::StopRebinding),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+
+        // Shadowed bindings, named before the list rather than hidden in it:
+        // a key that silently reaches the wrong action is the failure this
+        // whole screen exists to prevent.
+        for (kept, shadowed) in keymap.conflicts() {
+            section = section.push(
+                text(format!(
+                    "{} runs '{}', so it no longer reaches '{}'.",
+                    keymap.chord(kept).map(Chord::label).unwrap_or_default(),
+                    kept.label(),
+                    shadowed.label(),
+                ))
+                .size(typography::LABEL_SIZE)
+                .style(ui::warned),
+            );
+        }
+
+        let mut group = "";
+        for action in Action::all() {
+            if action.group() != group {
+                group = action.group();
+                section = section.push(Space::with_height(Length::Fixed(8.0)));
+                section = section.push(ui::caption(group));
+            }
+            section = section.push(self.binding_row(action));
+        }
+        section.into()
     }
-    section.into()
+
+    fn binding_row(&self, action: Action) -> Element<'_, Message> {
+        let chord = self.settings.keymap.chord(action);
+        let reading = chord.map_or_else(|| "—".to_owned(), Chord::label);
+
+        // The key is a key on a keyboard, so it is set as one; what it does is
+        // prose. A rebound key is set at full strength and a default is dim,
+        // which is how the list answers "what have I changed?" without a
+        // column of ticks.
+        let key = text(reading)
+            .size(typography::BODY_SIZE)
+            .font(typography::READOUT);
+        let key = if self.settings.keymap.is_rebound(action) {
+            key
+        } else {
+            key.style(ui::dim)
+        };
+
+        let mut controls = row![command(
+            if chord.is_some() { "Change" } else { "Bind" },
+            Message::Rebind(action),
+        )]
+        .spacing(4);
+        if chord.is_some() {
+            controls = controls.push(command("Clear", Message::Unbind(action)));
+        }
+
+        row![
+            container(key).width(Length::Fixed(160.0)),
+            text(action.label())
+                .size(typography::BODY_SIZE)
+                .style(ui::dim)
+                .width(Length::Fill),
+            controls,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    }
 }
 
 fn heading(label: &str) -> Element<'_, Message> {
@@ -1004,5 +1258,152 @@ mod tests {
     fn bytes_format_with_binary_prefixes() {
         assert_eq!(fmt_bytes(0), "0 B");
         assert_eq!(fmt_bytes(2048), "2.0 KiB");
+    }
+
+    // ----------------------------------------------------------- M13 (§7.6)
+
+    #[test]
+    fn choosing_a_watched_folder_says_what_will_and_will_not_happen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state();
+        assert_eq!(state.settings().watch_folder, None);
+
+        // An empty folder: nothing is left behind, so nothing is warned about.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let _ = state.update(None, Message::WatchFolderChosen(Some(empty.clone())));
+        assert_eq!(state.settings().watch_folder, Some(empty));
+        assert!(state.take_changed());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("imports on its own"));
+
+        // A folder with captures in it: the census is announced, because a
+        // user expecting two imports should find out here (§7.6).
+        let full = dir.path().join("full");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("a.csv"), "x\n1\n").unwrap();
+        std::fs::write(full.join("b.csv"), "x\n1\n").unwrap();
+        let _ = state.update(None, Message::WatchFolderChosen(Some(full)));
+        let notice = state.notice.clone().unwrap();
+        assert!(notice.contains("2 files"), "{notice}");
+        assert!(notice.contains("left alone"), "{notice}");
+        let _ = state.view();
+
+        // A cancelled dialog changes nothing; stopping clears the setting.
+        let before = state.settings().watch_folder.clone();
+        let _ = state.update(None, Message::WatchFolderChosen(None));
+        assert_eq!(state.settings().watch_folder, before);
+        let _ = state.update(None, Message::StopWatching);
+        assert_eq!(state.settings().watch_folder, None);
+        assert!(state.take_changed());
+        // And with nothing watched there is nothing to stop.
+        let _ = state.update(None, Message::StopWatching);
+        assert!(!state.take_changed());
+        let _ = state.view();
+    }
+
+    #[test]
+    fn a_watched_folder_that_is_gone_is_said_so_rather_than_hidden() {
+        let mut state = state();
+        let _ = state.update(
+            None,
+            Message::WatchFolderChosen(Some(PathBuf::from("no-such-folder"))),
+        );
+        // The setting is still the setting — it is the user's text, and the
+        // folder may come back — and the screen says the watch is not running.
+        assert!(state.settings().watch_folder.is_some());
+        let _ = state.view();
+    }
+
+    #[test]
+    fn a_key_is_captured_into_the_map_and_reported() {
+        let mut state = state();
+        assert!(state.rebinding().is_none());
+
+        let _ = state.update(None, Message::Rebind(Action::PipelineRun));
+        assert_eq!(state.rebinding(), Some(Action::PipelineRun));
+        let _ = state.view();
+
+        let chord = Chord::ctrl(crate::keymap::Key::Char('r'));
+        let _ = state.update(None, Message::BindCaptured(chord));
+        assert!(state.rebinding().is_none(), "one key, one binding");
+        assert_eq!(
+            state.settings().keymap.chord(Action::PipelineRun),
+            Some(chord)
+        );
+        assert!(state.take_changed());
+        assert!(state.notice.as_deref().unwrap().contains("Ctrl R"));
+
+        // A key with nothing waiting for it is dropped on the floor.
+        let _ = state.update(
+            None,
+            Message::BindCaptured(Chord::ctrl(crate::keymap::Key::Char('q'))),
+        );
+        assert_eq!(
+            state.settings().keymap.chord(Action::PipelineRun),
+            Some(chord)
+        );
+    }
+
+    /// A chord bound twice resolves rather than being refused, and the screen
+    /// says what the key no longer reaches — both in the notice and in a
+    /// standing line above the list.
+    #[test]
+    fn binding_a_key_that_is_taken_names_what_it_shadows() {
+        let mut state = state();
+        let _ = state.update(None, Message::Rebind(Action::PipelineRun));
+        let _ = state.update(
+            None,
+            Message::BindCaptured(Chord::ctrl(crate::keymap::Key::Char('t'))),
+        );
+        let notice = state.notice.clone().unwrap();
+        assert!(
+            notice.contains("Toggle the light and dark theme"),
+            "{notice}"
+        );
+        assert_eq!(state.settings().keymap.conflicts().len(), 1);
+        let _ = state.view();
+    }
+
+    #[test]
+    fn clearing_and_resetting_a_binding_both_write_the_settings() {
+        let mut state = state();
+        let _ = state.update(None, Message::Unbind(Action::ToggleTheme));
+        assert_eq!(state.settings().keymap.chord(Action::ToggleTheme), None);
+        assert!(state.take_changed());
+        assert!(state.notice.as_deref().unwrap().contains("command palette"));
+        let _ = state.view();
+
+        let _ = state.update(None, Message::ResetKeymap);
+        assert_eq!(
+            state.settings().keymap.chord(Action::ToggleTheme),
+            Some(Chord::ctrl(crate::keymap::Key::Char('t')))
+        );
+        assert!(state.take_changed());
+    }
+
+    #[test]
+    fn escape_out_of_a_rebinding_leaves_the_map_alone() {
+        let mut state = state();
+        let before = state.settings().keymap.clone();
+        let _ = state.update(None, Message::Rebind(Action::ScopeToggle));
+        let _ = state.update(None, Message::StopRebinding);
+        assert!(state.rebinding().is_none());
+        assert_eq!(state.settings().keymap, before);
+        assert!(!state.take_changed());
+    }
+
+    /// Every action in the catalogue has a row, so the list is what tells the
+    /// user what could have a key rather than only what does.
+    #[test]
+    fn the_shortcut_list_has_a_row_for_every_action() {
+        let state = state();
+        for action in Action::all() {
+            let _ = state.binding_row(action);
+        }
+        let _ = state.keyboard_section();
     }
 }

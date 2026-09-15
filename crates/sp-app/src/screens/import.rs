@@ -1,4 +1,4 @@
-//! The Import screen (`docs/DESIGN.md` §12.1, §7.4).
+//! The Import screen (`docs/DESIGN.md` §12.1, §7.4, §7.6).
 //!
 //! File picker → preview of the headers and first group → column-mapping
 //! panel (which column is the time of arrival and in what unit, which columns
@@ -7,9 +7,18 @@
 //!
 //! The sniff, the import and every store call run off the UI thread; the
 //! screen only ever holds metadata and the first group's cells.
+//!
+//! **One queue, three sources.** A multi-file pick, a drop on the window and
+//! the watched folder ([`crate::watch`]) all put files on the same queue, and
+//! the queue is drained one file at a time under the profile on screen. That
+//! is the whole of M13's ingest half: the alternative — a second code path
+//! that imports a watched file "automatically" — would be a second set of
+//! framing rules to keep in step with this one, and a watched import would
+//! stop being the import the user would have run by hand.
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,7 +27,7 @@ use iced::widget::{
     button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
     text_input, Space,
 };
-use iced::{Alignment, Element, Length, Subscription, Task};
+use iced::{Alignment, Element, Length, Subscription, Task, Theme};
 use sp_core::{DType, PropScope, PropertyDef, TimeUnit};
 use sp_csv::profile::{ColumnRule, CountMode};
 use sp_csv::{
@@ -33,6 +42,10 @@ use crate::ui;
 
 /// Diagnostics listed before the panel says "and N more".
 const DIAGNOSTIC_ROWS: usize = 200;
+
+/// Per-file outcomes kept. A watched folder never stops producing them, so the
+/// list is the recent account rather than the whole history of the session.
+const OUTCOME_ROWS: usize = 200;
 
 /// How a column's cells are stored, as one choice in the mapping panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +183,55 @@ struct Job {
     cancel: Arc<AtomicBool>,
 }
 
+/// How a file got onto the queue.
+///
+/// It is recorded because it decides one thing: whether the queue starts by
+/// itself. A drop and a pick are the user naming a *file*; the watched folder
+/// is the user having already named a *rule*, which is consent to import
+/// whatever lands there (§7.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Picked in the file dialog, or typed into the path field.
+    Chosen,
+    /// Dropped on the window.
+    Dropped,
+    /// Found in the watched folder.
+    Watched,
+}
+
+impl Source {
+    /// Whether a file from here imports without anyone pressing anything.
+    #[must_use]
+    pub const fn is_automatic(self) -> bool {
+        matches!(self, Self::Watched)
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Chosen => "chosen",
+            Self::Dropped => "dropped",
+            Self::Watched => "watched",
+        }
+    }
+}
+
+/// A file waiting to be imported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Queued {
+    path: PathBuf,
+    source: Source,
+}
+
+/// What became of one file the queue ran.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub path: PathBuf,
+    pub source: Source,
+    /// The import's own summary, or why it did not happen.
+    pub result: Result<String, String>,
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     path: String,
@@ -191,15 +253,41 @@ pub struct State {
     notice: Option<String>,
     /// Set when an import commits, so the root can refresh the library.
     completed: bool,
+
+    /// Files waiting their turn, oldest first.
+    queue: VecDeque<Queued>,
+    /// The file the running job is reading, and where it came from.
+    running: Option<Queued>,
+    /// How many files this drain started with, which is what decides whether
+    /// the typed dataset name can apply (see [`State::dataset_name_for`]).
+    run_total: usize,
+    /// Whether the drain in progress was started by the watched folder.
+    ///
+    /// It is what keeps the two intents apart in one queue: a drain the
+    /// watcher started takes only the files the watcher put there, so a file
+    /// somebody dropped and has not confirmed is never swept into an
+    /// unattended import — and a dropped file waiting at the head of the
+    /// queue never blocks the watch either (§7.6).
+    run_automatic: bool,
+    /// What became of the files this drain and the ones before it ran, newest
+    /// last.
+    outcomes: Vec<Outcome>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Browse,
-    FilePicked(Option<PathBuf>),
+    /// What the dialog came back with. A cancelled dialog is an empty list.
+    FilesPicked(Vec<PathBuf>),
     PathChanged(String),
     Sniff,
     Sniffed(Result<Box<Preview>, String>),
+
+    /// Take this file off the queue without importing it.
+    Dequeue(usize),
+    ClearQueue,
+    /// Forget the per-file outcome list.
+    ClearOutcomes,
 
     PreambleChanged(String),
     DelimiterPicked(DelimiterChoice),
@@ -238,6 +326,97 @@ impl State {
         std::mem::take(&mut self.completed)
     }
 
+    /// Files waiting, not counting the one being read.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Whether an import is running right now.
+    #[must_use]
+    pub const fn is_running(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// What became of the files the queue has run.
+    #[must_use]
+    pub fn outcomes(&self) -> &[Outcome] {
+        &self.outcomes
+    }
+
+    /// Queued files the watched folder put there.
+    #[must_use]
+    fn automatic_queued(&self) -> usize {
+        self.queue
+            .iter()
+            .filter(|queued| queued.source.is_automatic())
+            .count()
+    }
+
+    /// Puts files on the queue, and starts draining it when they came from
+    /// somewhere that does not need asking (§7.6).
+    ///
+    /// This is the one way in for a drop and for the watched folder, so both
+    /// arrive on the same queue under the same profile as a hand-picked file.
+    /// A directory contributes the importable files directly inside it, which
+    /// is how "drop a folder of captures on the window" works and why it does
+    /// not walk into an archive.
+    pub fn enqueue(
+        &mut self,
+        store: Option<&Store>,
+        paths: impl IntoIterator<Item = PathBuf>,
+        source: Source,
+    ) -> Task<Message> {
+        let mut added = 0;
+        let mut first = None;
+        for path in paths {
+            let expanded = if path.is_dir() {
+                crate::watch::importable_in(&path)
+            } else {
+                vec![path]
+            };
+            for path in expanded {
+                if self.queue.iter().any(|queued| queued.path == path)
+                    || self.running.as_ref().is_some_and(|run| run.path == path)
+                {
+                    continue;
+                }
+                first = first.or_else(|| Some(path.clone()));
+                self.queue.push_back(Queued { path, source });
+                added += 1;
+            }
+        }
+        if added == 0 {
+            return Task::none();
+        }
+        tracing::info!(added, source = source.label(), "files queued for import");
+
+        let mut tasks = Vec::new();
+        // The file at the head of the queue is the one the mapping panel is
+        // about, so it is the one previewed — unless a job is already reading
+        // something, in which case the screen is showing that and must not be
+        // pulled out from under it.
+        if self.job.is_none() {
+            if let Some(path) = first.filter(|_| self.queue.len() == added) {
+                self.adopt(&path);
+                tasks.push(self.sniff());
+            }
+        }
+        if source.is_automatic() && self.job.is_none() {
+            tasks.push(self.drain(store, true));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Takes a path as the file on screen, naming the dataset after it unless
+    /// the user has typed a name of their own.
+    fn adopt(&mut self, path: &Path) {
+        self.path = path.display().to_string();
+        if self.dataset_name.trim().is_empty() {
+            self.dataset_name = stem_of(path);
+        }
+    }
+
     /// The mode a fresh import profile starts in (Settings, §12.1).
     ///
     /// It applies to the profile on screen too: the mode is a decision about
@@ -274,20 +453,30 @@ impl State {
 
     pub fn update(&mut self, store: Option<&Store>, message: Message) -> Task<Message> {
         match message {
-            Message::Browse => Task::perform(pick_file(), Message::FilePicked),
-            Message::FilePicked(None) => Task::none(),
-            Message::FilePicked(Some(path)) => {
-                self.path = path.display().to_string();
-                if self.dataset_name.trim().is_empty() {
-                    self.dataset_name = path
-                        .file_stem()
-                        .map(|stem| stem.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                }
-                self.sniff()
-            }
+            Message::Browse => Task::perform(pick_files(), Message::FilesPicked),
+            Message::FilesPicked(paths) if paths.is_empty() => Task::none(),
+            Message::FilesPicked(paths) => self.enqueue(store, paths, Source::Chosen),
             Message::PathChanged(path) => {
                 self.path = path;
+                Task::none()
+            }
+            Message::Dequeue(index) => {
+                self.queue.remove(index);
+                Task::none()
+            }
+            Message::ClearQueue => {
+                let dropped = self.queue.len();
+                self.queue.clear();
+                if dropped > 0 {
+                    self.notice = Some(format!(
+                        "{dropped} file{} taken off the queue.",
+                        plural(dropped as u64)
+                    ));
+                }
+                Task::none()
+            }
+            Message::ClearOutcomes => {
+                self.outcomes.clear();
                 Task::none()
             }
             Message::Sniff => self.sniff(),
@@ -497,7 +686,7 @@ impl State {
                 }
             },
 
-            Message::Start => self.start(store),
+            Message::Start => self.drain(store, false),
             Message::Tick => {
                 if let Some(job) = &self.job {
                     self.shown_progress = *job.progress.lock().expect("progress mutex");
@@ -513,20 +702,32 @@ impl State {
             }
             Message::Imported(result) => {
                 self.job = None;
+                let finished = self.running.take();
                 match result {
                     Ok(report) => {
-                        self.notice = Some(format!("Imported {}", report.summary()));
+                        let summary = report.summary();
+                        self.notice = Some(format!("Imported {summary}"));
                         self.error = None;
                         self.report = Some(*report);
                         self.completed = true;
+                        self.record(finished, Ok(summary));
                     }
                     Err(error) => {
                         tracing::error!(%error, "import failed");
-                        self.error = Some(error);
+                        self.error = Some(error.clone());
                         self.report = None;
+                        // A failed file does not stop the queue: the whole
+                        // point of importing forty captures in one action is
+                        // not having to babysit it, and the outcome list is
+                        // where the failure is read afterwards (§12.3 —
+                        // errors are data).
+                        self.record(finished, Err(error));
                     }
                 }
-                Task::none()
+                // Straight on to the next file this drain is entitled to,
+                // whatever happened to this one; `start_next` is where the
+                // drain stops.
+                self.start_next(store)
             }
         }
     }
@@ -572,16 +773,75 @@ impl State {
         }
     }
 
-    fn start(&mut self, store: Option<&Store>) -> Task<Message> {
+    /// Starts draining the queue.
+    ///
+    /// `automatic` says which intent this drain serves: the watcher's, which
+    /// takes only the files the watcher queued, or the user's, which takes
+    /// everything and will fall back to the file on screen when the queue is
+    /// empty (§7.6).
+    fn drain(&mut self, store: Option<&Store>, automatic: bool) -> Task<Message> {
+        if self.job.is_some() {
+            // Already draining; a queued file's turn comes when this one is
+            // finished.
+            return Task::none();
+        }
+        if store.is_none() {
+            self.error = Some("No library is open.".to_owned());
+            return Task::none();
+        }
+        if !automatic && self.queue.is_empty() {
+            let path = PathBuf::from(self.path.trim());
+            if path.as_os_str().is_empty() {
+                self.error = Some("Choose a file to import.".to_owned());
+                return Task::none();
+            }
+            self.queue.push_back(Queued {
+                path,
+                source: Source::Chosen,
+            });
+        }
+        self.run_automatic = automatic;
+        self.run_total = if automatic {
+            self.automatic_queued()
+        } else {
+            self.queue.len()
+        };
+        if !automatic {
+            // A run the user asked for starts a fresh account. A watched one
+            // appends, because it never ends.
+            self.outcomes.clear();
+        }
+        self.start_next(store)
+    }
+
+    /// Takes the next file this drain is entitled to and imports it.
+    ///
+    /// One at a time and in order. Nothing is gained by two at once — the
+    /// store has a single writer thread (§4.2) — and a good deal is lost: a
+    /// progress bar that means something, and a diagnostic list that belongs
+    /// to a file the user can name.
+    fn start_next(&mut self, store: Option<&Store>) -> Task<Message> {
+        // What there is to take is decided before the library is asked about,
+        // so a drain that has run out does not report a missing library over
+        // the top of whatever the last file had to say.
+        let index = if self.run_automatic {
+            self.queue
+                .iter()
+                .position(|queued| queued.source.is_automatic())
+        } else {
+            (!self.queue.is_empty()).then_some(0)
+        };
+        let Some(queued) = index.and_then(|index| self.queue.remove(index)) else {
+            self.run_total = 0;
+            self.run_automatic = false;
+            return Task::none();
+        };
         let Some(store) = store else {
             self.error = Some("No library is open.".to_owned());
             return Task::none();
         };
-        let path = PathBuf::from(self.path.trim());
-        if path.as_os_str().is_empty() {
-            self.error = Some("Choose a file to import.".to_owned());
-            return Task::none();
-        }
+        let path = queued.path.clone();
+        let request = self.request_for_source(&path, queued.source);
 
         let progress = Arc::new(Mutex::new(ImportProgress::default()));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -592,16 +852,14 @@ impl State {
                 *sink.lock().expect("progress mutex") = update;
             }));
 
-        let mut request = ImportRequest::new(self.profile.clone()).named(self.dataset_name.trim());
-        request = request.from_file(&path);
-        if let Some(id) = self.loaded_profile {
-            request = request.with_profile_id(id);
-        }
-
         self.job = Some(Job {
             progress: progress.clone(),
             cancel,
         });
+        // The path field follows the queue, so the screen always names the
+        // file whose progress bar is moving.
+        self.path = path.display().to_string();
+        self.running = Some(queued);
         self.shown_progress = ImportProgress::default();
         self.report = None;
         self.error = None;
@@ -616,6 +874,55 @@ impl State {
             }),
             |outcome| Message::Imported(outcome.and_then(|inner| inner)),
         )
+    }
+
+    /// The request one file is imported under: the profile on screen, the
+    /// saved profile it came from, and the name the file gets.
+    ///
+    /// It is a function rather than four lines inside [`Self::start_next`] so
+    /// that a test can drive exactly the request a real import runs, rather
+    /// than a second one assembled to look like it.
+    pub(crate) fn request_for_source(&self, path: &Path, source: Source) -> ImportRequest {
+        let mut request =
+            ImportRequest::new(self.profile.clone()).named(self.dataset_name_for(path, source));
+        request = request.from_file(path);
+        if let Some(id) = self.loaded_profile {
+            request = request.with_profile_id(id);
+        }
+        request
+    }
+
+    /// What to call the dataset a file becomes.
+    ///
+    /// A typed name belongs to *one* import that a person asked for: importing
+    /// forty files under one name would make forty datasets nobody could tell
+    /// apart, and a file that arrived in the watched folder while nobody was
+    /// looking has nothing to do with whatever is in the name field. So the
+    /// typed name applies to a single chosen or dropped file, and everything
+    /// else is named after its own file.
+    fn dataset_name_for(&self, path: &Path, source: Source) -> String {
+        let typed = self.dataset_name.trim();
+        if !source.is_automatic() && self.run_total <= 1 && !typed.is_empty() {
+            typed.to_owned()
+        } else {
+            stem_of(path)
+        }
+    }
+
+    fn record(&mut self, finished: Option<Queued>, result: Result<String, String>) {
+        let Some(Queued { path, source }) = finished else {
+            return;
+        };
+        self.outcomes.push(Outcome {
+            path,
+            source,
+            result,
+        });
+        // A watched folder runs for as long as the application does, so the
+        // account is the recent one rather than all of it. `Clear` empties it.
+        if self.outcomes.len() > OUTCOME_ROWS {
+            self.outcomes.drain(..self.outcomes.len() - OUTCOME_ROWS);
+        }
     }
 
     fn group_rule(&self, label: &str) -> ColumnRule {
@@ -673,6 +980,17 @@ impl State {
                 .size(typography::BODY_SIZE)
                 .into(),
         ));
+        // The one line that teaches the two other ways in. It is here rather
+        // than in an empty state because it is true whether or not a file is
+        // chosen.
+        pane = pane.push(
+            text(
+                "Drop files or a folder on the window to queue them. Several files import \
+                 one after another, each named after itself.",
+            )
+            .size(typography::LABEL_SIZE)
+            .style(ui::dim),
+        );
 
         pane = pane.push(section("Framing"));
         pane = pane.push(labelled(
@@ -956,6 +1274,12 @@ impl State {
         if let Some(job) = &self.job {
             pane = pane.push(self.progress_row(job));
         }
+        if let Some(queue) = self.queue_panel() {
+            pane = pane.push(queue);
+        }
+        if let Some(outcomes) = self.outcomes_panel() {
+            pane = pane.push(outcomes);
+        }
 
         let body: Element<'_, Message> = match (&self.preview, &self.preview_error) {
             (_, Some(error)) => column![
@@ -995,8 +1319,17 @@ impl State {
     }
 
     fn action_row(&self) -> Element<'_, Message> {
+        // The queue is what the button acts on, so it is what the button
+        // says. One file is "Import"; forty is a number the user should see
+        // before they press it.
+        let waiting = self.queue.len().max(1);
+        let label = if waiting > 1 {
+            format!("Import {waiting} files")
+        } else {
+            "Import".to_owned()
+        };
         let ready = self.preview.is_some() && self.preview_error.is_none() && self.job.is_none();
-        let mut import = button(text("Import").size(typography::BODY_SIZE))
+        let mut import = button(text(label).size(typography::BODY_SIZE))
             .padding([6, 14])
             .style(button::primary);
         if ready {
@@ -1034,6 +1367,138 @@ impl State {
             );
         }
         actions.into()
+    }
+
+    /// What is waiting, and where it came from.
+    ///
+    /// A queue with nothing in it draws nothing: the panel is a fact about
+    /// this moment, not a box that is always there with a zero in it.
+    fn queue_panel(&self) -> Option<Element<'_, Message>> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        let mut list = column![row![
+            ui::caption(format!("Queued  {}", self.queue.len())),
+            Space::with_width(Length::Fill),
+        ]
+        .push_maybe((self.automatic_queued() > 0).then(|| {
+            text(format!(
+                "{} from the watched folder — importing on its own",
+                self.automatic_queued()
+            ))
+            .size(typography::LABEL_SIZE)
+            .style(ui::dim)
+        }))
+        .push(
+            button(
+                text("Clear")
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::LABEL),
+            )
+            .padding([2, 6])
+            .style(button::text)
+            .on_press(Message::ClearQueue),
+        )
+        .spacing(8)
+        .align_y(Alignment::Center)]
+        .spacing(2);
+
+        for (index, queued) in self.queue.iter().enumerate().take(DIAGNOSTIC_ROWS) {
+            list = list.push(
+                row![
+                    text(queued.path.display().to_string())
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::READOUT),
+                    Space::with_width(Length::Fill),
+                    text(queued.source.label())
+                        .size(typography::LABEL_SIZE)
+                        .font(typography::LABEL)
+                        .style(ui::dim),
+                    button(
+                        text("Remove")
+                            .size(typography::LABEL_SIZE)
+                            .font(typography::LABEL)
+                            .style(ui::dim),
+                    )
+                    .padding([2, 6])
+                    .style(button::text)
+                    .on_press(Message::Dequeue(index)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+        Some(list.into())
+    }
+
+    /// One line per file the queue has finished with, pass or fail.
+    ///
+    /// This is what a forty-file import is read from afterwards: the progress
+    /// bar is about the file in front of the reader and says nothing about the
+    /// thirty-nine behind it.
+    fn outcomes_panel(&self) -> Option<Element<'_, Message>> {
+        if self.outcomes().is_empty() {
+            return None;
+        }
+        let failed = self
+            .outcomes()
+            .iter()
+            .filter(|outcome| outcome.result.is_err())
+            .count();
+
+        let mut list = column![row![
+            ui::caption(format!("Imported  {}", self.outcomes().len())),
+            Space::with_width(Length::Fill),
+        ]
+        .push_maybe((failed > 0).then(|| {
+            text(format!("{failed} failed"))
+                .size(typography::LABEL_SIZE)
+                .font(typography::READOUT)
+                .style(text::danger)
+        }))
+        .push(
+            button(
+                text("Clear")
+                    .size(typography::LABEL_SIZE)
+                    .font(typography::LABEL),
+            )
+            .padding([2, 6])
+            .style(button::text)
+            .on_press(Message::ClearOutcomes),
+        )
+        .spacing(8)
+        .align_y(Alignment::Center)]
+        .spacing(2);
+
+        for outcome in self.outcomes().iter().rev().take(OUTCOME_ROWS) {
+            let (reading, style): (&str, fn(&Theme) -> text::Style) = match &outcome.result {
+                Ok(summary) => (summary.as_str(), ui::dim),
+                Err(error) => (error.as_str(), text::danger),
+            };
+            list = list.push(
+                row![
+                    container(
+                        text(stem_of(&outcome.path))
+                            .size(typography::LABEL_SIZE)
+                            .font(typography::READOUT),
+                    )
+                    .width(Length::Fixed(200.0)),
+                    // Where it came from, because a file that imported on its
+                    // own is a different fact from one somebody chose.
+                    container(
+                        text(outcome.source.label())
+                            .size(typography::LABEL_SIZE)
+                            .font(typography::LABEL)
+                            .style(ui::dim),
+                    )
+                    .width(Length::Fixed(64.0)),
+                    text(reading).size(typography::LABEL_SIZE).style(style),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+        Some(list.into())
     }
 
     fn progress_row(&self, _job: &Job) -> Element<'_, Message> {
@@ -1218,15 +1683,29 @@ fn diagnostic_row(diagnostic: &Diagnostic) -> Element<'_, Message> {
     .into()
 }
 
-/// The dialog runs on its own; a cancelled pick is `None`.
-async fn pick_file() -> Option<PathBuf> {
+/// The dialog runs on its own; a cancelled pick is an empty list.
+///
+/// Multi-select, because a bench run produces a directory of captures and
+/// importing them was one dialog per file.
+async fn pick_files() -> Vec<PathBuf> {
     rfd::AsyncFileDialog::new()
-        .set_title("Import a CSV file")
-        .add_filter("CSV", &["csv", "txt"])
+        .set_title("Import CSV files")
+        .add_filter("CSV", &["csv", "txt", "tsv"])
         .add_filter("All files", &["*"])
-        .pick_file()
+        .pick_files()
         .await
+        .unwrap_or_default()
+        .iter()
         .map(|handle| handle.path().to_path_buf())
+        .collect()
+}
+
+/// A file's name without its extension — what a dataset made from it is
+/// called.
+fn stem_of(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn sample_of(hint: &ColumnHint) -> String {
@@ -1503,7 +1982,7 @@ time, pulse width, power, band
     #[test]
     fn choosing_a_file_names_the_dataset_but_never_overwrites_a_typed_name() {
         let mut state = State::default();
-        let _ = state.update(None, Message::FilePicked(Some("/data/capture.csv".into())));
+        let _ = state.update(None, Message::FilesPicked(vec!["/data/capture.csv".into()]));
         assert_eq!(
             state.path,
             PathBuf::from("/data/capture.csv").display().to_string()
@@ -1512,13 +1991,231 @@ time, pulse width, power, band
 
         // A name the user typed is theirs, and the next file does not take it.
         let _ = state.update(None, Message::DatasetNameChanged("Trial 3".into()));
-        let _ = state.update(None, Message::FilePicked(Some("/data/other.csv".into())));
+        let _ = state.update(None, Message::FilesPicked(vec!["/data/other.csv".into()]));
         assert_eq!(state.dataset_name, "Trial 3");
 
         // A cancelled dialog changes nothing at all.
         let before = state.path.clone();
-        let _ = state.update(None, Message::FilePicked(None));
+        let queued = state.queued();
+        let _ = state.update(None, Message::FilesPicked(Vec::new()));
         assert_eq!(state.path, before);
+        assert_eq!(state.queued(), queued);
+    }
+
+    /// The file dialog is multi-select now, and what it comes back with is a
+    /// queue rather than a path.
+    #[test]
+    fn picking_several_files_queues_them_all_and_previews_the_first() {
+        let mut state = State::default();
+        let _ = state.update(
+            None,
+            Message::FilesPicked(vec![
+                "/data/one.csv".into(),
+                "/data/two.csv".into(),
+                "/data/three.csv".into(),
+            ]),
+        );
+        assert_eq!(state.queued(), 3);
+        assert_eq!(
+            state.path,
+            PathBuf::from("/data/one.csv").display().to_string(),
+            "the head of the queue is the file the mapping panel is about"
+        );
+        assert_eq!(state.dataset_name, "one");
+
+        // The same file twice is one file: a folder dropped over a pick of
+        // the same folder should not import everything in it twice.
+        let _ = state.update(None, Message::FilesPicked(vec!["/data/two.csv".into()]));
+        assert_eq!(state.queued(), 3);
+    }
+
+    #[test]
+    fn a_queued_file_can_be_taken_off_again() {
+        let mut state = State::default();
+        let _ = state.update(
+            None,
+            Message::FilesPicked(vec!["/data/one.csv".into(), "/data/two.csv".into()]),
+        );
+        let _ = state.update(None, Message::Dequeue(0));
+        assert_eq!(state.queued(), 1);
+        let _ = state.update(None, Message::ClearQueue);
+        assert_eq!(state.queued(), 0);
+        assert!(state.notice.as_deref().unwrap().contains("1 file"));
+        let _ = state.view();
+    }
+
+    /// A drop and a pick queue and wait; the watched folder does not, because
+    /// turning the watch on was the consent (§7.6).
+    #[test]
+    fn only_a_watched_file_starts_the_queue_by_itself() {
+        let (_dir, store) = store();
+
+        let mut dropped = State::default();
+        let _ = dropped.enqueue(
+            Some(&store),
+            [PathBuf::from("/data/capture.csv")],
+            Source::Dropped,
+        );
+        assert_eq!(dropped.queued(), 1);
+        assert!(!dropped.is_running(), "a drop waits to be told");
+
+        let mut watched = State::default();
+        let _ = watched.enqueue(
+            Some(&store),
+            [PathBuf::from("/data/capture.csv")],
+            Source::Watched,
+        );
+        assert!(
+            watched.is_running() || watched.outcomes().len() == 1,
+            "a watched file goes on its own"
+        );
+        assert_eq!(watched.queued(), 0);
+    }
+
+    #[test]
+    fn a_dropped_folder_contributes_the_captures_inside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.csv"), "x\n1\n").unwrap();
+        std::fs::write(dir.path().join("b.csv"), "x\n1\n").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "not a capture").unwrap();
+
+        let mut state = State::default();
+        let _ = state.enqueue(None, [dir.path().to_path_buf()], Source::Dropped);
+        assert_eq!(state.queued(), 2, "and not the notes");
+    }
+
+    #[test]
+    fn a_typed_name_is_for_one_file_and_a_run_of_many_names_each_after_itself() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::DatasetNameChanged("Trial 3".into()));
+
+        state.run_total = 1;
+        assert_eq!(
+            state.dataset_name_for(Path::new("/data/capture.csv"), Source::Chosen),
+            "Trial 3"
+        );
+        state.run_total = 4;
+        assert_eq!(
+            state.dataset_name_for(Path::new("/data/capture.csv"), Source::Chosen),
+            "capture",
+            "four datasets under one name would be four datasets nobody can tell apart"
+        );
+        // And a file nobody was there to name is named after itself, whatever
+        // is in the field.
+        state.run_total = 1;
+        assert_eq!(
+            state.dataset_name_for(Path::new("/data/capture.csv"), Source::Watched),
+            "capture"
+        );
+    }
+
+    /// One queue, two intents. A drain the watcher started takes only the
+    /// files the watcher queued, so an unconfirmed drop is never swept into an
+    /// unattended import — and equally never blocks the watch (§7.6).
+    #[test]
+    fn a_watched_drain_leaves_a_dropped_file_where_it_is() {
+        let (_dir, store) = store();
+        let mut state = State::default();
+        let _ = state.enqueue(
+            Some(&store),
+            [PathBuf::from("/nowhere/dropped.csv")],
+            Source::Dropped,
+        );
+        assert_eq!(state.queued(), 1);
+        assert!(!state.is_running());
+
+        // A watched file arrives behind it and imports anyway …
+        let _ = state.enqueue(
+            Some(&store),
+            [PathBuf::from("/nowhere/watched.csv")],
+            Source::Watched,
+        );
+        assert_eq!(
+            state.running.as_ref().map(|queued| queued.source),
+            Some(Source::Watched),
+            "the watcher took its own file and not the one in front of it"
+        );
+        assert_eq!(state.queued(), 1, "the dropped file is still waiting");
+
+        // … and when it finishes, the drain stops rather than carrying on
+        // into what a person put there.
+        let _ = state.update(Some(&store), Message::Imported(Err("no such file".into())));
+        assert!(!state.is_running());
+        assert_eq!(state.queued(), 1);
+        assert_eq!(
+            state.queue.front().map(|queued| queued.source),
+            Some(Source::Dropped)
+        );
+
+        // The user pressing Import is what takes it.
+        let _ = state.update(Some(&store), Message::Start);
+        assert_eq!(
+            state.running.as_ref().map(|queued| queued.source),
+            Some(Source::Dropped)
+        );
+    }
+
+    #[test]
+    fn a_failed_file_is_recorded_and_the_queue_carries_on() {
+        let (_dir, store) = store();
+        let mut state = State::default();
+        let _ = state.enqueue(
+            Some(&store),
+            [
+                PathBuf::from("/nowhere/one.csv"),
+                PathBuf::from("/nowhere/two.csv"),
+            ],
+            Source::Chosen,
+        );
+        state.run_total = 2;
+        state.running = Some(Queued {
+            path: "/nowhere/one.csv".into(),
+            source: Source::Chosen,
+        });
+        state.job = Some(Job {
+            progress: Arc::new(Mutex::new(ImportProgress::default())),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+
+        let _ = state.update(Some(&store), Message::Imported(Err("no such file".into())));
+        assert_eq!(state.outcomes().len(), 1);
+        assert!(state.outcomes()[0].result.is_err());
+        assert_eq!(
+            state.queued(),
+            1,
+            "the second file is still there to be tried"
+        );
+        let _ = state.view();
+    }
+
+    #[test]
+    fn an_outcome_list_can_be_read_and_cleared() {
+        let mut state = State {
+            outcomes: vec![
+                Outcome {
+                    path: "/data/one.csv".into(),
+                    source: Source::Watched,
+                    result: Ok("1 group, 2 pulses".to_owned()),
+                },
+                Outcome {
+                    path: "/data/two.csv".into(),
+                    source: Source::Dropped,
+                    result: Err("no count column".to_owned()),
+                },
+            ],
+            ..State::default()
+        };
+        let _ = state.view();
+        let _ = state.update(None, Message::ClearOutcomes);
+        assert!(state.outcomes().is_empty());
+    }
+
+    #[test]
+    fn a_source_says_whether_it_needs_asking() {
+        assert!(Source::Watched.is_automatic());
+        assert!(!Source::Dropped.is_automatic());
+        assert!(!Source::Chosen.is_automatic());
+        assert_eq!(Source::Watched.label(), "watched");
     }
 
     #[test]

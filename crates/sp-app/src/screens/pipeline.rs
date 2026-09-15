@@ -563,6 +563,15 @@ impl State {
     // -----------------------------------------------------------------------
 
     /// The descriptor of the stage at `index`, if its kind is registered.
+    /// Every registered stage, built-in and external.
+    ///
+    /// The command palette lists these, so a vendor DLL the user has allowed
+    /// is in the palette for the same reason it is in the stage rail: both
+    /// read this one registry (§9.9).
+    pub fn stage_descriptors(&self) -> impl Iterator<Item = &'static StageDescriptor> + '_ {
+        self.registry.descriptors()
+    }
+
     fn descriptor_at(&self, index: usize) -> Option<&'static StageDescriptor> {
         self.pipeline
             .stages
