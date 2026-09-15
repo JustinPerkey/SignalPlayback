@@ -133,6 +133,7 @@ impl App {
         self.scope.set_quality(settings.decimation);
         self.results.set_quality(settings.decimation);
         self.pipeline.set_libraries(&settings.external_libraries);
+        self.pipeline.set_sample_cap(settings.sample_cap.bytes());
         self.results.set_libraries(&settings.external_libraries);
         self.inspector
             .set_bins(settings.histogram_bins, self.store.as_ref())

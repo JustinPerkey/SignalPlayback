@@ -1,10 +1,19 @@
 # SignalPlayback — Design Document
 
-**Status:** v1.1
-**Date:** 2026-09-08
+**Status:** v1.2
+**Date:** 2026-09-15
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v1.2** — M10 is built, so §9.5 now says what the cache and the retention
+> policies actually do: `on_failure` output is written as the stage records and swept when
+> the group comes out well, because a group's fate is not settled until its last stage has
+> run; only `always` output is published to the cache, since a key must point at samples
+> that are still there; a stale key is unpublished on the lookup that finds it dangling;
+> and the run-level size cap is a claim per stage that leaves the account of what a stage
+> did intact. §12.4 gains the sample cap, §12.1 the Settings screen's cache figure and
+> `Clear stage cache`, §15.6 the CLI's `--sample-cap`, and open question 10 is settled.
+>
 > **Changes in v1.1** — M9 is built, so §9.9 now describes what exists rather than what was
 > proposed: the disposition array is per input signal and `sp_output` carries its count,
 > the host lends `f64`, provenance is a per-stage diagnostic, and a `sequential` library
@@ -1163,23 +1172,44 @@ with `Replaced`, `Untouched`, or `Dropped` — no inference.
 for each group  (parallel, bounded by in_flight_cap):
     frame ← load(group)                       # metadata + lazy signal refs
     for stage in pipeline:                    # strictly ordered
-        key ← blake3(stage.kind, stage.version, params_hash, input_hash)
+        key ← blake3(stage.kind, stage.version, params_hash, salt, input_hash)
         if cache.hit(key) and stage.pure:
             output ← cache.get(key)           # stage skipped entirely
         else:
             output ← stage.process(ctx, frame)
-            cache.put(key, output)
+            cache.put(key, output)            # `always` retention only
         record(run, group, stage, output)     # blobs + artifact rows
         frame ← frame.apply(output)
+    if group passed:                          # §9.5, retention
+        forget the samples of every `on_failure` stage
 ```
 
 - `input_hash` folds the content hashes of every input signal and inbound artifact, so the
-  key changes exactly when the inputs do.
+  key changes exactly when the inputs do. `salt` is what the stage instance adds beyond its
+  declaration — nothing for a compiled stage, the library file's hash for an external one
+  (§9.9).
 - **Editing stage 4's parameters re-runs stages 4…n only.** Stages 1–3 hit the cache. On a
   long pipeline this is the difference between iterating on an algorithm and waiting on one.
 - Stages may declare themselves impure (`descriptor().pure == false`) to opt out of caching.
-- **Retention policy** per stage: `Always` / `OnFailure` / `Never`, plus a run-level size
-  cap. Content addressing means unchanged signals never consume space regardless of policy.
+- A hit is **copied into this run**, sharing blobs rather than recomputing or referencing
+  across runs, so a cached stage is indistinguishable from one that ran apart from its
+  `cached` status — and deleting either run leaves the other whole. A key whose rows are
+  gone is unpublished on the lookup that finds it dangling, rather than missed again.
+- **Retention policy** per stage: `Always` / `OnFailure` / `Never`. Content addressing means
+  unchanged signals never consume space regardless of policy.
+  - `on_failure` is **written as the stage records and swept when the group comes out
+    well**. A group's fate is not settled until its last stage has run, and the samples a
+    failure is diagnosed from are exactly the ones that would already be gone. Sweeping is
+    not deleting the row: what the stage did to each signal, its statistics, its metrics and
+    its diagnostics stay — a group that passed is read for its numbers, not for its
+    intermediate waveforms.
+  - Only `always` output is **published to the cache**. A key must point at samples that are
+    still there, and `on_failure` output is swept the moment its group passes.
+- **Run-level size cap.** A stage claims room for the bytes it produced — a passthrough
+  shares the blob it was given and claims nothing — and a stage that does not get it records
+  everything except the samples, plus a diagnostic saying so. The claim is per stage rather
+  than a latch, so one stage too large to fit does not stop a smaller one later, and a
+  capped stage is not published to the cache either. The cap limits storage, never evidence.
 
 ### 9.6 Run Schema
 
@@ -1668,7 +1698,7 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 | **Scope** | Playback-focused view of stored signals, with the same stage rail available when a run is loaded. |
 | **Inspector** | Detail for one signal, pulse field or pulse: full metadata, property editor, tags, statistics, histogram, and a virtualised value table — for a pulse group, the table is the pulse records themselves, one row per pulse across every field. Statistics are recomputed from the samples in one streaming pass (min, max, peak-to-peak, mean, RMS, standard deviation, zero crossings and the distribution), not read from the cached row, so they answer for what is actually stored; the table is a window on the column, paged, so a 100 M-sample signal costs a read rather than a copy. A pulse is addressed as a row of its group's table: an unannotated pulse has no row of its own (§6.6). |
 | **Properties** | Manage property definitions and property sets (§6.3). |
-| **Settings** | Library location, theme, default sample rate, strict/tolerant import, retention defaults, decimation quality, keyboard map. |
+| **Settings** | Library location, theme, default sample rate, strict/tolerant import, retention defaults, the run-level sample cap, decimation quality, keyboard map. It also reports what the open library is made of — rows, bytes by blob kind, published stage-cache keys — with `Reclaim unused blobs` and `Clear stage cache` beside the figures. Clearing unpublishes keys and nothing else: the output they named belongs to the run that recorded it and stays there, so the cost is the next run's reuse. |
 
 ### 12.2 Iced Application Shape
 
@@ -1748,6 +1778,7 @@ logs:
 | Default sample rate | The rate a new generator spec starts at. The spec on screen follows it only while it is still on the old default — a rate the user typed is theirs |
 | Strict / tolerant import | Whether an import refuses a file whose declared count does not match what was read (§7.3) |
 | Retention | Finished runs kept per pipeline; the oldest go first. A run a baseline names is never deleted, and neither is one still going. Enforced in the window only: a headless run keeps everything it records, because CI is not the place to lose evidence |
+| Sample cap | How many bytes of samples one run may record before it keeps only what its stages said about them (§9.5). It is a limit on storage, never on evidence: past the cap a stage still records what it did to every signal, its statistics, its metrics and its diagnostics, and says why the samples are not there. A cap of zero is a real choice — the numbers without the waveforms behind them. The headless run takes it from `--sample-cap` rather than from the file, so CI decides its own budget |
 | Decimation quality | Shifts the reducer's automatic level choice by one either way (§5.4). It never promotes a level to a raw read: that bound is what keeps a frame inside its budget, not a preference |
 | Histogram bins | Resolution of the Inspector's histogram |
 | Allowed external libraries | The native libraries this installation may load as stages (§9.9). The list is consent rather than configuration: a library is on it because the user picked that file, and the load is attempted there and then, so a failure is reported beside the path that caused it. A headless run reads the same list, so CI loads what the window would |
@@ -2020,7 +2051,7 @@ not by section number.
 | Phase | Deliverable | Exit criteria |
 |-------|-------------|---------------|
 | **M9 — External stages** (done) | `sp-ext`, the §9.9 C ABI, library allow-list in settings, sample conforming DLL | A sample DLL runs as a stage over one group at a time; its path, hash and version are recorded in `run_stage` (G8) |
-| **M10 — Stage cache** | Content-hash stage cache, per-stage retention policy | Editing stage *n* re-runs only *n…end*; a cached run and a cold run produce identical outputs |
+| **M10 — Stage cache** (done) | Content-hash stage cache, per-stage retention policy, run-level sample cap | Editing stage *n* re-runs only *n…end*; a cached run and a cold run produce identical outputs |
 | **M11 — Stage families** | Detection, symbol-decode and measurement stages; stage conformance harness | Each family has a stage that runs end-to-end and passes the conformance harness |
 | **M12 — Generation** | Chirps, AM/FM/PM, `f(t)` expression node, PRBS, impairment ladders | A ladder produces one group per SNR rung, deterministically (G3) |
 | **M13 — Ingest & UX** | Drag-and-drop and multi-file import, watch folder, command palette, configurable shortcuts | A watched folder imports without user action; every action is reachable from the palette |
@@ -2028,6 +2059,10 @@ not by section number.
 
 M9 comes first because the external stage is the reason the harness exists for algorithms
 that are not written in Rust, and M14 only makes sense once M9 has a library to isolate.
+M10's key was already computed and recorded per stage when M5 wrote the scheduler; what it
+added is the part that decides what a key may point at — `on_failure` swept once its group
+passes, only `always` published, a stale key unpublished on the lookup that finds it, and a
+run-level cap that limits bytes without costing the account of what a stage did.
 
 ---
 
@@ -2079,10 +2114,14 @@ noted.
 9. **Stage output signal count.** Assumed a stage may add and drop signals freely within a
    group. If downstream stages must see a fixed signal count matching the group's declared
    `count`, that is a validation rule worth stating now.
-10. **Retention default.** `Always` is assumed, since content addressing makes passthrough
-   free. A pipeline whose every stage rewrites every sample of a 100 M-sample signal will
-   still cost ~400 MB per stage per group. Confirm whether the default should be
-   `Always` with a size cap, or `OnFailure` with opt-in.
+10. **Retention default.** ✅ *Settled at M10 (2026-09-15): `Always` with a size cap.*
+   Content addressing makes passthrough free, so the default keeps everything and costs
+   nothing for the stages that change nothing. The pipeline that does cost — every stage
+   rewriting every sample of a 100 M-sample signal, ~400 MB a stage a group — is met by the
+   run-level cap (§9.5), which stops keeping samples while still recording what each stage
+   did and measured, and by `OnFailure` per stage for the intermediates only a failure is
+   read for. `OnFailure` as the default was rejected: the common case is a workbench being
+   iterated on, where the run that passed is the one to compare against next.
 11. **Artifact size ceiling.** 64 KB inline / blob beyond that is a guess. A per-group
    spectrogram at fine resolution can reach hundreds of MB; if that is routine, the
    spectrogram artifact should store a decimated pyramid the way signals do.

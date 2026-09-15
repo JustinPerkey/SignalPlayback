@@ -158,6 +158,9 @@ pub struct StorageStats {
     pub pipelines: u64,
     pub runs: u64,
     pub artifacts: u64,
+    /// Published stage-cache keys (§9.5). They hold no bytes of their own:
+    /// each names output that belongs to the run that recorded it.
+    pub cache_entries: u64,
     pub baselines: u64,
     pub tags: u64,
     pub property_defs: u64,
@@ -201,6 +204,7 @@ pub fn storage(conn: &Connection) -> Result<StorageStats> {
         pipelines: count("SELECT COUNT(*) FROM pipeline")?,
         runs: count("SELECT COUNT(*) FROM run")?,
         artifacts: count("SELECT COUNT(*) FROM artifact")?,
+        cache_entries: count("SELECT COUNT(*) FROM stage_cache")?,
         baselines: count("SELECT COUNT(*) FROM baseline")?,
         tags: count("SELECT COUNT(*) FROM tag")?,
         property_defs: count("SELECT COUNT(*) FROM property_def")?,

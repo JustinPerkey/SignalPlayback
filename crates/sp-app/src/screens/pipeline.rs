@@ -126,6 +126,8 @@ pub struct State {
     /// External stage libraries from Settings, kept so a run rebuilds the
     /// same registry the editor validated against (§9.9).
     libraries: Vec<std::path::PathBuf>,
+    /// The sample bytes one run may record, from Settings (§9.5).
+    sample_cap: Option<u64>,
     pipeline: Pipeline,
     /// The row this pipeline is saved as, once it has been saved.
     saved_id: Option<PipelineId>,
@@ -161,6 +163,7 @@ impl Default for State {
         Self {
             registry,
             libraries: Vec::new(),
+            sample_cap: None,
             pipeline: Pipeline::new("New pipeline"),
             saved_id: None,
             saved: Vec::new(),
@@ -187,6 +190,12 @@ impl State {
     /// Adopts the external stage libraries from Settings, rebuilding the
     /// registry so the palette lists their stages and a saved pipeline naming
     /// one validates (§9.9).
+    /// The run-level sample cap from settings (§9.5), applied to the runs
+    /// this screen starts.
+    pub fn set_sample_cap(&mut self, cap: Option<u64>) {
+        self.sample_cap = cap;
+    }
+
     pub fn set_libraries(&mut self, libraries: &[std::path::PathBuf]) {
         if self.libraries == libraries {
             return;
@@ -723,6 +732,7 @@ impl State {
         let options = RunOptions {
             dataset_id: self.dataset,
             baseline_run,
+            sample_cap_bytes: self.sample_cap,
             ..RunOptions::default()
         };
         let pipeline = self.pipeline.clone();
