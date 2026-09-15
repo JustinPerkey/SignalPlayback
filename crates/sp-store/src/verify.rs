@@ -66,6 +66,13 @@ const REFERENCING_COLUMNS: &[(&str, &str)] = &[
     ("signal_group", "toa_blob_id"),
     ("pulse_field", "blob_id"),
     ("render_pyramid", "blob_id"),
+    // A run holds references of its own: every recorded stage output and
+    // every artifact payload too large to sit inline (§9.6, §10.1). Leaving
+    // them out would report a library with runs in it as damaged, and
+    // `repair_references` would then delete the columns the results screen
+    // reads.
+    ("run_signal", "blob_id"),
+    ("artifact", "blob_id"),
 ];
 
 /// Runs every check. Read-only; safe on a pooled reader.
