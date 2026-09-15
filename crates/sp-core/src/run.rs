@@ -198,7 +198,22 @@ impl Retention {
         }
     }
 
-    /// Whether samples produced under this policy are written, given how the
+    /// Whether samples are written as the stage records, before the group's
+    /// outcome is known.
+    ///
+    /// `on_failure` writes: a group's fate is not settled until its last
+    /// stage has run, and the samples a failure is diagnosed from are exactly
+    /// the ones that would already be gone. They are swept when the group
+    /// comes out well (§9.5).
+    #[must_use]
+    pub const fn writes_samples(self) -> bool {
+        match self {
+            Self::Always | Self::OnFailure => true,
+            Self::Never => false,
+        }
+    }
+
+    /// Whether samples produced under this policy are kept, given how the
     /// group turned out. Metrics and diagnostics are always recorded — they
     /// are small, and they are what a failed run is read for.
     #[must_use]

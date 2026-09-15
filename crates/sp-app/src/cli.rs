@@ -74,6 +74,8 @@ Options for `run`:
   --tolerance-metric-abs <x>, --tolerance-metric-rel <x>,
   --tolerance-artifact-abs <x>   tolerances stored with --promote
   --no-cache              recompute every stage rather than reusing output
+  --sample-cap <MiB>      stop keeping samples once the run has recorded this
+                          much; what stages did and measured is still recorded
   --notes <text>          recorded on the run
   --quiet                 print only the final verdict
 
@@ -346,6 +348,7 @@ fn run_headless(options: &Args) -> Result<i32, String> {
     let mut run_options = RunOptions {
         dataset_id: options.dataset_id,
         use_cache: !options.no_cache,
+        sample_cap_bytes: options.sample_cap_mib.map(|mib| mib * 1024 * 1024),
         notes: options.notes.clone(),
         ..RunOptions::default()
     };
@@ -576,6 +579,8 @@ pub struct Args {
     pub name: Option<String>,
     pub tolerances: Tolerances,
     pub no_cache: bool,
+    /// A ceiling in mebibytes on the samples one run records (§9.5).
+    pub sample_cap_mib: Option<u64>,
     pub quiet: bool,
     pub notes: Option<String>,
 }
@@ -612,12 +617,19 @@ impl Args {
                 "--tolerance-artifact-abs" => parsed.tolerances.artifact_abs = float(&value()?)?,
                 "--allow-new-groups" => parsed.tolerances.allow_new_groups = true,
                 "--no-cache" => parsed.no_cache = true,
+                "--sample-cap" => parsed.sample_cap_mib = Some(size(&value()?)?),
                 "--quiet" => parsed.quiet = true,
                 other => return Err(format!("unknown option '{other}'")),
             }
         }
         Ok(parsed)
     }
+}
+
+fn size(text: &str) -> Result<u64, String> {
+    text.trim()
+        .parse()
+        .map_err(|_| format!("'{text}' is not a size in mebibytes"))
 }
 
 fn number(text: &str) -> Result<i64, String> {
@@ -665,7 +677,7 @@ mod tests {
     fn the_options_of_a_run_parse() {
         let parsed = Args::parse(&args(
             "--library /tmp/lib.db --pipeline detector --dataset ladder \
-             --assert-baseline golden --no-cache --quiet",
+             --assert-baseline golden --no-cache --sample-cap 512 --quiet",
         ))
         .unwrap();
         assert_eq!(parsed.library, Some(PathBuf::from("/tmp/lib.db")));
@@ -673,8 +685,15 @@ mod tests {
         assert_eq!(parsed.dataset.as_deref(), Some("ladder"));
         assert_eq!(parsed.assert_baseline.as_deref(), Some("golden"));
         assert!(parsed.no_cache);
+        assert_eq!(parsed.sample_cap_mib, Some(512));
         assert!(parsed.quiet);
         assert!(parsed.tolerances.is_exact());
+    }
+
+    #[test]
+    fn a_sample_cap_that_is_not_a_size_is_refused() {
+        let error = Args::parse(&args("--sample-cap plenty")).unwrap_err();
+        assert!(error.contains("mebibytes"), "{error}");
     }
 
     #[test]

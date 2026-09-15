@@ -812,6 +812,48 @@ pub fn read_signal_samples(
     blob::read_column(conn, blob_id, range)
 }
 
+/// Forgets the samples recorded for one group at the given stages, leaving
+/// every row that says what happened.
+///
+/// This is what `on_failure` retention comes to once the group has turned out
+/// well (§9.5): the name, disposition, timebase and statistics stay — so the
+/// results screen still answers "what did this stage do to signal 3?" — and
+/// only the bytes go. Returns how many rows lost their samples.
+pub fn forget_stage_samples(
+    conn: &Connection,
+    run: RunId,
+    group: GroupId,
+    stages: &[i32],
+) -> Result<usize> {
+    let mut forgotten = 0;
+    for stage in stages {
+        let mut blobs = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT blob_id FROM run_signal
+                 WHERE run_id = ?1 AND group_id = ?2 AND stage_ordinal = ?3
+                   AND blob_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![run.get(), group.get(), stage], |row| {
+                row.get::<_, i64>(0)
+            })?;
+            for row in rows {
+                blobs.push(BlobId::new(row?));
+            }
+        }
+        conn.execute(
+            "UPDATE run_signal SET blob_id = NULL
+             WHERE run_id = ?1 AND group_id = ?2 AND stage_ordinal = ?3",
+            params![run.get(), group.get(), stage],
+        )?;
+        for blob_id in blobs {
+            blob::release(conn, blob_id)?;
+            forgotten += 1;
+        }
+    }
+    Ok(forgotten)
+}
+
 // ---------------------------------------------------------------------------
 // Artifacts
 // ---------------------------------------------------------------------------
@@ -1042,6 +1084,27 @@ pub fn cache_lookup(conn: &Connection, key: &str) -> Result<Option<CacheHit>> {
         )
         .optional()?;
     Ok(hit)
+}
+
+/// Drops a key. Called when a key resolved to rows that are no longer there
+/// — a run deleted out from under it in a window the cascade did not cover —
+/// so the next lookup misses cleanly rather than pointing at nothing again.
+pub fn cache_forget(conn: &Connection, key: &str) -> Result<bool> {
+    let gone = conn.execute("DELETE FROM stage_cache WHERE cache_key = ?1", [key])?;
+    Ok(gone > 0)
+}
+
+/// How many keys are published. The figure the Settings screen reports.
+pub fn cache_entries(conn: &Connection) -> Result<u64> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM stage_cache", [], |row| row.get(0))?;
+    Ok(n.max(0) as u64)
+}
+
+/// Unpublishes every key. Nothing is deleted but the keys themselves: the
+/// output they pointed at belongs to its run and stays there, so this costs
+/// the next run its reuse and nothing else.
+pub fn clear_cache(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM stage_cache", [])?)
 }
 
 /// Copies a cached stage's recorded signals and artifacts into this run,
@@ -1566,6 +1629,157 @@ mod tests {
         assert!(fx
             .store
             .read(|conn| cache_lookup(conn, "key-b"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn forgetting_a_stage_samples_keeps_the_row_and_releases_the_blob() {
+        // What `on_failure` retention comes to once the group passes (§9.5).
+        let fx = fixture(1);
+        let pipeline = saved_pipeline(&fx.store);
+        let group = fx.groups[0];
+        let run = fx
+            .store
+            .write(move |conn| {
+                let run = begin_run(conn, &NewRun::new(pipeline, "hash-9"))?;
+                // Distinct values per stage: identical samples would be one
+                // deduplicated blob with two references (§5.3), which is a
+                // different case — the one below.
+                for stage in 0..2 {
+                    let offset = f64::from(stage);
+                    record_signal(
+                        conn,
+                        run,
+                        &NewRunSignal::new(group, stage, 0, "rf", Timebase::regular(10.0, 0.0))
+                            .with_disposition(Disposition::Replaced)
+                            .with_samples(buffer(&[1.0 + offset, 2.0 + offset, 3.0 + offset])),
+                    )?;
+                }
+                Ok(run)
+            })
+            .unwrap();
+        assert_eq!(fx.store.read(blob::list).unwrap().len(), 2);
+
+        let forgotten = fx
+            .store
+            .write(move |conn| forget_stage_samples(conn, run, group, &[0]))
+            .unwrap();
+        assert_eq!(forgotten, 1);
+
+        let rows = fx
+            .store
+            .read(move |conn| stage_signals(conn, run, group, 0))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the account of the stage stays");
+        assert_eq!(rows[0].name, "rf");
+        assert_eq!(rows[0].disposition, Disposition::Replaced);
+        assert_eq!(rows[0].sample_count, 3);
+        assert_eq!(rows[0].blob_id, None);
+        assert_eq!(
+            fx.store.read(blob::list).unwrap().len(),
+            1,
+            "only the untouched stage's column is left"
+        );
+
+        // Asking twice is not an error, and costs the second stage nothing.
+        assert_eq!(
+            fx.store
+                .write(move |conn| forget_stage_samples(conn, run, group, &[0]))
+                .unwrap(),
+            0
+        );
+        assert!(fx
+            .store
+            .read(move |conn| stage_signals(conn, run, group, 1))
+            .unwrap()[0]
+            .blob_id
+            .is_some());
+    }
+
+    #[test]
+    fn a_shared_blob_survives_one_of_its_rows_forgetting_it() {
+        // Two stages passing the same column through hold one blob between
+        // them: forgetting one drops a reference, not the samples (§5.3).
+        let fx = fixture(1);
+        let pipeline = saved_pipeline(&fx.store);
+        let group = fx.groups[0];
+        let run = fx
+            .store
+            .write(move |conn| {
+                let run = begin_run(conn, &NewRun::new(pipeline, "hash-10"))?;
+                record_signal(
+                    conn,
+                    run,
+                    &NewRunSignal::new(group, 0, 0, "rf", Timebase::regular(10.0, 0.0))
+                        .with_samples(buffer(&[4.0, 5.0])),
+                )?;
+                let blob_id = stage_signals(conn, run, group, 0)?[0].blob_id.unwrap();
+                record_signal(
+                    conn,
+                    run,
+                    &NewRunSignal::new(group, 1, 0, "rf", Timebase::regular(10.0, 0.0))
+                        .with_disposition(Disposition::Passthrough)
+                        .sharing_blob(blob_id, 2, SignalStats::default()),
+                )?;
+                Ok(run)
+            })
+            .unwrap();
+
+        fx.store
+            .write(move |conn| forget_stage_samples(conn, run, group, &[0]))
+            .unwrap();
+
+        let kept = fx
+            .store
+            .read(move |conn| stage_signals(conn, run, group, 1))
+            .unwrap();
+        let blob_id = kept[0].blob_id.expect("the passthrough still has it");
+        assert_eq!(
+            fx.store
+                .read(move |conn| blob::read_column(conn, blob_id, SampleRange::first(2)))
+                .unwrap()
+                .to_f64(),
+            vec![4.0, 5.0]
+        );
+    }
+
+    #[test]
+    fn cache_keys_can_be_counted_forgotten_and_cleared() {
+        let fx = fixture(1);
+        let pipeline = saved_pipeline(&fx.store);
+        let group = fx.groups[0];
+        fx.store
+            .write(move |conn| {
+                let run = begin_run(conn, &NewRun::new(pipeline, "hash-11"))?;
+                for (index, key) in ["key-c", "key-d", "key-e"].iter().enumerate() {
+                    cache_put(
+                        conn,
+                        key,
+                        CacheHit {
+                            run_id: run,
+                            group_id: group,
+                            stage_ordinal: index as i32,
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fx.store.read(cache_entries).unwrap(), 3);
+
+        assert!(fx.store.write(|conn| cache_forget(conn, "key-d")).unwrap());
+        assert!(
+            !fx.store.write(|conn| cache_forget(conn, "key-d")).unwrap(),
+            "forgetting what is already gone says so rather than failing"
+        );
+        assert_eq!(fx.store.read(cache_entries).unwrap(), 2);
+
+        assert_eq!(fx.store.write(|conn| clear_cache(conn)).unwrap(), 2);
+        assert_eq!(fx.store.read(cache_entries).unwrap(), 0);
+        assert!(fx
+            .store
+            .read(|conn| cache_lookup(conn, "key-c"))
             .unwrap()
             .is_none());
     }

@@ -103,6 +103,54 @@ impl Retention {
     }
 }
 
+/// A ceiling on the sample bytes one run records (§9.5).
+///
+/// It is a limit on storage, never on evidence: past the cap a stage still
+/// records what it did to every signal, its statistics, its metrics and its
+/// diagnostics — only the samples are left out, and the stage says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleCap {
+    /// Record every sample a run produces, which is what a workbench wants.
+    #[default]
+    Unlimited,
+    /// Mebibytes. Zero is a real choice: a run that wants the numbers and
+    /// none of the waveforms behind them.
+    Mib(u64),
+}
+
+impl SampleCap {
+    /// The cap in bytes, or `None` when there is none.
+    #[must_use]
+    pub const fn bytes(self) -> Option<u64> {
+        match self {
+            Self::Unlimited => None,
+            Self::Mib(mib) => Some(mib * 1024 * 1024),
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Unlimited => "Record every sample".to_owned(),
+            Self::Mib(0) => "Record no samples, only what stages measured".to_owned(),
+            Self::Mib(mib) => format!("Stop keeping samples past {mib} MiB"),
+        }
+    }
+
+    /// The choices the Settings screen offers.
+    #[must_use]
+    pub fn choices() -> Vec<Self> {
+        vec![
+            Self::Unlimited,
+            Self::Mib(4096),
+            Self::Mib(1024),
+            Self::Mib(256),
+            Self::Mib(0),
+        ]
+    }
+}
+
 /// Everything the Settings screen edits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -116,6 +164,8 @@ pub struct Settings {
     pub import_mode: CountMode,
     /// What happens to old runs when a new one finishes (§9.6).
     pub retention: Retention,
+    /// How much of what a run produces is kept as samples (§9.5).
+    pub sample_cap: SampleCap,
     /// How hard the scope's reducer works per frame (§11.4).
     pub decimation: Quality,
     /// Bins in the Inspector's histogram.
@@ -134,6 +184,7 @@ impl Default for Settings {
             default_sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
             import_mode: CountMode::default(),
             retention: Retention::default(),
+            sample_cap: SampleCap::default(),
             decimation: Quality::default(),
             histogram_bins: DEFAULT_BINS,
             external_libraries: Vec::new(),
@@ -234,6 +285,7 @@ mod tests {
             default_sample_rate_hz: 1_000_000.0,
             import_mode: CountMode::Strict,
             retention: Retention::Keep(5),
+            sample_cap: SampleCap::Mib(256),
             decimation: Quality::Fine,
             histogram_bins: 128,
             external_libraries: vec![PathBuf::from("/opt/vendor/libeq.so")],
@@ -294,6 +346,18 @@ mod tests {
             chosen.library_file(default),
             Some(PathBuf::from("/elsewhere/lib.db"))
         );
+    }
+
+    #[test]
+    fn a_sample_cap_reads_as_a_sentence_and_converts_to_bytes() {
+        assert_eq!(SampleCap::Unlimited.bytes(), None);
+        assert_eq!(SampleCap::Mib(256).bytes(), Some(256 * 1024 * 1024));
+        // Zero is a cap, not the absence of one: the numbers without the
+        // waveforms behind them.
+        assert_eq!(SampleCap::Mib(0).bytes(), Some(0));
+        assert_eq!(SampleCap::Unlimited.label(), "Record every sample");
+        assert!(SampleCap::Mib(1024).label().contains("1024 MiB"));
+        assert!(SampleCap::choices().contains(&SampleCap::Unlimited));
     }
 
     #[test]

@@ -20,11 +20,11 @@
 //! per group, and `end_run` runs after the last group on one fresh instance of
 //! each stage, whose artifacts are recorded run-level.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use sp_core::run::{AssertStatus, Disposition, RunStatus, StageStatus};
+use sp_core::run::{AssertStatus, Diagnostic, Disposition, Retention, RunStatus, StageStatus};
 use sp_core::{DatasetId, GroupId, PipelineId, RunId};
 use sp_store::regress::{self, AssertionResultRow};
 use sp_store::runs::{
@@ -134,6 +134,9 @@ pub struct RunOptions {
     pub in_flight_cap: usize,
     /// Whether a stage whose cache key is already recorded may reuse it.
     pub use_cache: bool,
+    /// How many bytes of samples this run may record before it keeps only
+    /// what a stage said about them (§9.5). `None` records everything.
+    pub sample_cap_bytes: Option<u64>,
     /// Recorded on the run, for the dataset the groups came from.
     pub dataset_id: Option<DatasetId>,
     /// The run a `baseline` reference in an assertion resolves against
@@ -151,6 +154,7 @@ impl Default for RunOptions {
                 .unwrap_or(2)
                 .clamp(1, 8),
             use_cache: true,
+            sample_cap_bytes: None,
             dataset_id: None,
             baseline_run: None,
             notes: None,
@@ -170,6 +174,14 @@ impl RunOptions {
     #[must_use]
     pub fn without_cache(mut self) -> Self {
         self.use_cache = false;
+        self
+    }
+
+    /// Caps the sample bytes the run records. Past the cap a stage records
+    /// what it did and what it measured, but not the samples themselves.
+    #[must_use]
+    pub fn with_sample_cap(mut self, bytes: Option<u64>) -> Self {
+        self.sample_cap_bytes = bytes;
         self
     }
 
@@ -270,6 +282,7 @@ pub fn run_pipeline(
         options: options.clone(),
         control: control.clone(),
         groups_total: groups.len(),
+        budget: SampleBudget::new(options.sample_cap_bytes),
     };
 
     let outcomes = run_groups(&ctx, groups);
@@ -348,6 +361,52 @@ struct RunEnv<'a> {
     options: RunOptions,
     control: RunControl,
     groups_total: usize,
+    budget: SampleBudget,
+}
+
+/// The run-level size cap (§9.5), shared by every group in flight.
+///
+/// A stage asks for room before its samples are written. A stage that does
+/// not get it records everything except the samples — the row, its
+/// disposition, its statistics, its metrics — which is what makes the cap a
+/// limit on storage rather than on evidence. The claim is per stage, not a
+/// latch: one stage too big to fit does not stop a smaller one later.
+#[derive(Debug)]
+struct SampleBudget {
+    cap: Option<u64>,
+    recorded: AtomicU64,
+}
+
+impl SampleBudget {
+    fn new(cap: Option<u64>) -> Self {
+        Self {
+            cap,
+            recorded: AtomicU64::new(0),
+        }
+    }
+
+    /// Takes `bytes` out of what is left, or reports that they do not fit.
+    fn claim(&self, bytes: u64) -> bool {
+        let Some(cap) = self.cap else {
+            return true;
+        };
+        let mut recorded = self.recorded.load(Ordering::Relaxed);
+        loop {
+            let next = recorded.saturating_add(bytes);
+            if next > cap {
+                return false;
+            }
+            match self.recorded.compare_exchange_weak(
+                recorded,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => recorded = actual,
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -518,6 +577,10 @@ fn run_group(ctx: &RunEnv<'_>, group_id: GroupId) -> Result<GroupOutcome> {
         }
     }
 
+    if outcome.status == RunStatus::Ok {
+        sweep_on_failure_samples(ctx, group_id)?;
+    }
+
     let wall_ms = started.elapsed().as_millis() as u64;
     let status = outcome.status;
     ctx.store.write(move |conn| {
@@ -533,6 +596,37 @@ fn run_group(ctx: &RunEnv<'_>, group_id: GroupId) -> Result<GroupOutcome> {
         )
     })?;
     Ok(outcome)
+}
+
+/// Forgets the samples of every `on_failure` stage, now that the group has
+/// come out well and they are not the evidence they were kept against (§9.5).
+///
+/// The rows stay. What the stage did to each signal, and what it measured, is
+/// still on record — a group that passed is read for its numbers, not for its
+/// intermediate waveforms.
+fn sweep_on_failure_samples(ctx: &RunEnv<'_>, group_id: GroupId) -> Result<()> {
+    let provisional: Vec<i32> = ctx
+        .pipeline
+        .enabled()
+        .filter(|(_, stage)| stage.retention == Retention::OnFailure)
+        .map(|(ordinal, _)| ordinal as i32)
+        .collect();
+    if provisional.is_empty() {
+        return Ok(());
+    }
+    let run = ctx.run;
+    let forgotten = ctx
+        .store
+        .write(move |conn| runs::forget_stage_samples(conn, run, group_id, &provisional))?;
+    if forgotten > 0 {
+        tracing::debug!(
+            run = run.get(),
+            group = group_id.get(),
+            forgotten,
+            "on-failure samples swept from a group that passed"
+        );
+    }
+    Ok(())
 }
 
 /// How one group's assertions turned out.
@@ -760,6 +854,11 @@ fn reuse_cached(
         Ok(copied)
     })?;
     if copied == 0 {
+        // The key outlived the rows it named. Unpublish it so the next lookup
+        // misses cleanly rather than paying for the same disappointment.
+        let stale = key.to_owned();
+        ctx.store
+            .write(move |conn| runs::cache_forget(conn, &stale))?;
         return Ok(false);
     }
 
@@ -832,7 +931,16 @@ fn record_stage_output(
     wall_ms: u64,
 ) -> Result<GroupFrame> {
     let run = ctx.run;
-    let keep_samples = stage.retention.keeps_samples(false);
+    // `on_failure` is written now and swept when the group turns out well
+    // (§9.5): whether this group fails is not known until its last stage has
+    // run, and the samples a failure is diagnosed from are exactly the ones
+    // that would be gone by then.
+    let mut keep_samples = stage.retention.writes_samples();
+    let mut capped = false;
+    if keep_samples && !ctx.budget.claim(fresh_sample_bytes(output)) {
+        keep_samples = false;
+        capped = true;
+    }
     let dispositions = GroupFrame::dispositions(output);
 
     let mut rows: Vec<NewRunSignal> = Vec::with_capacity(after.signals.len());
@@ -890,9 +998,25 @@ fn record_stage_output(
     stage_row.wall_ms = Some(wall_ms);
     stage_row.metrics.clone_from(&output.metrics);
     stage_row.diagnostics.clone_from(&output.diagnostics);
+    if capped {
+        tracing::warn!(
+            run = run.get(),
+            group = group_id.get(),
+            stage = ordinal,
+            "the run's sample cap is reached; this stage's samples were not kept"
+        );
+        stage_row.diagnostics.push(Diagnostic::warn(
+            "the run's sample cap is reached, so this stage recorded what it did but not the \
+             samples it produced",
+        ));
+    }
 
-    let publish_cache =
-        keep_samples && ctx.registry.descriptor(&stage.kind).is_some_and(|d| d.pure);
+    // Only `always` output is published: a key must point at samples that are
+    // still there, and `on_failure` output is swept the moment the group comes
+    // out well. Output the cap turned away has no samples to point at either.
+    let publish_cache = keep_samples
+        && stage.retention == Retention::Always
+        && ctx.registry.descriptor(&stage.kind).is_some_and(|d| d.pure);
     let key_owned = key.to_owned();
 
     ctx.store.write(move |conn| {
@@ -924,6 +1048,23 @@ fn record_stage_output(
     } else {
         Ok(after)
     }
+}
+
+/// The bytes a stage's output would add to the library: what it produced,
+/// not what it passed through. A passthrough shares the blob it was given, so
+/// it costs nothing and counts for nothing (§5.3).
+fn fresh_sample_bytes(output: &StageOutput) -> u64 {
+    output
+        .signals
+        .iter()
+        .map(|out| match out {
+            crate::stage::SignalOut::Replace { samples, .. }
+            | crate::stage::SignalOut::Add { samples, .. } => {
+                samples.len() as u64 * samples.dtype().size_bytes() as u64
+            }
+            crate::stage::SignalOut::Passthrough { .. } | crate::stage::SignalOut::Drop { .. } => 0,
+        })
+        .sum()
 }
 
 fn signal_row(

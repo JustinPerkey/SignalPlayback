@@ -23,7 +23,7 @@ use sp_store::stats::{self, StorageStats};
 use sp_store::{LibrarySummary, Store};
 
 use crate::jobs;
-use crate::settings::{Retention, Settings, ThemeChoice, MAX_BINS, MIN_BINS};
+use crate::settings::{Retention, SampleCap, Settings, ThemeChoice, MAX_BINS, MIN_BINS};
 use crate::typography;
 use crate::ui;
 
@@ -55,6 +55,7 @@ choice!(QualityEntry, Quality, |quality: Quality| match quality {
     Quality::Fine => "Fine — twice the detail per pixel".to_owned(),
 });
 choice!(RetentionEntry, Retention, Retention::label);
+choice!(CapEntry, SampleCap, SampleCap::label);
 
 #[derive(Debug, Default)]
 pub struct State {
@@ -86,6 +87,7 @@ pub enum Message {
     ModePicked(ModeEntry),
     QualityPicked(QualityEntry),
     RetentionPicked(RetentionEntry),
+    CapPicked(CapEntry),
     RateChanged(String),
     RateCommitted,
     ChooseLibrary,
@@ -95,6 +97,8 @@ pub enum Message {
     Storage(Result<(LibrarySummary, StorageStats), String>),
     Sweep,
     Swept(Result<usize, String>),
+    ClearCache,
+    CacheCleared(Result<usize, String>),
     UseHistogramBins(usize),
     AddExternalLibrary,
     ExternalLibraryChosen(Option<PathBuf>),
@@ -160,6 +164,11 @@ impl State {
             }
             Message::RetentionPicked(RetentionEntry(retention)) => {
                 self.settings.retention = retention;
+                self.changed = true;
+                Task::none()
+            }
+            Message::CapPicked(CapEntry(cap)) => {
+                self.settings.sample_cap = cap;
                 self.changed = true;
                 Task::none()
             }
@@ -284,6 +293,32 @@ impl State {
                     }),
                     Message::Swept,
                 )
+            }
+            Message::ClearCache => {
+                let Some(store) = store else {
+                    self.error = Some("No library is open.".to_owned());
+                    return Task::none();
+                };
+                // Only the keys go. The output they named belongs to the run
+                // that recorded it and stays exactly where it was (§9.5).
+                Task::perform(
+                    jobs::write(store.clone(), |conn| sp_store::runs::clear_cache(conn)),
+                    Message::CacheCleared,
+                )
+            }
+            Message::CacheCleared(result) => {
+                match result {
+                    Ok(0) => self.notice = Some("The stage cache was already empty.".to_owned()),
+                    Ok(n) => {
+                        self.notice = Some(format!(
+                            "Unpublished {n} stage cache {}. The next run recomputes; nothing \
+                             recorded was deleted.",
+                            if n == 1 { "key" } else { "keys" }
+                        ));
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+                store.map_or_else(Task::none, |store| self.load(store))
             }
             Message::Swept(result) => {
                 match result {
@@ -512,6 +547,26 @@ impl State {
             text("A run a baseline names is never deleted, whatever the limit.")
                 .size(typography::LABEL_SIZE)
                 .style(ui::dim),
+            labelled(
+                "Samples one run may record",
+                pick_list(
+                    SampleCap::choices()
+                        .into_iter()
+                        .map(CapEntry)
+                        .collect::<Vec<_>>(),
+                    Some(CapEntry(self.settings.sample_cap)),
+                    Message::CapPicked,
+                )
+                .text_size(typography::BODY_SIZE)
+                .width(Length::Fixed(300.0))
+                .into(),
+            ),
+            text(
+                "Past the cap a stage still records what it did and what it measured; only the \
+                 samples are left out, and it says so.",
+            )
+            .size(typography::LABEL_SIZE)
+            .style(ui::dim),
             labelled("Inspector histogram bins", bin_buttons.into()),
         ]
         .spacing(8)
@@ -523,6 +578,7 @@ impl State {
             heading("This library"),
             Space::with_width(Length::Fill),
             command("Refresh", Message::Refresh),
+            command("Clear stage cache", Message::ClearCache),
             command("Reclaim unused blobs", Message::Sweep),
         ]
         .spacing(6)
@@ -560,6 +616,7 @@ impl State {
             ("Pipelines", storage.pipelines.to_string()),
             ("Runs", storage.runs.to_string()),
             ("Artifacts", storage.artifacts.to_string()),
+            ("Stage cache keys", storage.cache_entries.to_string()),
             ("Baselines", storage.baselines.to_string()),
             ("Samples and pulse fields", fmt_bytes(storage.sample_bytes)),
             ("Render pyramids", fmt_bytes(storage.pyramid_bytes)),
@@ -567,7 +624,7 @@ impl State {
             ("Unreferenced", fmt_bytes(storage.unreferenced_bytes)),
             ("File on disk", fmt_bytes(storage.file_bytes)),
         ];
-        // Sixteen counts, read down a column. A caption on the left and a
+        // Seventeen counts, read down a column. A caption on the left and a
         // flush-right reading on the right lets the eye run down either the
         // names or the figures without tracking across the pair.
         for (label, value) in rows {
@@ -824,6 +881,35 @@ mod tests {
         );
         assert_eq!(state.settings().retention, Retention::Keep(5));
         assert!(state.take_changed());
+
+        let _ = state.update(None, Message::CapPicked(CapEntry(SampleCap::Mib(1024))));
+        assert_eq!(state.settings().sample_cap, SampleCap::Mib(1024));
+        assert!(state.take_changed());
+    }
+
+    #[test]
+    fn clearing_the_cache_needs_a_library_and_says_what_it_unpublished() {
+        let mut state = state();
+        let _ = state.update(None, Message::ClearCache);
+        assert_eq!(state.error.as_deref(), Some("No library is open."));
+
+        let _ = state.update(None, Message::CacheCleared(Ok(0)));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("The stage cache was already empty.")
+        );
+        let _ = state.update(None, Message::CacheCleared(Ok(1)));
+        let notice = state.notice.clone().unwrap();
+        assert!(
+            notice.starts_with("Unpublished 1 stage cache key."),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("nothing recorded was deleted"),
+            "clearing keys must not read as deleting runs: {notice}"
+        );
+        let _ = state.update(None, Message::CacheCleared(Ok(3)));
+        assert!(state.notice.clone().unwrap().contains("3 stage cache keys"));
     }
 
     #[test]

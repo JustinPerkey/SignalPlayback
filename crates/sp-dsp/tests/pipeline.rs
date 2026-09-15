@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sp_core::run::{Disposition, RunStatus, StageStatus};
+use sp_core::run::{Disposition, Retention, RunStatus, StageStatus};
 use sp_core::time::SampleRange;
 use sp_core::{DType, DatasetId, GroupId, PipelineId, RunId, SampleBuffer, SourceKind, Timebase};
 use sp_dsp::artifacts::{Detections, Statistics};
@@ -144,6 +144,27 @@ fn run_saved(
         &lib.groups,
         options,
         control,
+    )
+    .expect("the run itself should not fail")
+}
+
+/// Runs a freshly saved pipeline over some of the library's groups.
+fn run_over(
+    lib: &Library,
+    registry: &StageRegistry,
+    pipeline: &Pipeline,
+    groups: &[GroupId],
+    options: &RunOptions,
+) -> RunSummary {
+    let id = save(&lib.store, pipeline);
+    run_pipeline(
+        &lib.store,
+        registry,
+        id,
+        pipeline,
+        groups,
+        options,
+        &RunControl::new(),
     )
     .expect("the run itself should not fail")
 }
@@ -608,4 +629,342 @@ fn deleting_a_run_leaves_the_library_as_it_was() {
         "every blob the run added is released"
     );
     assert_eq!(after.signals, before.signals);
+}
+
+// ---------------------------------------------------------------------------
+// Retention and the run-level cap (§9.5)
+// ---------------------------------------------------------------------------
+
+/// Whether a stage's recorded signals still have their samples.
+fn has_samples(lib: &Library, run: RunId, group: GroupId, stage: i32) -> bool {
+    let rows = lib
+        .store
+        .read(|conn| runs::stage_signals(conn, run, group, stage))
+        .unwrap();
+    assert!(!rows.is_empty(), "the stage recorded nothing at all");
+    rows.iter().all(|row| row.blob_id.is_some())
+}
+
+#[test]
+fn a_never_kept_stage_records_what_it_did_but_not_the_samples() {
+    let lib = library();
+    let registry = sp_dsp::registry().unwrap();
+    let pipeline = Pipeline::new("frugal")
+        .with_stage(PipelineStage::new("dsp.condition.detrend").with_retention(Retention::Never))
+        .with_stage(PipelineStage::new("dsp.measure.statistics"));
+
+    let summary = run(&lib, &registry, &pipeline, &RunOptions::default());
+    assert_eq!(summary.status, RunStatus::Ok);
+
+    let group = lib.groups[0];
+    assert!(!has_samples(&lib, summary.run, group, 0));
+    assert!(
+        has_samples(&lib, summary.run, group, 1),
+        "the stage after it kept its own, and had samples to work from"
+    );
+
+    // The row is still the full account of what happened to the signal.
+    let rows = lib
+        .store
+        .read(|conn| runs::stage_signals(conn, summary.run, group, 0))
+        .unwrap();
+    assert_eq!(rows[0].name, "rf");
+    assert_eq!(rows[0].disposition, Disposition::Replaced);
+    assert_eq!(rows[0].sample_count, 16);
+    assert!(rows[0].stats.rms().is_some(), "the statistics survive");
+
+    let stages = lib
+        .store
+        .read(|conn| runs::group_stages(conn, summary.run, group))
+        .unwrap();
+    assert!(stages[1].metrics.contains_key("rf.rms"));
+}
+
+#[test]
+fn an_on_failure_stage_keeps_its_samples_only_for_the_group_that_failed() {
+    // Group 2 is sampled at 100 Hz, so the 200 Hz corner is above its Nyquist
+    // frequency and the filter refuses it — the one group whose intermediate
+    // waveform is worth keeping (§9.5).
+    let lib = library();
+    let registry = sp_dsp::registry().unwrap();
+    let pipeline = Pipeline::new("diagnosable")
+        .with_stage(
+            PipelineStage::new("dsp.condition.detrend").with_retention(Retention::OnFailure),
+        )
+        .with_stage(
+            PipelineStage::new("dsp.filter.biquad")
+                .with_param("cutoff_hz", 200.0)
+                .with_param("sections", 2),
+        );
+
+    let summary = run(&lib, &registry, &pipeline, &RunOptions::default());
+    assert_eq!(summary.status, RunStatus::Failed);
+    assert_eq!(summary.groups_failed, 1);
+
+    assert!(
+        has_samples(&lib, summary.run, lib.groups[2], 0),
+        "the failed group keeps what it was diagnosed from"
+    );
+    assert!(
+        !has_samples(&lib, summary.run, lib.groups[0], 0),
+        "a group that passed sheds them again"
+    );
+    assert!(!has_samples(&lib, summary.run, lib.groups[1], 0));
+
+    // Shedding them is not deleting the row: the account of the stage stays.
+    let rows = lib
+        .store
+        .read(|conn| runs::stage_signals(conn, summary.run, lib.groups[0], 0))
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].disposition, Disposition::Replaced);
+}
+
+#[test]
+fn an_on_failure_stage_is_never_published_to_the_cache() {
+    // Its samples go the moment the group comes out well, so a key pointing
+    // at them would resolve to rows without samples (§9.5).
+    let lib = library();
+    let registry = sp_dsp::registry().unwrap();
+    let pipeline = Pipeline::new("provisional").with_stage(
+        PipelineStage::new("dsp.condition.detrend").with_retention(Retention::OnFailure),
+    );
+    let id = save(&lib.store, &pipeline);
+
+    run_saved(
+        &lib,
+        &registry,
+        &pipeline,
+        id,
+        &RunOptions::default(),
+        &RunControl::new(),
+    );
+    let again = run_saved(
+        &lib,
+        &registry,
+        &pipeline,
+        id,
+        &RunOptions::default(),
+        &RunControl::new(),
+    );
+
+    assert_eq!(again.stages_cached, 0);
+    assert_eq!(again.stages_run, 3);
+    assert_eq!(
+        lib.store.read(runs::cache_entries).unwrap(),
+        0,
+        "nothing was published"
+    );
+}
+
+#[test]
+fn a_run_past_its_sample_cap_records_the_account_without_the_samples() {
+    let lib = library();
+    let registry = sp_dsp::registry().unwrap();
+    // Two signals of sixteen f64 samples: 256 bytes a stage over one group.
+    // A cap of 256 lets the first stage through and turns the second away.
+    let pipeline = Pipeline::new("capped")
+        .with_stage(PipelineStage::new("dsp.condition.detrend"))
+        .with_stage(PipelineStage::new("dsp.condition.gain").with_param("gain", 2.0));
+
+    let summary = run_over(
+        &lib,
+        &registry,
+        &pipeline,
+        &lib.groups[..1],
+        &RunOptions::default().with_sample_cap(Some(256)),
+    );
+    assert_eq!(summary.status, RunStatus::Ok, "a cap is not a failure");
+
+    let group = lib.groups[0];
+    assert!(has_samples(&lib, summary.run, group, 0));
+    assert!(!has_samples(&lib, summary.run, group, 1));
+
+    let stages = lib
+        .store
+        .read(|conn| runs::group_stages(conn, summary.run, group))
+        .unwrap();
+    assert!(
+        stages[1]
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("cap")),
+        "the stage says why its samples are not there: {:?}",
+        stages[1].diagnostics
+    );
+    // What it did is still on record, cap or no cap.
+    let rows = lib
+        .store
+        .read(|conn| runs::stage_signals(conn, summary.run, group, 1))
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].disposition, Disposition::Replaced);
+    assert_eq!(rows[0].sample_count, 16);
+}
+
+#[test]
+fn a_capped_stage_is_not_published_to_the_cache_either() {
+    let lib = library();
+    let registry = sp_dsp::registry().unwrap();
+    let pipeline = Pipeline::new("capped")
+        .with_stage(PipelineStage::new("dsp.condition.detrend"))
+        .with_stage(PipelineStage::new("dsp.condition.gain").with_param("gain", 2.0));
+    let id = save(&lib.store, &pipeline);
+    let groups = &lib.groups[..1];
+
+    run_pipeline(
+        &lib.store,
+        &registry,
+        id,
+        &pipeline,
+        groups,
+        &RunOptions::default().with_sample_cap(Some(256)),
+        &RunControl::new(),
+    )
+    .unwrap();
+    // Uncapped this time: the first stage is reused, the second has to run
+    // again because nothing was published for it.
+    let again = run_pipeline(
+        &lib.store,
+        &registry,
+        id,
+        &pipeline,
+        groups,
+        &RunOptions::default(),
+        &RunControl::new(),
+    )
+    .unwrap();
+    assert_eq!(again.stages_cached, 1);
+    assert_eq!(again.stages_run, 1);
+    assert!(has_samples(&lib, again.run, lib.groups[0], 1));
+}
+
+#[test]
+fn a_cached_run_records_what_a_cold_run_records() {
+    // The M10 exit criterion: reuse changes what the run costs, never what it
+    // says (§16.1).
+    let lib = library();
+    let registry = sp_dsp::registry().unwrap();
+    let pipeline = conditioning();
+    let id = save(&lib.store, &pipeline);
+
+    let cold = run_saved(
+        &lib,
+        &registry,
+        &pipeline,
+        id,
+        &RunOptions::default().without_cache(),
+        &RunControl::new(),
+    );
+    let warm = run_saved(
+        &lib,
+        &registry,
+        &pipeline,
+        id,
+        &RunOptions::default(),
+        &RunControl::new(),
+    );
+    assert_eq!(warm.stages_run, 0);
+    assert_eq!(warm.stages_cached, cold.stages_run);
+
+    for &group in &lib.groups {
+        for stage in SOURCE_STAGE..5 {
+            let cold_rows = lib
+                .store
+                .read(|conn| runs::stage_signals(conn, cold.run, group, stage))
+                .unwrap();
+            let warm_rows = lib
+                .store
+                .read(|conn| runs::stage_signals(conn, warm.run, group, stage))
+                .unwrap();
+            assert_eq!(cold_rows.len(), warm_rows.len(), "stage {stage}");
+            for (cold_row, warm_row) in cold_rows.iter().zip(&warm_rows) {
+                assert_eq!(cold_row.name, warm_row.name);
+                assert_eq!(cold_row.disposition, warm_row.disposition);
+                assert_eq!(cold_row.attributes, warm_row.attributes);
+                assert_eq!(cold_row.sample_count, warm_row.sample_count);
+            }
+            for ordinal in 0..cold_rows.len() {
+                assert_eq!(
+                    samples(&lib, cold.run, group, stage, ordinal),
+                    samples(&lib, warm.run, group, stage, ordinal),
+                    "stage {stage}, signal {ordinal}"
+                );
+            }
+        }
+
+        let cold_stages = lib
+            .store
+            .read(|conn| runs::group_stages(conn, cold.run, group))
+            .unwrap();
+        let warm_stages = lib
+            .store
+            .read(|conn| runs::group_stages(conn, warm.run, group))
+            .unwrap();
+        for (cold_stage, warm_stage) in cold_stages.iter().zip(&warm_stages) {
+            assert_eq!(cold_stage.metrics, warm_stage.metrics);
+            assert_eq!(cold_stage.diagnostics, warm_stage.diagnostics);
+        }
+
+        let cold_artifacts = lib
+            .store
+            .read(|conn| runs::stage_artifacts(conn, cold.run, Some(group), 4))
+            .unwrap();
+        let warm_artifacts = lib
+            .store
+            .read(|conn| runs::stage_artifacts(conn, warm.run, Some(group), 4))
+            .unwrap();
+        assert_eq!(cold_artifacts.len(), warm_artifacts.len());
+        for (cold_artifact, warm_artifact) in cold_artifacts.iter().zip(&warm_artifacts) {
+            assert_eq!(cold_artifact.kind, warm_artifact.kind);
+            assert_eq!(
+                lib.store
+                    .read(|conn| runs::artifact_payload(conn, cold_artifact))
+                    .unwrap(),
+                lib.store
+                    .read(|conn| runs::artifact_payload(conn, warm_artifact))
+                    .unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_key_whose_run_is_gone_is_unpublished_rather_than_followed() {
+    let lib = library();
+    let registry = sp_dsp::registry().unwrap();
+    let pipeline = conditioning();
+    let id = save(&lib.store, &pipeline);
+
+    let first = run_saved(
+        &lib,
+        &registry,
+        &pipeline,
+        id,
+        &RunOptions::default(),
+        &RunControl::new(),
+    );
+    assert!(lib.store.read(runs::cache_entries).unwrap() > 0);
+
+    // Deleting the run takes its output with it. The keys go with the rows
+    // they named, so the next run recomputes rather than following one.
+    lib.store
+        .write(move |conn| runs::delete_run(conn, first.run))
+        .unwrap();
+    assert_eq!(lib.store.read(runs::cache_entries).unwrap(), 0);
+
+    let again = run_saved(
+        &lib,
+        &registry,
+        &pipeline,
+        id,
+        &RunOptions::default(),
+        &RunControl::new(),
+    );
+    assert_eq!(again.stages_cached, 0);
+    assert_eq!(again.stages_run, 3 * 5);
+    assert_eq!(
+        samples(&lib, again.run, lib.groups[0], 2, 0)[0],
+        -3.75 * 2.0
+    );
 }

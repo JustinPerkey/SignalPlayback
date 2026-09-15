@@ -10,7 +10,35 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
 ## Status
 
-**M8 — Polish.** The last milestone: the loop runs end to end and the binary is
+**M10 — Stage cache.** The first milestone of the 1.x track to touch the
+scheduler: editing stage *n* re-runs stages *n…end* and no more, and a cached
+run records exactly what a cold run records.
+
+- **Content-hash reuse** — a stage's key folds its kind, version, parameters,
+  whatever the instance adds (an external library's file hash) and the content
+  hashes of everything it will read. A hit is copied into the new run, sharing
+  blobs rather than pointing across runs, so a cached stage is
+  indistinguishable from one that ran apart from its `cached` status, and
+  deleting either run leaves the other whole.
+- **Retention per stage** — `Always`, `OnFailure` or `Never`. `OnFailure` is
+  written as the stage records and swept when the group comes out well: a
+  group's fate is not settled until its last stage has run, and the samples a
+  failure is diagnosed from are exactly the ones that would already be gone.
+  Sweeping drops the samples, never the row — what the stage did to each
+  signal, and what it measured, stays on record.
+- **A run-level sample cap** — settings and `--sample-cap` bound the bytes one
+  run records. Past the cap a stage records everything except the samples and
+  says so in a diagnostic: the cap limits storage, never evidence.
+- **Cache hygiene** — only `always` output is published, since a key must point
+  at samples that are still there; a key whose rows are gone is unpublished on
+  the lookup that finds it dangling; and Settings reports how many keys are
+  published, with `Clear stage cache` beside the figure.
+
+Before it, **M9 — External stages**: an algorithm that was never written in
+Rust runs as a stage, one group at a time, over a flat C ABI, with the
+library's path, hash and version recorded in every run.
+
+**M8 — Polish** closed the MVP: the loop runs end to end and the binary is
 releasable.
 
 - **Inspector** — one signal or pulse field in full: its metadata, an editable
@@ -85,6 +113,7 @@ the application; with a subcommand it runs to completion on the terminal:
 signalplayback run --library lib.db --pipeline "detector" \
                    --dataset "impairment ladder" --assert-baseline golden
 signalplayback run --library lib.db --pipeline "detector" --promote golden
+signalplayback run --library lib.db --pipeline "detector" --sample-cap 512
 signalplayback baselines --library lib.db
 signalplayback import --library lib.db --file capture.csv --name "capture 1"
 signalplayback export --library lib.db --dataset "capture 1" --out out.csv
@@ -109,7 +138,7 @@ Dependencies point left-to-right only: `sp-core` depends on nothing else here,
 | `sp-csv` | Grouped-block CSV framer, parser, import profiles, writer | M2 |
 | `sp-gen` | `GenSpec` node tree and its renderer | M3 |
 | `sp-engine` | Transport state machine, playback clock, render pyramids | M4 |
-| `sp-proc` | `Stage` trait, registry, ports, scheduler, run recording, assertions, run diffing | M5, M7 |
+| `sp-proc` | `Stage` trait, registry, ports, scheduler, run recording, assertions, run diffing, the stage cache key and the sample cap | M5, M7, M10 |
 | `sp-dsp` | Built-in stages: conditioning, filtering, transforms, detection | M5 |
 | `sp-app` | The Iced application — the only crate that knows about pixels | M0+ |
 
@@ -138,6 +167,7 @@ each change as it is made:
 | Default sample rate | The rate a new generator spec starts at |
 | Strict / tolerant import | Whether an import refuses a file whose counts do not add up |
 | Retention | Finished runs kept per pipeline; a run a baseline names is never deleted |
+| Sample cap | Bytes of samples one run may record before it keeps only what its stages said about them |
 | Decimation quality | Shifts the scope's automatic pyramid level by one either way |
 | Histogram bins | Resolution of the Inspector's histogram |
 
