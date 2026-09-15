@@ -851,6 +851,111 @@ mod tests {
     }
 
     #[test]
+    fn every_screen_in_the_rail_can_be_navigated_to_and_drawn() {
+        // The rail, the header and the status bar are rebuilt for every
+        // screen, so each of the ten is opened and drawn in turn.
+        let dir = tempfile::tempdir().unwrap();
+        let mut opened = app_in(dir.path());
+        for screen in Screen::ALL {
+            let _ = opened.update(Message::Nav(screen));
+            assert_eq!(opened.screen, screen);
+            assert_eq!(
+                opened.title(),
+                format!("SignalPlayback — {}", screen.label())
+            );
+            let _ = opened.view();
+        }
+
+        // And with no library open, which is what the status bar reports.
+        let mut app = app();
+        assert!(app.store.is_none());
+        for screen in Screen::ALL {
+            let _ = app.update(Message::Nav(screen));
+            let _ = app.view();
+        }
+    }
+
+    #[test]
+    fn the_theme_button_in_the_header_toggles_the_same_setting_the_rail_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let before = app.settings.theme;
+        let _ = app.update(Message::ToggleTheme);
+        assert_ne!(app.settings.theme, before);
+        let _ = app.view();
+    }
+
+    #[test]
+    fn inspecting_from_the_library_opens_the_inspector_on_that_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        assert_eq!(app.screen, Screen::Library);
+
+        let target = inspector::Target::Signal(sp_core::SignalId::new(7));
+        let _ = app.update(Message::Library(library::Message::Inspect(target)));
+        assert_eq!(
+            app.screen,
+            Screen::Inspector,
+            "Inspect is a navigation as well as a selection"
+        );
+        let _ = app.view();
+    }
+
+    #[test]
+    fn opening_a_run_from_the_history_moves_to_the_results_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::Nav(Screen::Runs));
+
+        let _ = app.update(Message::Runs(runs::Message::Open(sp_core::RunId::new(3))));
+        assert_eq!(app.screen, Screen::Results);
+
+        // A diff is the same handover, carrying the run to measure against.
+        let _ = app.update(Message::Nav(Screen::Runs));
+        let _ = app.update(Message::Runs(runs::Message::MarkAgainst(
+            sp_core::RunId::new(2),
+        )));
+        let _ = app.update(Message::Runs(runs::Message::Diff(sp_core::RunId::new(3))));
+        assert_eq!(app.screen, Screen::Results);
+    }
+
+    #[test]
+    fn a_screen_that_asks_for_nothing_leaves_the_user_where_they_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::Nav(Screen::Pipeline));
+        // A plain edit on another screen is not a navigation.
+        let _ = app.update(Message::Library(library::Message::SearchChanged(
+            "rf".to_owned(),
+        )));
+        assert_eq!(app.screen, Screen::Pipeline);
+    }
+
+    #[test]
+    fn a_setting_changed_on_one_screen_reaches_the_screens_that_work_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        // Typing in the box changes nothing until the field is submitted.
+        let _ = app.update(Message::Settings(settings_screen::Message::RateChanged(
+            "96000".to_owned(),
+        )));
+        assert_ne!(app.settings.default_sample_rate_hz, 96_000.0);
+
+        let _ = app.update(Message::Settings(settings_screen::Message::RateCommitted));
+        assert_eq!(app.settings.default_sample_rate_hz, 96_000.0);
+        assert_eq!(
+            app.generate.sample_rate_hz(),
+            96_000.0,
+            "the Generate screen opens on the new default"
+        );
+        assert_eq!(
+            Settings::load(&Settings::path_in(dir.path())).default_sample_rate_hz,
+            96_000.0,
+            "and it is on disk before the app is closed"
+        );
+    }
+
+    #[test]
     fn bytes_format_with_binary_prefixes() {
         assert_eq!(fmt_bytes(0), "0 B");
         assert_eq!(fmt_bytes(1023), "1023 B");

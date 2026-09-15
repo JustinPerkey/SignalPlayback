@@ -1488,4 +1488,118 @@ mod tests {
         let _ = state.update(None, Message::SearchChanged("  ".into()));
         assert!(state.hits.is_none());
     }
+
+    #[test]
+    fn toggling_a_train_collapses_and_expands_it() {
+        let mut state = State::default();
+        let id = TrainId::new(2);
+        let _ = state.update(None, Message::ToggleTrain(id));
+        assert!(state.collapsed_trains.contains(&id));
+        let _ = state.update(None, Message::ToggleTrain(id));
+        assert!(!state.collapsed_trains.contains(&id));
+    }
+
+    #[test]
+    fn an_export_says_where_the_file_went() {
+        let mut state = State::default();
+        let _ = state.update(None, Message::Exported(Ok("/tmp/radar.csv".into())));
+        assert_eq!(state.notice.as_deref(), Some("Exported to /tmp/radar.csv."));
+        assert!(state.error.is_none());
+
+        let _ = state.update(None, Message::Exported(Err("the disk is full".into())));
+        assert_eq!(state.error.as_deref(), Some("the disk is full"));
+        assert!(state.notice.is_none(), "one message at a time");
+    }
+
+    #[test]
+    fn a_library_that_will_not_load_is_reported() {
+        let mut state = State {
+            loading: true,
+            ..State::default()
+        };
+        let _ = state.update(None, Message::Loaded(Err("the file is locked".into())));
+        assert!(!state.loading);
+        assert_eq!(state.error.as_deref(), Some("the file is locked"));
+    }
+
+    /// A library holding one dataset, one train, one group and two signals.
+    fn stocked() -> (tempfile::TempDir, Store, GroupId) {
+        use sp_core::{DType, Domain, Provenance, SampleBuffer, SourceKind, Timebase};
+        use sp_store::library::{NewDataset, NewGroup, NewSignal};
+        use sp_store::NewTrain;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("library.db")).unwrap();
+        let group = store
+            .write(|conn| {
+                let dataset = library::insert_dataset(
+                    conn,
+                    &NewDataset::new("radar trial", SourceKind::Generated),
+                )?;
+                let train = trains::insert_train(conn, &NewTrain::new(dataset, 0))?;
+                let group = library::insert_group(conn, &NewGroup::new(train, 0, 2))?;
+                for (ordinal, name) in ["rf", "baseband"].into_iter().enumerate() {
+                    library::insert_signal(
+                        conn,
+                        &NewSignal::new(
+                            group,
+                            ordinal as u32,
+                            name,
+                            Timebase::regular(48_000.0, 0.0),
+                            SampleBuffer::from_f64(DType::F64, &[0.0, 0.5, -0.5]),
+                        )
+                        .with_domain(Domain::Analog)
+                        .with_provenance(Provenance::Generated),
+                    )?;
+                }
+                library::tag_signal(conn, SignalId::new(1), "golden")?;
+                Ok(group)
+            })
+            .unwrap();
+        (dir, store, group)
+    }
+
+    #[test]
+    fn the_screen_builds_a_view_in_every_state_it_can_be_in() {
+        // Nothing loaded, loading, and a library that would not open.
+        let mut state = State::default();
+        let _ = state.view();
+        state.loading = true;
+        let _ = state.view();
+        let _ = state.update(None, Message::Loaded(Err("the file is locked".into())));
+        let _ = state.view();
+
+        // The tree, a group selected, and its signal table.
+        let (_dir, store, group) = stocked();
+        let mut state = State::default();
+        let index = store.read(load_index).unwrap();
+        let _ = state.update(None, Message::Loaded(Ok(index)));
+        let _ = state.view();
+
+        let _ = state.update(Some(&store), Message::SelectGroup(group));
+        let detail = store
+            .read(move |conn| load_detail(conn, group, false))
+            .unwrap();
+        let _ = state.update(None, Message::DetailLoaded(group, Ok(detail)));
+        let _ = state.update(None, Message::SortBy(0));
+        let _ = state.view();
+
+        // The filter bar, with a query, a tag and a property test in it.
+        let _ = state.update(Some(&store), Message::SearchChanged("rf".into()));
+        let _ = state.update(Some(&store), Message::ToggleTag("golden".into()));
+        let _ = state.update(Some(&store), Message::PropKeyChanged("prf_hz".into()));
+        let _ = state.update(Some(&store), Message::PropValueChanged(">= 1000".into()));
+        let hits = store
+            .read(|conn| library::list_signals(conn, group))
+            .unwrap();
+        let _ = state.update(None, Message::SearchDone(Ok(hits)));
+        state.notice = Some("Exported to /tmp/radar.csv.".to_owned());
+        let _ = state.view();
+
+        // Collapsed to the dataset row, which is how a big library is read.
+        for dataset in state.index.as_ref().unwrap().datasets.clone() {
+            let _ = state.update(None, Message::ToggleDataset(dataset.id));
+        }
+        let _ = state.view();
+    }
 }

@@ -761,6 +761,160 @@ mod tests {
     }
 
     #[test]
+    fn typing_a_rate_leaves_the_setting_alone_until_the_field_is_submitted() {
+        // The box is a draft: the setting moves when the user presses enter,
+        // not on the keystroke that leaves "9" a valid rate of its own.
+        let mut state = state();
+        let _ = state.update(None, Message::RateChanged("9".into()));
+        let _ = state.update(None, Message::RateChanged("96000".into()));
+        assert_eq!(
+            state.settings().default_sample_rate_hz,
+            crate::settings::DEFAULT_SAMPLE_RATE_HZ
+        );
+        assert!(!state.take_changed());
+
+        let _ = state.update(None, Message::RateCommitted);
+        assert_eq!(state.settings().default_sample_rate_hz, 96_000.0);
+        assert!(state.take_changed());
+    }
+
+    #[test]
+    fn a_rate_that_is_not_a_finite_number_of_hertz_is_refused() {
+        for text in ["0", "inf", "NaN", "   ", "48 kHz"] {
+            let mut state = state();
+            let _ = state.update(None, Message::RateChanged(text.into()));
+            let _ = state.update(None, Message::RateCommitted);
+            assert!(state.rate_error.is_some(), "'{text}' was taken as a rate");
+            assert_eq!(
+                state.settings().default_sample_rate_hz,
+                crate::settings::DEFAULT_SAMPLE_RATE_HZ,
+                "'{text}'"
+            );
+            assert!(!state.take_changed(), "'{text}'");
+        }
+    }
+
+    #[test]
+    fn a_rate_that_parses_clears_the_complaint_about_the_last_one() {
+        let mut state = state();
+        let _ = state.update(None, Message::RateChanged("wobble".into()));
+        let _ = state.update(None, Message::RateCommitted);
+        assert!(state.rate_error.is_some());
+
+        let _ = state.update(None, Message::RateChanged("192e3".into()));
+        let _ = state.update(None, Message::RateCommitted);
+        assert!(state.rate_error.is_none());
+        assert_eq!(state.settings().default_sample_rate_hz, 192_000.0);
+    }
+
+    #[test]
+    fn every_picker_writes_the_setting_it_stands_for() {
+        let mut state = state();
+        let _ = state.update(None, Message::ModePicked(ModeEntry(CountMode::Strict)));
+        assert_eq!(state.settings().import_mode, CountMode::Strict);
+        assert!(state.take_changed());
+
+        let _ = state.update(None, Message::QualityPicked(QualityEntry(Quality::Fine)));
+        assert_eq!(state.settings().decimation, Quality::Fine);
+        assert!(state.take_changed());
+
+        let _ = state.update(
+            None,
+            Message::RetentionPicked(RetentionEntry(Retention::Keep(5))),
+        );
+        assert_eq!(state.settings().retention, Retention::Keep(5));
+        assert!(state.take_changed());
+    }
+
+    #[test]
+    fn reclaiming_space_needs_a_library() {
+        let mut state = state();
+        let _ = state.update(None, Message::Sweep);
+        assert_eq!(state.error.as_deref(), Some("No library is open."));
+    }
+
+    #[test]
+    fn a_reclaim_says_how_many_blobs_it_freed() {
+        let mut state = state();
+        let _ = state.update(None, Message::Swept(Ok(0)));
+        assert_eq!(state.notice.as_deref(), Some("Nothing to reclaim."));
+        let _ = state.update(None, Message::Swept(Ok(1)));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Reclaimed 1 unreferenced blob.")
+        );
+        let _ = state.update(None, Message::Swept(Ok(4)));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("Reclaimed 4 unreferenced blobs.")
+        );
+        let _ = state.update(None, Message::Swept(Err("the file is locked".into())));
+        assert_eq!(state.error.as_deref(), Some("the file is locked"));
+    }
+
+    #[test]
+    fn an_allowed_library_is_listed_once_and_can_be_taken_off_the_list() {
+        let mut state = state();
+        let path = PathBuf::from("vendor-stages.dll");
+        state.settings.external_libraries.push(path.clone());
+
+        let _ = state.update(None, Message::ExternalLibraryChosen(Some(path.clone())));
+        assert_eq!(state.settings().external_libraries.len(), 1);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("That library is already allowed.")
+        );
+        assert!(!state.take_changed(), "nothing changed, so nothing to save");
+
+        let _ = state.update(None, Message::RemoveExternalLibrary(path));
+        assert!(state.settings().external_libraries.is_empty());
+        assert!(state.take_changed());
+        assert!(state.notice.is_some(), "the removal says what it means");
+    }
+
+    #[test]
+    fn a_library_that_will_not_load_is_reported_rather_than_allowed() {
+        let mut state = state();
+        let _ = state.update(
+            None,
+            Message::ExternalLibraryChosen(Some(PathBuf::from("no-such-vendor-library.dll"))),
+        );
+        assert!(state.error.is_some());
+        assert!(
+            state.settings().external_libraries.is_empty(),
+            "a library that cannot be loaded is not added to the allow-list"
+        );
+        assert!(!state.take_changed());
+    }
+
+    #[test]
+    fn the_screen_builds_a_view_in_every_state_it_can_be_in() {
+        let mut state = state();
+        let _ = state.view();
+
+        // With the figures the storage section reports …
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("library.db")).unwrap();
+        let figures = store
+            .read(|conn| Ok((sp_store::library::summary(conn)?, stats::storage(conn)?)))
+            .unwrap();
+        let _ = state.update(None, Message::Storage(Ok(figures)));
+        state
+            .settings
+            .external_libraries
+            .push(PathBuf::from("vendor-stages.dll"));
+        state.notice = Some("Reclaimed 2 unreferenced blobs.".to_owned());
+        let _ = state.view();
+
+        // … and with every message the screen can show at once.
+        let _ = state.update(None, Message::Storage(Err("the file is locked".into())));
+        let _ = state.update(None, Message::RateChanged("wobble".into()));
+        let _ = state.update(None, Message::RateCommitted);
+        state.error = Some("boom".to_owned());
+        let _ = state.view();
+    }
+
+    #[test]
     fn bytes_format_with_binary_prefixes() {
         assert_eq!(fmt_bytes(0), "0 B");
         assert_eq!(fmt_bytes(2048), "2.0 KiB");

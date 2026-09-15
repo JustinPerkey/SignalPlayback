@@ -1428,6 +1428,126 @@ mod tests {
     }
 
     #[test]
+    fn the_transport_buttons_play_pause_stop_and_toggle() {
+        let mut state = state_with(vec![entry(1, 1_000.0, 10_000)]);
+        let _ = state.update(None, Message::Add(SignalId::new(1)));
+
+        let _ = state.update(None, Message::Play);
+        assert!(state.is_playing());
+        let _ = state.update(None, Message::Pause);
+        assert!(!state.is_playing());
+        let _ = state.update(None, Message::Toggle);
+        assert!(state.is_playing(), "toggle plays what was paused");
+        let _ = state.update(None, Message::Toggle);
+        assert!(!state.is_playing());
+
+        // Stop rewinds as well as stopping.
+        let _ = state.update(None, Message::Canvas(Action::Seek(4.0)));
+        let _ = state.update(None, Message::Play);
+        let _ = state.update(None, Message::Stop);
+        assert!(!state.is_playing());
+        assert_eq!(state.transport.playhead_s(), 0.0);
+    }
+
+    #[test]
+    fn the_rate_and_loop_pickers_reach_the_transport() {
+        let mut state = state_with(vec![entry(1, 1_000.0, 10_000)]);
+        let _ = state.update(None, Message::Add(SignalId::new(1)));
+        let _ = state.update(None, Message::RateChanged(2.0));
+        assert!((state.transport.rate() - 2.0).abs() < 1e-12);
+        let _ = state.update(None, Message::LoopModeChanged(LoopMode::Loop));
+        assert_eq!(state.transport.loop_mode(), LoopMode::Loop);
+    }
+
+    #[test]
+    fn a_traces_gain_and_offset_come_back_with_its_reset_button() {
+        let mut state = state_with(vec![entry(1, 1_000.0, 10_000)]);
+        let _ = state.update(None, Message::Add(SignalId::new(1)));
+        let _ = state.update(None, Message::GainChanged(0, 4.0));
+        let _ = state.update(None, Message::OffsetChanged(0, -1.5));
+        let _ = state.update(None, Message::TimeOffsetChanged(0, 2.0));
+        assert_eq!(state.traces[0].style.gain, 4.0);
+        assert_eq!(state.traces[0].style.offset_v, -1.5);
+        assert_eq!(state.traces[0].style.t_offset_s, 2.0);
+
+        let _ = state.update(None, Message::ResetStyle(0));
+        assert_eq!(state.traces[0].style.gain, 1.0);
+        assert_eq!(state.traces[0].style.offset_v, 0.0);
+        assert_eq!(state.traces[0].style.t_offset_s, 0.0);
+        assert_eq!(
+            state.transport.range(),
+            TimeRange::new(0.0, 10.0),
+            "the timeline follows the alignment back"
+        );
+    }
+
+    #[test]
+    fn fitting_puts_the_whole_of_every_trace_back_in_the_window() {
+        let mut state = state_with(vec![entry(1, 1_000.0, 10_000)]);
+        let _ = state.update(None, Message::Add(SignalId::new(1)));
+        let _ = state.update(
+            None,
+            Message::Canvas(Action::ZoomTime {
+                at_s: 5.0,
+                factor: 0.1,
+            }),
+        );
+        assert!(state.viewport.duration_s() < 10.0);
+
+        let _ = state.update(None, Message::FitAll);
+        assert!((state.viewport.duration_s() - 10.0).abs() < 1e-9);
+
+        // Fitting the amplitude alone leaves the time window where it was.
+        let _ = state.update(None, Message::GainChanged(0, 8.0));
+        let before = state.viewport.time();
+        let _ = state.update(None, Message::FitAmplitude);
+        assert_eq!(state.viewport.time(), before);
+    }
+
+    #[test]
+    fn a_control_for_a_trace_that_is_gone_is_ignored() {
+        // Every per-trace control is addressed by row, so a stale row must be
+        // a no-op rather than a panic.
+        let mut state = state_with(vec![entry(1, 1_000.0, 10_000)]);
+        let _ = state.update(None, Message::Add(SignalId::new(1)));
+        for message in [
+            Message::Remove(9),
+            Message::Select(9),
+            Message::ToggleVisible(9),
+            Message::GainChanged(9, 2.0),
+            Message::OffsetChanged(9, 2.0),
+            Message::TimeOffsetChanged(9, 2.0),
+            Message::ResetStyle(9),
+        ] {
+            let _ = state.update(None, message);
+        }
+        assert_eq!(state.traces.len(), 1);
+        assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn removing_the_selected_trace_moves_the_selection_with_the_rows() {
+        let mut state = state_with(vec![
+            entry(1, 1_000.0, 10_000),
+            entry(2, 1_000.0, 10_000),
+            entry(3, 1_000.0, 10_000),
+        ]);
+        for id in 1..=3 {
+            let _ = state.update(None, Message::Add(SignalId::new(id)));
+        }
+        let _ = state.update(None, Message::Select(2));
+        let _ = state.update(None, Message::Remove(0));
+        assert_eq!(
+            state.selected,
+            Some(1),
+            "the row the user picked is still the row they picked"
+        );
+
+        let _ = state.update(None, Message::Remove(1));
+        assert_eq!(state.selected, None, "the selected row itself went");
+    }
+
+    #[test]
     fn the_screen_builds_a_view_in_every_state_it_can_be_in() {
         // Empty, loading, failed, populated, playing, stacked and selected:
         // the view must not panic in any of them.
