@@ -63,7 +63,10 @@ impl Section {
 }
 
 /// One top-level surface of the application.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+///
+/// `Ord` follows the declaration order, which is rail order; it is derived so
+/// a screen can key a set, and carries no meaning beyond that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Screen {
     #[default]
     Library,
@@ -119,7 +122,11 @@ impl Screen {
         }
     }
 
-    /// Digit pressed with the command modifier to reach this screen.
+    /// Digit this screen's default `Ctrl`+digit binding uses.
+    ///
+    /// It is a *default*, not the map: since M13 the keyboard is
+    /// [`crate::keymap::Keymap`]'s, and this is what it starts from
+    /// (`crate::actions::Action::default_chord`).
     #[must_use]
     pub fn shortcut(self) -> Option<char> {
         let index = Self::ALL.iter().position(|s| *s == self)?;
@@ -128,17 +135,6 @@ impl Screen {
             9 => Some('0'),
             _ => None,
         }
-    }
-
-    /// The screen a command-modified digit selects.
-    #[must_use]
-    pub fn from_shortcut(digit: char) -> Option<Self> {
-        let index = match digit {
-            '0' => 9,
-            '1'..='9' => digit.to_digit(10)? as usize - 1,
-            _ => return None,
-        };
-        Self::ALL.get(index).copied()
     }
 }
 
@@ -163,14 +159,13 @@ mod tests {
     }
 
     #[test]
-    fn shortcuts_round_trip_and_are_unique() {
+    fn every_screen_has_a_default_digit_of_its_own() {
         let mut seen = Vec::new();
         for screen in Screen::ALL {
             let digit = screen.shortcut().expect("every screen has a shortcut");
-            assert_eq!(Screen::from_shortcut(digit), Some(screen));
             assert!(!seen.contains(&digit), "{digit} used twice");
             seen.push(digit);
         }
-        assert_eq!(Screen::from_shortcut('x'), None);
+        assert_eq!(seen.len(), Screen::ALL.len());
     }
 }

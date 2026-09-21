@@ -204,6 +204,17 @@ impl State {
         Task::perform(jobs::read(store.clone(), load_entries), Message::Loaded)
     }
 
+    /// Every signal in the library, with the group it is in.
+    ///
+    /// The command palette reads this rather than running a query of its own:
+    /// the list is already loaded, already refreshed whenever the library
+    /// changes, and a second copy of it would be a second thing to keep in
+    /// step (`crate::palette`).
+    #[must_use]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
     /// Whether playback is running, which is what the root subscribes frames
     /// for.
     #[must_use]

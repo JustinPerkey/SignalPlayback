@@ -10,8 +10,53 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
 ## Status
 
-**M12 — Generation.** A ladder whose rungs are groups, and a spectrum that says
-where its peaks are as well as how tall they are.
+**M13 — Ingest & UX.** One import queue with four ways into it, and one list of
+everything the application can be told to do.
+
+- **One queue, four sources** — the file dialog (multi-select now), the path
+  field, a drop on the window, and a watched folder all put files on the same
+  queue, drained a file at a time under the profile the Import screen is
+  holding. A second "auto-import" path would have been a second set of framing
+  rules to keep in step; this way a watched import is the import the user would
+  have run by hand. A file that fails does not stop the queue, and every file's
+  outcome is one line in a list under the progress bar. The drain knows where
+  each file came from, so an unconfirmed drop is never swept into an
+  unattended import — and never blocks one either.
+- **What a source implies is the whole design.** A drop names a *file*, so it
+  queues and previews and waits; turning a watch on names a *rule*, so it
+  imports. A dropped folder contributes the captures directly inside it.
+- **A capture still being written is left alone.** The watcher records each
+  file's length and modification time and offers it only once both are
+  unchanged since the previous scan — which is also why it is a poll and not an
+  OS watch: an inotify event says a write happened, not that writing has
+  finished.
+- **What is already in the folder is adopted, not imported.** Pointing at a
+  folder of four hundred old captures is not a request for four hundred
+  datasets in an application with no undo. The Settings screen says so as the
+  folder is chosen, and `Import every file in the watched folder` is the action
+  for the other intent.
+- **An action catalogue, because the exit criterion needs one.** *Every action
+  is reachable from the palette* cannot be tested while "every action" is a
+  button in one screen's view and, for the ones with keys, an arm of a `match`
+  in the root subscription. One list — id, label, the screen it acts on, the
+  message it sends — with the palette and the keyboard map as its two readers,
+  makes the criterion a test rather than a claim.
+- **`Ctrl`+`K` over every action, signal and stage.** The actions come from the
+  catalogue, the signals from the list the Scope screen has already loaded, and
+  the stages from the pipeline's registry, so nothing here is a third copy of
+  anything. A screen-scoped action takes you to its screen and then acts, which
+  is the only reading of *run "Play or pause" from the Library screen* that
+  makes sense.
+- **Every shortcut is rebindable**, stored as the overrides only so a later
+  build's new default is still a default. The defaults are exactly the keys v1
+  had plus `Ctrl`+`K`; everything else ships unbound and is reached from the
+  palette. A chord bound twice resolves rather than being refused, and the
+  Settings screen names what the key no longer reaches. The transport and stage
+  rail keys are bindings now rather than a `match` in the root subscription,
+  which is what §11.4 had been waiting for.
+
+Before it, **M12 — Generation**: a ladder whose rungs are groups, and a
+spectrum that says where its peaks are as well as how tall they are.
 
 - **The impairment ladder** — one clean source, a sweep of impairments, and
   **one group per rung**. The group is what a pipeline runs, caches, asserts
@@ -46,14 +91,14 @@ where its peaks are as well as how tall they are.
   the window to reach for when the amplitude is the measurement and the
   frequency is not.
 
-Before it, **M11 — Stage families**: a contract written down once — the stage
+Before that, **M11 — Stage families**: a contract written down once — the stage
 conformance harness — and three families of stage held to it, detection, symbol
 decode and measurement, with the four artifact kinds they emit. It earned its
 keep on the first run, finding a passthrough that ignored both its parameters
 and the cancel flag and a reference external library that called itself pure
 while publishing a call counter.
 
-Before that, **M10 — Stage cache**, the first milestone of the 1.x track to touch
+And **M10 — Stage cache**, the first milestone of the 1.x track to touch
 the scheduler: editing stage *n* re-runs stages *n…end* and no more, and a cached
 run records exactly what a cold run records.
 
@@ -185,7 +230,7 @@ Dependencies point left-to-right only: `sp-core` depends on nothing else here,
 | `sp-dsp` | Built-in stages: passthrough, gain, detrend, normalise, biquad, FFT, threshold, peak find, slice, symbol decode, bit pack, statistics, pulse metrics | M5, M11, M12 |
 | `sp-ext` | External stages: loading a native library over the flat C ABI, and the paths this installation may load | M9 |
 | `sp-ext-sample` | A conforming library built as a `cdylib`: the ABI's reference implementation, and what `sp-ext`'s tests load | M9 |
-| `sp-app` | The Iced application — the only crate that knows about pixels | M0+ |
+| `sp-app` | The Iced application — the only crate that knows about pixels, plus the action catalogue, the command palette, the keyboard map and the watched folder | M0+, M13 |
 
 Inside `sp-store`, row-level functions (`library`, `props`, `pulses`, `blob`,
 `profiles`, `regress`, `stats`, `verify`) take a connection and do one thing; `Store` owns
@@ -194,10 +239,19 @@ the connections and runs closures on the writer thread (`write`) or a pooled rea
 
 ## Keyboard
 
+Every key below is a default, not a rule: the Settings screen lists every action
+the application has and the key bound to it, and rebinds any of them. An action
+with no key is still reached from the command palette.
+
 | Keys | Action |
 |------|--------|
+| `Ctrl`+`K` | The command palette — every action, signal and stage |
 | `Ctrl`+`1`…`9`, `Ctrl`+`0` | Jump to a screen |
 | `Ctrl`+`T` | Toggle light/dark theme |
+| `Space` | Play or pause (Scope, Results) |
+| `Home` / `End` | Jump to the start or the end (Scope, Results) |
+| `[` / `]` | Set the loop points (Scope) |
+| `←` / `→` | Step through the stage rail (Results) |
 
 ## Settings
 
@@ -215,6 +269,8 @@ each change as it is made:
 | Sample cap | Bytes of samples one run may record before it keeps only what its stages said about them |
 | Decimation quality | Shifts the scope's automatic pyramid level by one either way |
 | Histogram bins | Resolution of the Inspector's histogram |
+| Watched folder | A folder whose new files import on their own; what is already in it is adopted rather than imported |
+| Keyboard map | Which chord runs which action; only what differs from the default is stored |
 
 A settings file that will not parse, or one written by an older build, falls
 back to the defaults for the fields it does not carry: losing a preference

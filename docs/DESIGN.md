@@ -1,10 +1,23 @@
 # SignalPlayback — Design Document
 
-**Status:** v1.4
+**Status:** v1.5
 **Date:** 2026-09-15
 **Author:** Justin Perkey
 **Repository:** `d:\Repos\SignalPlayback`
 
+> **Changes in v1.5** — M13 is built, in two halves. **Ingest:** §7.6 is new — one import
+> queue with four sources (dialog, path field, a drop on the window, a watched folder), and
+> the decisions that make an unattended import safe: a settle check over two scans, a
+> census that adopts what is already in the folder, and a source that decides whether the
+> queue starts by itself. **UX:** §12.5 is new — the action catalogue, the command palette
+> over every action, signal and stage, and the keyboard map, including how a chord bound
+> twice resolves and why the key subscription decides nothing. §11.4's note about `[` and
+> `]` waiting on a configurable map is answered; §12.1's Import and Settings rows, §12.2's
+> application shape, §12.3's keyboard bullet and §12.4's table follow the code; §14's
+> accessibility note is narrowed to focus order; §15.1 and §15.11 move the four entries
+> M13 delivered; and §16.1 marks the milestone done with the two tests that hold its exit
+> criteria.
+>
 > **Changes in v1.4** — M11 is built, so §9.8's "planned" table loses the three
 > families it named and §10.1's "built so far" gains the artifacts they emit:
 > **peak find** (`Peaks`), **slice**, **symbol decode** (`Symbols`), **bit pack**
@@ -271,7 +284,11 @@ SignalPlayback/
     └── sp-app/                # Iced binary. The only crate that knows about pixels.
         ├── main.rs            #   A window, or a subcommand
         ├── cli.rs             #   The headless command line (§10.4)
-        ├── state.rs           #   App state, the root Message, the key bindings
+        ├── state.rs           #   App state, the root Message, event routing
+        ├── actions.rs         #   The action catalogue: one list of every command (§12.5)
+        ├── palette.rs         #   Ctrl+K over every action, signal and stage (§12.5)
+        ├── keymap.rs          #   Chords, and the map from an action to one (§12.5)
+        ├── watch.rs           #   The watched folder and its settle check (§7.6)
         ├── jobs.rs            #   Store work, off the UI thread
         ├── stages.rs          #   The registry: sp-dsp plus the allowed external libraries
         ├── settings.rs        #   settings.json and its defaults (§12.4)
@@ -951,6 +968,71 @@ mapping is a decision — so import → run → export is scriptable without the
 dataset that was imported can be exported: the layout it was read with is stored on the
 dataset (`csv_layout`) and is what the writer reverses, so a generated or derived dataset
 has nothing to reverse and the action is refused rather than guessed at.
+
+### 7.6 The Import Queue and the Watched Folder
+
+There are four ways a file reaches §7.4's pipeline and **one queue**: the file dialog
+(multi-select), the path field, a drop on the window, and a watched folder. Each puts
+paths on `import::State`'s queue, which is drained one file at a time under the profile
+the Import screen is holding.
+
+One queue is the whole design. The alternative — an "auto-import" path of its own for a
+watched file — would be a second set of framing rules to keep in step with the first, and
+a watched import would stop being the import the user would have run by hand. The drain is
+serial rather than parallel: the store has one writer thread (§4.2), so two at once buys
+nothing, and it costs a progress bar that means something and a diagnostic list that
+belongs to a file the user can name. A file that fails does not stop the queue; every
+file's outcome is one line in a per-file list, which is §12.3's *errors are data* applied
+to forty files instead of forty rows.
+
+**A typed dataset name belongs to one import a person asked for.** Importing forty files
+under one name would make forty datasets nobody could tell apart, so the name field applies
+to a single chosen or dropped file and everything else is named after its own file stem.
+
+**Where a file came from decides whether the queue starts by itself.**
+
+| Source | On arrival |
+|--------|------------|
+| Dialog or path field | Queued; the head of the queue is previewed and mapped. The import starts when the user says so |
+| Dropped on the window | Same, and the Import screen comes forward. A dropped *folder* contributes the importable files directly inside it |
+| Watched folder | Imported, with nobody pressing anything, and without moving the user off the screen they are on |
+
+A drop names a *file*; turning the watch on names a *rule*, and that is the consent an
+unattended import needs — the same reading the external-library allow-list takes of a path
+the user picked (§9.9). `settings.json` carries the folder, so a watch survives a restart.
+
+One queue, two intents, so the **drain is source-aware**: a drain the watcher started takes
+only the files the watcher queued. Without that, a file dropped and not yet confirmed would
+be swept into the next unattended import — and, resolved the other way round, a dropped
+file sitting at the head of the queue would silently stop the watch working. The typed
+dataset name follows the same reasoning: a file that arrived while nobody was looking has
+nothing to do with whatever is in the name field, so a watched file is always named after
+itself. A watched drain appends to the per-file outcome list rather than clearing it, since
+it never ends; the list keeps the most recent two hundred and there is an action to empty
+it.
+
+The watcher (`sp-app/src/watch.rs`) is a poll, and three decisions in it are the feature:
+
+- **A file is imported only once it has stopped changing.** A capture being written into
+  the folder is a file that exists, is readable and is half a file. Each scan records its
+  length and modification time, and a file becomes eligible on the *next* scan only if
+  both are unchanged. This is also why the poll is not an OS watch: an inotify event says
+  a write happened, not that writing has finished, so the settle check is needed either
+  way and the event buys nothing.
+- **What is already in the folder is adopted, not imported.** Pointing at a folder of four
+  hundred old captures is not a request for four hundred datasets, and there is no undo
+  (§12.3). The census taken when the folder is adopted marks everything in it as seen, the
+  Settings screen says so in as many words when the folder is chosen, and *Import every
+  file in the watched folder* is the action for the other intent.
+- **A file is offered once.** Imported, failed or adopted, it is not offered again while
+  the folder stays watched — so a folder nobody touches costs one `read_dir` a second and
+  produces nothing. A file that disappears is forgotten, so the same name written again is
+  a new file.
+
+Only `.csv`, `.txt` and `.tsv` are looked at, by the watcher and by a dropped folder
+alike: the framer is the CSV one, and a watched folder is usually somebody's capture
+directory with notes and screenshots in it. The scan is not recursive — a drop box is a
+drop box.
 
 ---
 
@@ -1858,10 +1940,12 @@ traces:
 Interactions: scroll = zoom time about the pointer, shift+scroll = pan, ctrl+scroll = zoom
 amplitude, drag = box zoom, double-click = fit, click = move the playhead, `Home`/`End` =
 jump to bounds, space = play/pause. On the Results screen `←`/`→` walk the stage rail
-(§10.2). Loop in and out are buttons on the transport rather than `[` / `]`: the canvas
+(§10.2). Loop in and out are buttons on the transport *as well as* `[` / `]`: the canvas
 takes the keyboard for the playhead, and a key that silently redefines the loop while the
-pointer is elsewhere is worse than a labelled control. Binding them is part of the
-configurable shortcut map (§15.11).
+pointer is elsewhere needs a labelled control beside it rather than instead of it. Since
+M13 all of these are bindings in the keyboard map and none of them is in a `match` in the
+root subscription: they are screen-scoped actions, which is what makes `Space` the
+transport here and nothing at all on the Library screen (§12.5).
 
 Per-trace controls: visibility, colour, gain, vertical offset, and a **stacked vs.
 overlaid** layout toggle. Domain drives the default renderer — `DigitalLogic` signals get
@@ -1876,7 +1960,7 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 | Screen | Purpose |
 |--------|---------|
 | **Library** | Tree of Dataset → Group → Signal / pulse field, with search, tag and property filters (every filter narrows: a query, two tags and `prf_hz >= 1000` asks for the signals that satisfy all of them), and a detail table sortable on any column — numeric columns as numbers, and a signal with no cached statistics last either way. Hosts cross-group pulse search (§6.6): a field predicate returns matching pulses across every group, each row jumping to its group and playhead position. Multi-select feeds the scope, a playlist, or a pipeline run. |
-| **Import** | File picker → preview grid of the headers and first group → column-mapping panel (which column is the time of arrival and in what unit, which columns bind to property definitions) → profile save/load → progress with a live error list. |
+| **Import** | File picker → preview grid of the headers and first group → column-mapping panel (which column is the time of arrival and in what unit, which columns bind to property definitions) → profile save/load → progress with a live error list. The picker is multi-select and the screen holds a queue, which a drop on the window and the watched folder feed as well (§7.6); the queue drains one file at a time under one profile, and every file's outcome is one line in a list beneath the progress bar. |
 | **Generate** | Node tree editor, parameter form, live preview, sweep configuration, preset browser. |
 | **Pipeline** | Stage palette on the left, ordered stage list in the middle, generated parameter form on the right. Port validation inline. Run controls with group selection. |
 | **Results** | Group list + stage rail + scope + artifact panes (§10.3). The main working surface for algorithm development. |
@@ -1884,7 +1968,7 @@ logic lanes, `BasebandIq` gets I/Q or magnitude, `Symbols` gets labelled stems.
 | **Scope** | Playback-focused view of stored signals: transport, loop region, per-trace controls, and a viewport that survives navigation. A run's stages are walked on the Results screen, which has the rail (§10.2). |
 | **Inspector** | Detail for one signal, pulse field or pulse: full metadata, property editor, tags, statistics, histogram, and a virtualised value table — for a pulse group, the table is the pulse records themselves, one row per pulse across every field. Statistics are recomputed from the samples in one streaming pass (min, max, peak-to-peak, mean, RMS, standard deviation, zero crossings and the distribution), not read from the cached row, so they answer for what is actually stored; the table is a window on the column, paged, so a 100 M-sample signal costs a read rather than a copy. A pulse is addressed as a row of its group's table: an unannotated pulse has no row of its own (§6.6). |
 | **Properties** | The list of property definitions and the form that declares a new one (§6.3). Property *sets* — named reusable bundles — have their tables in the schema but no screen yet (§15.5). |
-| **Settings** | Library location, theme, default sample rate, strict/tolerant import, retention defaults, the run-level sample cap, decimation quality, histogram bins, the allowed external libraries, and the (fixed, v1) keyboard map. It also reports what the open library is made of — rows, bytes by blob kind, published stage-cache keys — with `Reclaim unused blobs` and `Clear stage cache` beside the figures. Clearing unpublishes keys and nothing else: the output they named belongs to the run that recorded it and stays there, so the cost is the next run's reuse. `Verify Library`, `VACUUM` and `Rebuild pyramids` are written and tested in `sp-store` but have no button yet (§15.6). |
+| **Settings** | Library location, theme, default sample rate, strict/tolerant import, retention defaults, the run-level sample cap, decimation quality, histogram bins, the allowed external libraries, the watched folder (§7.6), and the keyboard map — every action in the catalogue with the key bound to it, rebindable in place, with any shadowed binding named above the list (§12.5). It also reports what the open library is made of — rows, bytes by blob kind, published stage-cache keys — with `Reclaim unused blobs` and `Clear stage cache` beside the figures. Clearing unpublishes keys and nothing else: the output they named belongs to the run that recorded it and stays there, so the cost is the next run's reuse. `Verify Library`, `VACUUM` and `Rebuild pyramids` are written and tested in `sp-store` but have no button yet (§15.6). |
 
 ### 12.2 Iced Application Shape
 
@@ -1911,11 +1995,20 @@ struct App {
     results:  results::State,    // run, group, stage, pinned stage and playhead
     scope:    scope::State,      // playback keeps its position across screens
     settings_screen: settings::State,
+    palette:  palette::State,    // the command palette, drawn over any screen (§12.5)
+    watcher:  watch::Watcher,    // the watched folder (§7.6)
+    hovering: usize,             // files being dragged over the window
 }
 
 enum Message {
     Nav(Screen),
     ToggleTheme,
+    Run(Action),                 // one path for a key, a button and the palette
+    Key(Chord),                  // resolved against the keymap in `update`
+    OpenPalette,
+    Palette(palette::Message),
+    FileHovered, FileDropped(PathBuf), FilesHoveredLeft,
+    WatchTick, SweepWatchedFolder,
     Library(library::Message),
     Import(import::Message),
     Generate(generate::Message),
@@ -1945,6 +2038,14 @@ pool and the UI thread only ever sees the message that comes back. Per-stage pro
 arrives while a run is still going, so the stage rail fills in live — the user can inspect
 stage 1's output while stage 4 is still computing.
 
+Two things live on the root rather than on a screen because they are about the application
+rather than about one surface of it: the command palette, which reaches every screen and is
+drawn over whichever one is showing, and the watched folder, which feeds the Import screen
+without being part of it. `Message::Run(Action)` is the one path a command is dispatched
+by — the root navigates to the action's screen and then sends the action's own message —
+so a command cannot behave differently depending on whether it was a button, a key or a
+palette entry.
+
 ### 12.3 UX Principles
 
 - **No modal blocking on IO.** Import, generation and runs happen in the background; the
@@ -1960,7 +2061,9 @@ stage 1's output while stage 4 is still computing.
   offers no delete at all, which is why the gap has not bitten.
 - **Errors are data, not dialogs.** Import problems and stage diagnostics land in
   filterable lists the user can work through, not a popup per row.
-- **Keyboard first** for transport, stage stepping and navigation.
+- **Keyboard first** for transport, stage stepping and navigation — and since M13 for
+  everything else through the palette, which is the discovery surface for the commands
+  that have no key and would otherwise have no name (§12.5).
 
 ### 12.4 Settings
 
@@ -1980,6 +2083,8 @@ logs:
 | Decimation quality | Shifts the reducer's automatic level choice by one either way (§5.4). It never promotes a level to a raw read: that bound is what keeps a frame inside its budget, not a preference |
 | Histogram bins | Resolution of the Inspector's histogram |
 | Allowed external libraries | The native libraries this installation may load as stages (§9.9). The list is consent rather than configuration: a library is on it because the user picked that file, and the load is attempted there and then, so a failure is reported beside the path that caused it. A headless run reads the same list, so CI loads what the window would |
+| Watched folder | A folder whose new files are imported without being asked for (§7.6). Consent in the same way the library list is: a folder is here because the user pointed at it, and that pointing is what makes an unattended import theirs. What is already in the folder is adopted rather than imported, and the screen says so as the folder is chosen. A folder that has gone is reported rather than silently not running |
+| Keyboard map | Which chord runs which action (§12.5). Every action in the catalogue has a row, whether or not it has a key, because the list is what says what *could* have one. Only bindings that differ from the default are written to the file, so a build that adds an action gets its default rather than coming up unbound in a file written before it existed |
 
 Every control writes the file as it changes — there is nothing here that is only
 half-decided, so there is no Save button. A settings file that will not parse, or a field
@@ -1987,10 +2092,88 @@ an older build did not write, falls back to the default for that field: losing a
 preference must never cost the user their application. Out-of-range values are clamped
 rather than refused, for the same reason.
 
-The keyboard map is fixed in v1; the screen lists the ones that work from anywhere —
-`Ctrl`+`1`…`9` and `Ctrl`+`0` to jump to a screen, `Ctrl`+`T` for the theme — so they are
-discoverable. The transport and rail keys belong to the screen they act on and are labelled
-there instead (§11.4). §15.11 tracks making the whole map configurable.
+The keyboard map was fixed in v1 and is editable from M13; §12.5 is how. The defaults are
+exactly the keys v1 had — `Ctrl`+`1`…`9` and `Ctrl`+`0` to jump to a screen, `Ctrl`+`T`
+for the theme, the transport and rail keys on the screens they act on — plus `Ctrl`+`K`
+for the palette, which is the one new default. Everything else ships unbound and is
+reached from the palette: a shipped map that claims sixty chords is a map the user has to
+fight.
+
+### 12.5 Actions, the Command Palette and the Keyboard Map
+
+Before M13 there was no list of what the application can be told to do. A command existed
+as a button in one screen's `view` and, if it had a key, as an arm of a `match` in the root
+subscription — so "every action" was not a thing the code could be asked about, and
+neither a palette nor an editable keyboard map could be built without inventing the list
+twice.
+
+`sp-app/src/actions.rs` is that list. Each `Action` carries four things:
+
+| Field | What it is |
+|-------|------------|
+| `id` | What `settings.json` binds a key to: `pipeline.run`, `scope.play_pause`. Written down rather than derived from the variant, because a variant may be renamed and a user's binding may not |
+| `label` | What the palette shows and is searched by, verb first: *Run the pipeline* |
+| `screen` | The screen it acts on, or `None` for the whole application |
+| `message` | The root message it sends |
+
+The palette and the keymap are both *readers* of it, which is what makes **every action is
+reachable from the palette** a test rather than a claim.
+
+**What is an action and what is not.** An action is a command that takes no argument from
+the screen it is on: *Run the pipeline*, *Cancel the import*, *Reclaim unused blobs*.
+Setting a control's *value* — the text in a search box, which stage is selected, a
+parameter field, a picked delimiter — is not an action and is not in the catalogue: it has
+no name a user would search for and no meaning without the thing it is setting. The line
+is drawn there deliberately, because a catalogue that included every
+`ParamText(key, text)` would be a catalogue of nothing.
+
+`screen` does two jobs at once, and they are the same fact read twice. It is the scope a
+binding fires in — `Space` means *play* because the Scope screen is showing — and it is
+where the palette takes the user before running the action, because *run "Play or pause"
+from the Library screen* can only sensibly mean *go and play*.
+
+**The palette** (`Ctrl`+`K`) is over every action, signal and stage, as §15.11 asked. The
+actions come from the catalogue, the signals from the list the Scope screen has already
+loaded, and the stages from the pipeline's registry — so the palette invents no third copy
+of any of the three, and a vendor DLL the user has allowed is in it for the same reason it
+is in the stage rail. A signal opens in the Inspector through the Library screen's own
+handover (§12.2); a stage is appended to the pipeline. Matching is a subsequence scan
+scored on where the match landed — the start of the text, then the start of a word, then a
+run of adjacent characters, less one for every character skipped — and it is *greedy*
+rather than optimal alignment, because this runs over every entry on every keystroke and
+because a deterministic ranking is the only kind that can be tested. Ties break on the
+shorter label and then on catalogue order, so a row never moves under the user's finger.
+The palette is drawn *over* the screen showing rather than replacing it: it is a way of
+reaching the application, not a screen of its own, and seeing the trace behind it is what
+makes that true.
+
+**The keyboard map** is `{action id → chord}` in `settings.json`, storing only what differs
+from the default, with an empty string for an action the user has deliberately unbound. A
+binding that will not parse is dropped rather than silently becoming some other key, and it
+does not fall back to the default it was written to replace — but it never stops the
+application opening, which is the rule the whole settings file follows (§12.4). `ctrl` in a
+chord means the platform's command modifier, `Cmd` on macOS. A shifted character arrives as
+the shifted character itself, so the shift flag is recorded only for a named key, whose
+identity it does not change.
+
+A chord bound twice **resolves rather than being refused**: refusing it would mean the user
+has to remember which of sixty-odd actions is holding the key they want. A screen-scoped
+binding wins over a global one on that screen; between two of equal specificity the earlier
+one in the catalogue wins; and either way the Settings screen names what the key no longer
+reaches, both in the notice and in a standing line above the list. Two screens sharing a
+key is not a conflict at all — it is the mechanism, and it is how `Space` plays on both the
+Scope and the Results screen.
+
+One consequence shapes the plumbing. Iced takes a plain `fn` for an event filter, so
+nothing about the application — least of all the keymap — can be captured in a
+subscription. So the subscription does no deciding: it reports *what key was pressed*, and
+`update` resolves it, which is also the only place that knows whether a text field has the
+keyboard or a binding is being captured. Capturing comes first in that order, or
+`Ctrl`+`1` could never be rebound — the press would navigate away before it could be
+recorded. Only presses no widget took are reported at all, so a character typed into a
+focused field never arrives; the Scope screen's filter is the one case that needs a guard
+of its own, because there the canvas keeps the keyboard while the field has the text
+(§11.4).
 
 ---
 
@@ -2132,7 +2315,9 @@ artifact identity is also carried by the legend, never by colour alone. Minimum 
 text. Keyboard coverage is partial rather than full: every screen is reachable by
 `Ctrl`+*digit*, the transport and the stage rail have keys, and text inputs take focus in
 order — but there is no focus ring walking every control, and §15.11's configurable
-shortcut map is where finishing the job belongs.
+shortcut map is where finishing the job belongs — and as of M13 that map exists and is
+editable (§12.5), so the remaining half is keyboard *focus order* through a screen rather
+than the bindings.
 
 ---
 
@@ -2153,8 +2338,12 @@ existed since M3 and only the milestone table had not noticed.
 - **[MVP]** Strict vs. tolerant count handling with a diagnostics list.
 - **[MVP]** Time-of-arrival column with a configurable source unit (default µs).
 - **[MVP]** Map CSV columns onto typed property definitions.
-- **[V1.x]** Drag-and-drop import; import multiple files in one action.
-- **[V1.x]** Watch-folder auto-import.
+- **[done — M13]** Drag-and-drop import; import multiple files in one action. Both are the
+  same queue: a multi-select dialog, a drop of files or of a folder, and the watched folder
+  all feed it, and it drains one file at a time under one profile (§7.6).
+- **[done — M13]** Watch-folder auto-import, with a settle check so a capture still being
+  written is left alone, and a census so the files already in the folder are adopted rather
+  than imported (§7.6).
 - **[V1.x]** Import from clipboard paste.
 - **[V1.x]** Domain inference proposals (digital vs analog vs I/Q).
 - **[V2]** Additional formats: WAV, MATLAB `.mat`, HDF5, SigMF, Parquet, NumPy `.npy`, TDMS, VCD.
@@ -2345,8 +2534,12 @@ existed since M3 and only the milestone table had not noticed.
 - **[MVP]** Light/dark theme.
 - **[V1.x]** Undo/redo for library and pipeline edits.
 - **[V1.x]** Recent files, datasets and pipelines.
-- **[V1.x]** Command palette (Ctrl+K) over every action, signal and stage.
-- **[V1.x]** Configurable keyboard shortcuts.
+- **[done — M13]** Command palette (Ctrl+K) over every action, signal and stage, reading
+  the action catalogue, the Scope screen's signal list and the pipeline's stage registry
+  rather than three lists of its own (§12.5).
+- **[done — M13]** Configurable keyboard shortcuts: every catalogued action is rebindable
+  from the Settings screen, stored as the overrides only, with a shadowed binding named
+  rather than refused (§12.5).
 - **[V2]** Workspaces — save a full scope + results setup and restore it.
 - **[V2]** Session crash recovery.
 - **[V2]** Localisation scaffolding.
@@ -2391,6 +2584,7 @@ holds it, rather than to the commit that claimed it:
 | M10 | `sp-dsp/tests/pipeline.rs`: `editing_a_stage_re_runs_it_and_everything_after_it` is the first clause, `a_cached_run_records_what_a_cold_run_records` the second, with retention, the sample cap and `a_key_whose_run_is_gone_is_unpublished_rather_than_followed` beside them. |
 | M11 | `sp-dsp/tests/conformance.rs`: `every_builtin_conforms` and `the_harness_covers_every_check_for_every_builtin` hold the second clause with nothing waived, and `sp-ext/tests/native.rs`'s `a_stage_from_outside_this_binary_is_held_to_the_same_contract` holds it for a stage this crate did not write. `sp-dsp/tests/families.rs` holds the first: `detection_and_measurement_run_end_to_end_over_a_pulse_train`, `symbol_decode_runs_end_to_end_and_the_bits_are_the_bits_that_went_in`, `a_family_pipeline_is_valid_before_it_is_run`. |
 | M12 | `sp-gen/tests/ladder.rs`: `a_ladder_produces_one_group_per_snr_rung` and `a_ladder_is_the_same_ladder_the_second_time` are the criterion, with `every_rung_lands_at_the_noise_it_names` and `the_rung_is_a_declared_group_property_rather_than_a_loose_attribute` beside them. `determinism.rs` now carries an `Awgn` node in its strategy, so `chunks_join_up_into_the_whole_render` is what holds the probe window to G3. |
+| M13 | `sp-app/src/palette.rs`: `every_action_is_reachable_from_the_palette` is the second clause, with `an_action_is_also_reachable_by_its_identifier` beside it; `state.rs`'s `every_action_in_the_palette_runs` holds that what it lists actually works. `state.rs`'s `a_watched_folder_imports_without_user_action` is the first, end to end — a folder adopted, a capture written into it, two ticks, and a dataset named after the file with nothing pressed. |
 
 Two corrections came out of that pass rather than a milestone: §9.8 and §10.1 were
 describing stage and artifact families that were planned rather than written, and §13 was
@@ -2410,11 +2604,12 @@ not by section number.
 | **M10 — Stage cache** (done) | Content-hash stage cache, per-stage retention policy, run-level sample cap | Editing stage *n* re-runs only *n…end*; a cached run and a cold run produce identical outputs |
 | **M11 — Stage families** (done) | Detection, symbol-decode and measurement stages; stage conformance harness; the artifact kinds they emit (§10.1) | Each family has a stage that runs end-to-end and passes the conformance harness |
 | **M12 — Generation** (done) | Impairment ladders, one group per rung; a flat-top window and FFT phase | A ladder produces one group per SNR rung, deterministically (G3) |
-| **M13 — Ingest & UX** | Drag-and-drop and multi-file import, watch folder, command palette, configurable shortcuts | A watched folder imports without user action; every action is reachable from the palette |
+| **M13 — Ingest & UX** (done) | Drag-and-drop and multi-file import, watch folder, command palette, configurable shortcuts | A watched folder imports without user action; every action is reachable from the palette |
 | **M14 — Isolation** | `sp-stage-host`, shared-memory transport, `process_isolated` execution | A library that segfaults fails one group with a diagnostic and the run continues |
 
 M9 comes first because the external stage is the reason the harness exists for algorithms
 that are not written in Rust, and M14 only makes sense once M9 has a library to isolate.
+M13 is independent of all of them — it touches `sp-app` and nothing below it.
 M10's key was already computed and recorded per stage when M5 wrote the scheduler; what it
 added is the part that decides what a key may point at — `on_failure` swept once its group
 passes, only `always` published, a stale key unpublished on the lookup that finds it, and a
@@ -2447,6 +2642,51 @@ ordinal (§10.5) — without which the curve of §8.4 is a curve against 0, 1, 2
 publishing FFT phase needed a second scale on the `Series` view, since dB and radians share
 an x axis and nothing else: `ViewHint::Series` gained a `y2`, which is what a Bode plot is
 and what `FilterResponse` will want when a filter stage publishes one.
+
+**M13 turned out to be one milestone with two unrelated halves, and the UX half needed a
+list that did not exist.**
+
+The ingest half was small once it was seen as a *queue*. Drag-and-drop, multi-file import
+and the watched folder are three sources for one queue rather than three importers, so the
+work was the queue, the drain and the three ways in — and the interesting decisions are all
+about what a source implies (§7.6). A drop names a file, so it queues and previews; turning
+a watch on names a rule, so it imports. A capture being written into a watched folder is a
+file that is readable and half-written, so the watcher settles a file over two scans before
+offering it — which is also why the poll was not replaced by an OS watch, since an inotify
+event says a write happened and not that writing has finished. And pointing at a folder of
+four hundred old captures is not a request for four hundred datasets in an application with
+no undo, so the census adopts what is already there and there is an action for the other
+intent.
+
+The UX half was the milestone's design work, and it started somewhere the exit criterion
+forced. *Every action is reachable from the palette* cannot be built — let alone tested —
+while "every action" is a button in one screen's `view` and, for the ones with keys, an arm
+of a `match` in the root subscription. So the action catalogue came first (§12.5): one list
+carrying an id, a label, the screen it acts on and the message it sends, with the palette
+and the keyboard map as its two readers. The criterion is then a test over `Action::ALL`
+rather than a claim, and a second test runs every action through the root to hold that what
+the palette lists actually works.
+
+Two things fell out of the catalogue rather than being asked for. §11.4's standing note —
+that `[` and `]` are buttons rather than keys and that "binding them is part of the
+configurable shortcut map" — is answered, because the transport keys are now screen-scoped
+actions with default bindings and not a `match`; the map is what makes a key mean *play*
+on the Scope screen and nothing on the Library screen. And a chord bound twice had to have
+an answer: it resolves, deterministically, with the Settings screen naming what the key no
+longer reaches, because refusing the binding would mean the user has to remember which of
+sixty-odd actions is holding the key they want.
+
+The one piece of plumbing worth recording is Iced's: an event filter is a plain `fn`, so
+the keymap cannot be captured in a subscription. The subscription therefore decides nothing
+and reports only *what key was pressed*; `update` resolves it, which is also the only place
+that knows whether a text field has the keyboard or a binding is being captured. That order
+matters — capturing has to come first, or `Ctrl`+`1` could never be rebound, since the
+press would navigate away before it could be recorded.
+
+What M13 did *not* do is the rest of §15.11 or the rest of §15.1. Undo/redo, recent files,
+window layout and clipboard import were not in the deliverable and are untouched, and the
+accessibility note in §14 is narrowed rather than closed: the bindings are configurable now,
+but there is still no focus ring walking every control.
 
 **M11 grew by that pass and is now delivered.** Five stages — peak find, slice, symbol
 decode, bit pack and pulse metrics — give the three families the milestone named a stage
